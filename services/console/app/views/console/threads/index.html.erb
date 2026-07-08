@@ -52,10 +52,9 @@
       <% end %>
 
       <% if @starting_new_thread && !console_threads_read_only? %>
-        <div class="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-6">
+        <div class="flex min-h-0 flex-1 items-start justify-center overflow-y-auto px-6">
           <div class="console-new-chat">
             <h1 class="console-new-chat-title">Start a new chat</h1>
-            <p class="console-new-chat-subtitle">Pick a harness, choose a model where it applies, and send your first message.</p>
             <%= render "console/threads/composer", mode: :new %>
           </div>
         </div>

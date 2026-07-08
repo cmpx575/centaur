@@ -83,31 +83,26 @@ class Console::ThreadsController < ApplicationController
 
   SlackThreadOwner = Struct.new(:user_id, :team_id, keyword_init: true)
 
-  # Harnesses the composer can start a chat on, in display order. Wire values
-  # match api-rs's HarnessType enum (serde lowercase).
-  COMPOSER_HARNESSES = [
-    [ "claudecode", "Claude Code" ],
-    [ "codex", "Codex" ],
-    [ "amp", "Amp" ]
+  # The composer's single model selector, in display order. Each entry pins
+  # the harness the choice runs on (wire values match api-rs's HarnessType
+  # enum, serde lowercase); the model ids are the ones the bots' --model flags
+  # expand to (services/slackbotv2/src/overrides.ts). Amp appears as a plain
+  # entry with no model: it picks its own model per turn.
+  ComposerAgent = Struct.new(:value, :label, :harness, :model, keyword_init: true)
+  COMPOSER_AGENTS = [
+    ComposerAgent.new(value: "claude-opus-4-8", label: "Claude Opus 4.8",
+                      harness: "claudecode", model: "claude-opus-4-8"),
+    ComposerAgent.new(value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6",
+                      harness: "claudecode", model: "claude-sonnet-4-6"),
+    ComposerAgent.new(value: "claude-haiku-4-5", label: "Claude Haiku 4.5",
+                      harness: "claudecode", model: "claude-haiku-4-5"),
+    ComposerAgent.new(value: "claude-fable-5", label: "Claude Fable 5",
+                      harness: "claudecode", model: "claude-fable-5"),
+    ComposerAgent.new(value: "gpt-5.5", label: "GPT-5.5",
+                      harness: "codex", model: "gpt-5.5"),
+    ComposerAgent.new(value: "amp", label: "Amp",
+                      harness: "amp", model: nil)
   ].freeze
-  COMPOSER_DEFAULT_HARNESS = "claudecode".freeze
-  # Models offered per harness. The blocks-protocol user line carries `model`
-  # and every harness honors it; the ids here are the ones the bots' --model
-  # flags expand to (services/slackbotv2/src/overrides.ts). Amp maps to an
-  # empty list on purpose: it manages its own model per turn, so the composer
-  # shows a note instead of a selector.
-  COMPOSER_MODELS = {
-    "claudecode" => [
-      [ "claude-opus-4-8", "Claude Opus 4.8" ],
-      [ "claude-sonnet-4-6", "Claude Sonnet 4.6" ],
-      [ "claude-haiku-4-5", "Claude Haiku 4.5" ],
-      [ "claude-fable-5", "Claude Fable 5" ]
-    ],
-    "codex" => [
-      [ "gpt-5.5", "GPT-5.5" ]
-    ],
-    "amp" => []
-  }.freeze
 
   helper_method :thread_title,
                 :thread_source_icon,
@@ -118,10 +113,8 @@ class Console::ThreadsController < ApplicationController
                 :thread_message_text,
                 :thread_text_preview,
                 :thread_status_classes,
-                :composer_harness_choices,
-                :composer_default_harness,
-                :composer_model_choices,
-                :composer_model_choices_by_harness
+                :composer_agent_choices,
+                :composer_default_agent_value
 
   def index
     @query = params[:q].to_s.strip
@@ -183,47 +176,48 @@ class Console::ThreadsController < ApplicationController
     @api_client ||= client_factory.call
   end
 
-  def composer_harness_choices
-    COMPOSER_HARNESSES
+  # Selector options as [label, value] pairs, the deploy's default model
+  # annotated and listed first. The default comes from the same env/config
+  # resolution the thread header uses, so the composer never claims a default
+  # the sandbox would not actually run.
+  def composer_agent_choices
+    default_value = composer_default_agent_value
+    sorted = COMPOSER_AGENTS.sort_by.with_index do |agent, index|
+      agent.value == default_value ? -1 : index
+    end
+    sorted.map do |agent|
+      label = agent.value == default_value ? "#{agent.label} (default)" : agent.label
+      [ label, agent.value ]
+    end
   end
 
-  def composer_default_harness
-    COMPOSER_DEFAULT_HARNESS
+  def composer_default_agent_value
+    default = default_model_for_harness(COMPOSER_AGENTS.first.harness)
+    COMPOSER_AGENTS.find { |agent| agent.value == default }&.value ||
+      COMPOSER_AGENTS.first.value
   end
 
-  # Model options for one harness, default first and annotated. The default
-  # comes from the same env/config resolution the thread header uses, so the
-  # composer never claims a default the sandbox would not actually run.
-  def composer_model_choices(harness)
-    options = COMPOSER_MODELS.fetch(harness, [])
-    default = default_model_for_harness(harness)
-    return options if default.blank?
-
-    default_label = options.find { |value, _label| value == default }&.last || default
-    [ [ default, "#{default_label} (default)" ] ] +
-      options.reject { |value, _label| value == default }
-  end
-
-  def composer_model_choices_by_harness
-    COMPOSER_HARNESSES.to_h { |value, _label| [ value, composer_model_choices(value) ] }
+  def composer_agent_for(raw)
+    value = raw.to_s.strip
+    value = composer_default_agent_value if value.blank?
+    COMPOSER_AGENTS.find { |agent| agent.value == value }
   end
 
   def start_thread(prompt)
-    harness = params[:harness_type].to_s.strip.presence || composer_default_harness
-    unless COMPOSER_MODELS.key?(harness)
-      redirect_to console_threads_path(new: 1), alert: "Unknown harness #{harness.inspect}."
+    agent = composer_agent_for(params[:model])
+    if agent.nil?
+      redirect_to console_threads_path(new: 1),
+                  alert: "Unknown model #{params[:model].to_s.inspect}."
       return
     end
 
-    model = composer_model_param(harness)
     thread_key = "console:#{SecureRandom.uuid}"
-
     api_client.create_session(
       thread_key: thread_key,
-      harness_type: harness,
-      metadata: console_actor_metadata.merge(model.present? ? { model: model } : {})
+      harness_type: agent.harness,
+      metadata: console_actor_metadata.merge(agent.model.present? ? { model: agent.model } : {})
     )
-    send_prompt(thread_key, prompt, model: model)
+    send_prompt(thread_key, prompt, model: agent.model)
     redirect_to console_threads_path(thread: thread_key)
   rescue CentaurApiClient::Error => e
     redirect_to console_threads_path(new: 1), alert: "Could not start the chat: #{e.message}"
@@ -298,18 +292,6 @@ class Console::ThreadsController < ApplicationController
     recorded_model(latest_executions_for([ session.thread_key ])[session.thread_key]&.metadata) ||
       recorded_model(session.metadata_hash) ||
       default_model_for_harness(session.harness_type.to_s)
-  end
-
-  # An unknown model falls back to the harness default rather than erroring:
-  # the select is populated from the same list, so mismatches only come from
-  # hand-crafted posts.
-  def composer_model_param(harness)
-    model = params[:model].to_s.strip
-    return nil if model.blank?
-
-    allowed = COMPOSER_MODELS.fetch(harness, []).map(&:first) +
-      [ default_model_for_harness(harness) ]
-    allowed.compact.include?(model) ? model : nil
   end
 
   # Keeps split-view panes open across a composer submit: the form carries the

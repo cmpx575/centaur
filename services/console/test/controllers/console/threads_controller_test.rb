@@ -667,8 +667,9 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select "a[aria-label=?]", "New chat", count: 1
     assert_select "form[action=?]", console_threads_path do
       assert_select "textarea[name=prompt]", count: 1
-      assert_select "select[name=harness_type]", count: 1
       assert_select "select[name=model]", count: 1
+      assert_select "select[name=model] option[value=?]", "amp"
+      assert_select "select[name=harness_type]", count: 0
     end
   end
 
@@ -684,8 +685,8 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select "form[action=?]", console_threads_path do
       assert_select "input[type=hidden][name=thread_key][value=?]", "console:composer-open"
       assert_select "textarea[name=prompt]", count: 1
-      # Follow-ups stay on the chat's existing harness/model: no pickers.
-      assert_select "select[name=harness_type]", count: 0
+      # Follow-ups stay on the chat's existing harness/model: no picker.
+      assert_select "select[name=model]", count: 0
     end
   end
 
@@ -693,7 +694,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     client = RecordingApiClient.new
     with_composer(client: client) do
       post console_threads_url,
-           params: { prompt: "Reply with PONG.", harness_type: "claudecode", model: "claude-opus-4-8" }
+           params: { prompt: "Reply with PONG.", model: "claude-opus-4-8" }
     end
 
     assert_equal %i[create_session append_session_messages execute_session], client.calls.map(&:first)
@@ -727,11 +728,10 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_threads_path(thread: create[:thread_key])
   end
 
-  test "starting an amp chat sends no model" do
+  test "picking Amp starts an amp chat and sends no model" do
     client = RecordingApiClient.new
     with_composer(client: client) do
-      post console_threads_url,
-           params: { prompt: "Reply with PONG.", harness_type: "amp", model: "claude-opus-4-8" }
+      post console_threads_url, params: { prompt: "Reply with PONG.", model: "amp" }
     end
 
     create = client.calls[0].last
@@ -744,15 +744,26 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_not line.key?("model")
   end
 
-  test "starting a chat with an unknown harness is rejected" do
+  test "starting a chat with an unknown model is rejected" do
     client = RecordingApiClient.new
     with_composer(client: client) do
-      post console_threads_url, params: { prompt: "Reply with PONG.", harness_type: "hal9000" }
+      post console_threads_url, params: { prompt: "Reply with PONG.", model: "hal9000" }
     end
 
     assert_empty client.calls
     assert_redirected_to console_threads_path(new: 1)
-    assert_match(/Unknown harness/, flash[:alert])
+    assert_match(/Unknown model/, flash[:alert])
+  end
+
+  test "a gpt model pick starts a codex chat" do
+    client = RecordingApiClient.new
+    with_composer(client: client) do
+      post console_threads_url, params: { prompt: "Reply with PONG.", model: "gpt-5.5" }
+    end
+
+    create = client.calls[0].last
+    assert_equal "codex", create[:harness_type]
+    assert_equal "gpt-5.5", create[:metadata][:model]
   end
 
   test "a blank prompt in writable mode asks for a message" do
