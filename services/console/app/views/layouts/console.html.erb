@@ -971,6 +971,13 @@
         color: #a1a1aa;
       }
 
+      /* New chat is an action row, not a nav destination: hover brightens the
+         text instead of drawing a pill, so it never stacks against the active
+         Chats pill right below it. */
+      .console-new-chat-link:hover {
+        background: transparent;
+        color: #f4f4f5;
+      }
 
       .console-new-chat-link .console-nav-icon {
         position: absolute;
@@ -1471,6 +1478,11 @@
 
       html[data-console-theme="light"] .console-new-chat-link {
         color: #565c63;
+      }
+
+      html[data-console-theme="light"] .console-new-chat-link:hover {
+        background: transparent;
+        color: #1c1f23;
       }
 
       @media (max-width: 760px) {
