@@ -36,59 +36,18 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".console-thread-group-title", text: /Chats/
   end
 
-  test "threads page does not render composer when session database is unavailable" do
-    with_threads_read_only do
-      with_recent_first_error do
-        get console_threads_url
-      end
+  test "threads page falls back to the new chat screen when session database is unavailable" do
+    with_recent_first_error do
+      get console_threads_url
     end
 
     assert_response :ok
-    assert_select "input[name=q]", count: 0
-    assert_select ".console-main-thread-frame aside", count: 0
-    # No chat selected: like the not-found state, the page renders only the
-    # centered empty state — no detail header.
+    # No chat selected: the new-chat composer renders (posting goes through
+    # the API, not the sessions DB), alongside the unavailability note.
     assert_select ".console-thread-detail-header", count: 0
-    assert_select "a[aria-label=?]", "New chat", count: 0
-    assert_select "span[aria-label=?]", "New chat disabled", count: 0
-    assert_select "textarea[name=prompt]", count: 0
-    assert_select "select[name=harness_type]", count: 0
-    assert_select "form[action=?]", console_threads_path, count: 0
-    assert_select "body", text: /No chats yet/
+    assert_select "a[aria-label=?]", "New chat", count: 1
+    assert_select "textarea[name=prompt]", count: 1
     assert_select "body", text: /Chat database is unavailable/
-  end
-
-  test "blank prompt is blocked by read only mode" do
-    with_threads_read_only do
-      post console_threads_url, params: { prompt: " " }
-    end
-
-    assert_redirected_to console_threads_path
-    assert_equal "Chats are read-only while browsing a mirrored production snapshot.", flash[:alert]
-  end
-
-  test "threads page hides composer controls" do
-    with_threads_read_only do
-      with_recent_first_error do
-        get console_threads_url
-      end
-    end
-
-    assert_response :ok
-    assert_select "textarea[name=prompt]", count: 0
-    assert_select "form[action=?]", console_threads_path, count: 0
-    assert_select "body", text: /Read-only snapshot/, count: 0
-    assert_select "span[aria-label=?]", "New chat disabled", count: 0
-    assert_select "a[aria-label=?]", "New chat", count: 0
-  end
-
-  test "posts are blocked without calling the session api" do
-    with_threads_read_only do
-      post console_threads_url, params: { prompt: "Do not run this." }
-    end
-
-    assert_redirected_to console_threads_path
-    assert_equal "Chats are read-only while browsing a mirrored production snapshot.", flash[:alert]
   end
 
   test "plain threads page redirects to first visible thread" do
@@ -633,30 +592,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_nil controller.send(:selected_session, scoped_relation, [])
   end
 
-  test "starting a thread is blocked without calling the session api" do
-    with_threads_read_only do
-      post console_threads_url, params: { prompt: "Reply with PONG.", harness_type: "amp" }
-    end
-
-    assert_redirected_to console_threads_path
-    assert_equal "Chats are read-only while browsing a mirrored production snapshot.", flash[:alert]
-  end
-
-  test "posting to an existing thread is blocked without calling the session api" do
-    with_threads_read_only do
-      post console_threads_url,
-           params: {
-             prompt: "Continue from here.",
-             thread_key: "console:existing",
-             harness_type: "codex"
-           }
-    end
-
-    assert_redirected_to console_threads_path(thread: "console:existing")
-    assert_equal "Chats are read-only while browsing a mirrored production snapshot.", flash[:alert]
-  end
-
-  test "writable mode renders the sidebar New chat link and the full-page composer" do
+  test "renders the sidebar New chat link and the full-page composer" do
     with_composer do
       with_recent_first_error do
         get console_threads_url(new: 1)
@@ -675,7 +611,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  test "writable mode shows the new chat screen when nothing is selected" do
+  test "shows the new chat screen when nothing is selected" do
     with_composer do
       with_recent_first_error do
         get console_threads_url
@@ -687,7 +623,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select "body", text: /No chats yet/, count: 0
   end
 
-  test "writable mode renders a follow-up composer on an open chat" do
+  test "renders a follow-up composer on an open chat" do
     skip_unless_session_table
     insert_console_session("console:composer-open")
 
@@ -780,7 +716,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "gpt-5.5", create[:metadata][:model]
   end
 
-  test "a blank prompt in writable mode asks for a message" do
+  test "a blank prompt asks for a message" do
     client = RecordingApiClient.new
     with_composer(client: client) do
       post console_threads_url, params: { prompt: "   " }
@@ -1367,18 +1303,11 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  # Read-only is the unset-env default; pinned explicitly so the suite is
-  # deterministic when the runner exports CENTAUR_CONSOLE_THREADS_READ_ONLY=0
-  # (the local dev container does).
-  def with_threads_read_only(&block)
-    with_env("CENTAUR_CONSOLE_THREADS_READ_ONLY" => nil, "IRON_CONTROL_THREADS_READ_ONLY" => nil, &block)
-  end
-
-  # Runs the block with chats writable and the injected fake session client.
+  # Runs the block with the injected fake session client.
   def with_composer(client: RecordingApiClient.new)
     original_factory = Console::ThreadsController.client_factory
     Console::ThreadsController.client_factory = -> { client }
-    with_env("CENTAUR_CONSOLE_THREADS_READ_ONLY" => "0") { yield client }
+    yield client
   ensure
     Console::ThreadsController.client_factory = original_factory
   end

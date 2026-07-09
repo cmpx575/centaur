@@ -1552,17 +1552,15 @@
             </div>
           <% end %>
 
-          <% unless console_threads_read_only? %>
-            <div class="console-thread-group">
-              <a href="<%= console_threads_path(new: 1) %>"
-                 class="console-thread-group-title"
-                 aria-label="New chat"
-                 title="New chat">
-                <span class="console-nav-icon"><%= console_icon("plus", classes: "size-4") %></span>
-                <span class="console-nav-label">New chat</span>
-              </a>
-            </div>
-          <% end %>
+          <div class="console-thread-group">
+            <a href="<%= console_threads_path(new: 1) %>"
+               class="console-thread-group-title"
+               aria-label="New chat"
+               title="New chat">
+              <span class="console-nav-icon"><%= console_icon("plus", classes: "size-4") %></span>
+              <span class="console-nav-label">New chat</span>
+            </a>
+          </div>
 
           <div class="console-thread-group">
             <a href="<%= console_threads_path %>"

@@ -62,8 +62,6 @@ class Console::ThreadsController < ApplicationController
   CONSOLE_THREAD_OWNER_METADATA_KEYS = %w[actor_email user_email].freeze
   SLACK_USER_ID_PATTERN = /\A[UW][A-Z0-9]+\z/.freeze
   SLACK_MENTION_PATTERN = /<@([UW][A-Z0-9]+)(?:\|([^>]+))?>|@([UW][A-Z0-9]+)/.freeze
-  READ_ONLY_REASON =
-    "Chats are read-only while browsing a mirrored production snapshot.".freeze
   # Deploy-time default-model overrides: the same env vars deployers set in
   # sandbox.extraEnv to change the harness model, mirrored onto the Console by
   # the chart. Amp has no fixed default model, so it is intentionally absent.
@@ -145,11 +143,6 @@ class Console::ThreadsController < ApplicationController
   # is still read from the sessions DB by #index after the redirect.
   def create
     thread_key = params[:thread_key].to_s.strip.presence
-
-    if console_threads_read_only?
-      redirect_to(console_threads_path(thread: thread_key), alert: READ_ONLY_REASON)
-      return
-    end
 
     prompt = params[:prompt].to_s.strip
     if prompt.blank?

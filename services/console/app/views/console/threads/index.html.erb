@@ -51,11 +51,10 @@
       </div>
       <% end %>
 
-      <%# With posting enabled, an empty selection IS the new-chat screen —
-          both the explicit ?new=1 entry point and the nothing-selected /
-          no-chats-yet cases. Read-only keeps the plain empty states below;
-          an unresolvable ?thread= still renders as not-found. %>
-      <% if (@starting_new_thread || @selected_session.nil?) && !@thread_not_found && !console_threads_read_only? %>
+      <%# An empty selection IS the new-chat screen — both the explicit ?new=1
+          entry point and the nothing-selected / no-chats-yet cases. An
+          unresolvable ?thread= still renders as not-found. %>
+      <% if (@starting_new_thread || @selected_session.nil?) && !@thread_not_found %>
         <div class="flex min-h-0 flex-1 items-start justify-center overflow-y-auto px-6">
           <div class="console-new-chat">
             <h1 class="console-new-chat-title">Start a new chat</h1>
@@ -68,7 +67,7 @@
           <div class="console-thread-content flex flex-col gap-6">
             <%= render "console/threads/transcript", items: @selected_transcript_items %>
           </div>
-        <% elsif @thread_not_found %>
+        <% else %>
           <div class="flex h-full items-center justify-center px-6">
             <div class="flex max-w-sm flex-col items-center gap-3 text-center">
               <div class="flex size-12 items-center justify-center rounded-full border border-ink-700 bg-ink-850/60 text-zinc-500">
@@ -77,31 +76,10 @@
               <div class="text-sm font-semibold text-zinc-200">Chat not found</div>
             </div>
           </div>
-        <% elsif @sessions.empty? %>
-          <div class="flex h-full items-center justify-center px-6">
-            <div class="flex max-w-sm flex-col items-center gap-3 text-center">
-              <div class="flex size-12 items-center justify-center rounded-full border border-ink-700 bg-ink-850/60 text-zinc-500">
-                <%= console_icon("message-square", classes: "size-5") %>
-              </div>
-              <div class="text-sm font-semibold text-zinc-200">No chats yet</div>
-              <p class="text-sm leading-6 text-zinc-500">
-                Chats you start — from Slack or the Console — will show up here.
-              </p>
-            </div>
-          </div>
-        <% else %>
-          <div class="flex h-full items-center justify-center px-6">
-            <div class="flex max-w-sm flex-col items-center gap-3 text-center">
-              <div class="flex size-12 items-center justify-center rounded-full border border-ink-700 bg-ink-850/60 text-zinc-500">
-                <%= console_icon("message-square", classes: "size-5") %>
-              </div>
-              <div class="text-sm font-semibold text-zinc-200">Select a chat from the sidebar</div>
-            </div>
-          </div>
         <% end %>
       </div>
 
-      <% if @selected_session && !console_threads_read_only? %>
+      <% if @selected_session %>
         <div class="console-composer-dock">
           <div class="console-thread-content">
             <%= render "console/threads/composer", mode: :thread, session: @selected_session %>
