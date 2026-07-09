@@ -114,7 +114,8 @@ class Console::ThreadsController < ApplicationController
                 :thread_text_preview,
                 :thread_status_classes,
                 :composer_agent_choices,
-                :composer_default_agent_value
+                :composer_default_agent_value,
+                :thread_execution_active?
 
   def index
     @query = params[:q].to_s.strip
@@ -169,6 +170,13 @@ class Console::ThreadsController < ApplicationController
 
   def api_client
     @api_client ||= client_factory.call
+  end
+
+  # Whether the thread's newest execution is still running — drives the
+  # transcript's thinking indicator and the while-running auto-refresh.
+  def thread_execution_active?(thread_key)
+    execution = @latest_executions&.[](thread_key)
+    execution.present? && %w[queued running executing].include?(execution.status.to_s)
   end
 
   # Selector options as [label, value] pairs, the deploy's default model

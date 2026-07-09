@@ -37,6 +37,7 @@
   <div class="console-transcript-scroll min-h-0 flex-1 overflow-y-auto px-4 py-4">
     <div class="flex flex-col gap-5">
       <%= render "console/threads/transcript", items: panel[:transcript_items] %>
+      <%= render "console/threads/thinking_indicator" if thread_execution_active?(session.thread_key) %>
     </div>
   </div>
   <div class="console-composer-dock console-composer-dock--panel">

@@ -24,11 +24,6 @@
                        class: "console-composer-input",
                        data: { console_composer_input: true } %>
     <div class="console-composer-controls">
-      <% if thread_mode %>
-        <span class="console-composer-meta">
-          <%= thread_harness_label(composer_session) %><% if (model_label = thread_model_label(composer_session)) %> · <%= model_label %><% end %>
-        </span>
-      <% end %>
       <span class="console-composer-spacer"></span>
       <% unless thread_mode %>
         <% default_value = composer_default_agent_value %>
@@ -70,6 +65,66 @@
   (() => {
     if (window.__consoleComposerWired) return;
     window.__consoleComposerWired = true;
+
+    // Optimistic send: paint the outgoing message and a thinking placeholder
+    // the moment the form submits, so the seconds the server spends creating
+    // the session and dispatching the turn never look like a hang. The real
+    // transcript replaces all of it when the redirect lands. Markup mirrors
+    // the transcript partial's user bubble and _thinking_indicator.
+    const userBubble = (text) => {
+      const row = document.createElement("div");
+      row.className = "group flex justify-end";
+      const stack = document.createElement("div");
+      stack.className = "console-message-stack flex flex-col max-w-[72%] items-end";
+      const bubble = document.createElement("div");
+      bubble.className = "w-full rounded-[24px] bg-ink-700 px-4 py-3 text-zinc-100";
+      const body = document.createElement("div");
+      body.className = "console-markdown text-sm leading-6";
+      body.style.whiteSpace = "pre-wrap";
+      body.textContent = text;
+      bubble.appendChild(body);
+      stack.appendChild(bubble);
+      row.appendChild(stack);
+      return row;
+    };
+
+    const thinkingRow = () => {
+      const row = document.createElement("div");
+      row.className = "flex justify-start";
+      row.setAttribute("data-console-thinking-indicator", "");
+      const pending = document.createElement("div");
+      pending.className = "console-thinking-pending";
+      pending.textContent = "Thinking…";
+      row.appendChild(pending);
+      return row;
+    };
+
+    document.addEventListener("submit", (event) => {
+      const form = event.target;
+      if (!form.matches?.("[data-console-composer]")) return;
+      const input = form.querySelector("[data-console-composer-input]");
+      const text = (input?.value || "").trim();
+      if (!text) return;
+
+      if (form.dataset.consoleComposer === "new") {
+        // The form stays in the DOM (hidden) so the in-flight submission is
+        // undisturbed; the heading gives way to the painted conversation.
+        const container = form.closest(".console-new-chat");
+        if (!container) return;
+        const column = document.createElement("div");
+        column.className = "flex w-full flex-col gap-6";
+        column.append(userBubble(text), thinkingRow());
+        container.querySelector(".console-new-chat-title")?.setAttribute("hidden", "");
+        container.insertBefore(column, form);
+        form.hidden = true;
+      } else {
+        const transcript = form.closest("section")?.querySelector(".console-transcript-scroll > div");
+        if (!transcript) return;
+        transcript.querySelector("[data-console-thinking-indicator]")?.remove();
+        transcript.append(userBubble(text), thinkingRow());
+        input.value = "";
+      }
+    });
 
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {

@@ -623,6 +623,28 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select "body", text: /No chats yet/, count: 0
   end
 
+  test "an active execution renders a thinking indicator" do
+    skip_unless_session_table
+    insert_console_session("console:thinking-active")
+    insert_session_execution("console:thinking-active", status: "running")
+
+    get console_threads_url(thread: "console:thinking-active")
+
+    assert_response :ok
+    assert_select "[data-console-thinking-indicator]", count: 1
+  end
+
+  test "a completed execution renders no thinking indicator" do
+    skip_unless_session_table
+    insert_console_session("console:thinking-done")
+    insert_session_execution("console:thinking-done", status: "completed")
+
+    get console_threads_url(thread: "console:thinking-done")
+
+    assert_response :ok
+    assert_select "[data-console-thinking-indicator]", count: 0
+  end
+
   test "renders a follow-up composer on an open chat" do
     skip_unless_session_table
     insert_console_session("console:composer-open")
@@ -1372,6 +1394,21 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
       slack_user_name: slack_user_name
     }.to_json
     insert_session(thread_key, metadata)
+  end
+
+  def insert_session_execution(thread_key, status:)
+    connection = CentaurSession.connection
+    connection.execute(<<~SQL.squish)
+      insert into session_executions (execution_id, thread_key, status, metadata, created_at, updated_at)
+      values (
+        #{connection.quote("#{thread_key}-exec")},
+        #{connection.quote(thread_key)},
+        #{connection.quote(status)},
+        '{}'::jsonb,
+        now(),
+        now()
+      )
+    SQL
   end
 
   def insert_session_message(thread_key, index:)

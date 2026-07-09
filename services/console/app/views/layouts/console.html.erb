@@ -931,12 +931,18 @@
         color: #3ace79;
       }
 
-      .console-composer-meta {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        color: #71717a;
-        font-size: 0.75rem;
+      /* "Thinking…" placeholder while a turn is executing, painted both by
+         the server (_thinking_indicator) and the composer's optimistic JS. */
+      .console-thinking-pending {
+        color: #8b8b94;
+        font-size: 0.875rem;
+        line-height: 1.5;
+        animation: console-thinking-pulse 1.6s ease-in-out infinite;
+      }
+
+      @keyframes console-thinking-pulse {
+        0%, 100% { opacity: 0.45; }
+        50% { opacity: 1; }
       }
 
       .console-composer-send {
@@ -1447,7 +1453,7 @@
         color: #1f9d55;
       }
 
-      html[data-console-theme="light"] .console-composer-meta {
+      html[data-console-theme="light"] .console-thinking-pending {
         color: #6f757c;
       }
 
