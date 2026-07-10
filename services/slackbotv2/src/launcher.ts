@@ -524,10 +524,12 @@ async function pollWorkflow(
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
   let runningCardShown = record.state === 'running'
   while ((options.now ?? Date.now)() - startedAt <= maxPollMs) {
-    const run = await centaurApi(
+    const response = await centaurApi(
       options,
       `/api/workflows/runs/${encodeURIComponent(record.workflowRunId ?? '')}`
     )
+    const wrappedRun = recordAt(response, 'run')
+    const run = Object.keys(wrappedRun).length > 0 ? wrappedRun : response
     const status = stringAt(run, 'status')
     if (TERMINAL_WORKFLOW_STATES.has(status)) return run
     if (status === 'running' && !runningCardShown) {

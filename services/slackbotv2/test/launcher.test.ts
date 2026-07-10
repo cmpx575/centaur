@@ -83,8 +83,9 @@ function testHarness(input: {
       })
     }
     if (url.endsWith('/api/workflows/runs/workflow-run-1')) {
-      return jsonResponse(
-        workflowStates.shift() ?? {
+      return jsonResponse({
+        ok: true,
+        run: workflowStates.shift() ?? {
           run_id: 'workflow-run-1',
           status: 'completed',
           result: {
@@ -93,7 +94,7 @@ function testHarness(input: {
             terminal_state: 'completed'
           }
         }
-      )
+      })
     }
     return jsonResponse({ ok: false, error: 'unhandled_test_url' }, 500)
   }
