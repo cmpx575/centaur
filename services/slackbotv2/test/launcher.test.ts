@@ -89,9 +89,11 @@ function testHarness(input: {
           run_id: 'workflow-run-1',
           status: 'completed',
           result: {
-            launcher_run_id: '2026-07-10_experiment-slack-launcher-proof',
-            fleet_job_id: 'fleet-job-1',
-            terminal_state: 'completed'
+            output: {
+              launcher_run_id: '2026-07-10_experiment-slack-launcher-proof',
+              fleet_job_id: 'fleet-job-1',
+              terminal_state: 'completed'
+            }
           }
         }
       })

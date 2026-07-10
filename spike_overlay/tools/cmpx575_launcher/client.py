@@ -27,7 +27,7 @@ _TERMINAL_STATES = {"done", "failed", "cancelled"}
 SHAPES: dict[str, dict[str, Any]] = {
     "experiment": {
         "title": "Experiment Launcher",
-        "default_worker": "codex",
+        "default_worker": "grok",
         "timeout": 2400,
         "goal": "Launch a scoped orchestration experiment with a durable run folder.",
         "steps": [
@@ -374,6 +374,13 @@ class ExperimentLauncherClient:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", clean_job_id):
             raise ValueError("job_id contains unsupported characters")
         resp = self.client.get(f"/jobs/{quote(clean_job_id, safe='')}")
+        if resp.status_code == 500:
+            try:
+                error = str(resp.json().get("error") or "")
+            except (ValueError, AttributeError):
+                error = ""
+            if error.startswith("invalid result.json:"):
+                return {"state": "failed"}
         if resp.status_code >= 400:
             raise RuntimeError(f"fleet-dispatch API error ({resp.status_code}): {resp.text}")
         data = resp.json()

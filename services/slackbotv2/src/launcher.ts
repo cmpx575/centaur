@@ -457,7 +457,9 @@ async function processSubmission(
     }
 
     const terminal = await pollWorkflow(options, record)
-    const result = recordAt(terminal, 'result')
+    const resultEnvelope = recordAt(terminal, 'result')
+    const resultOutput = recordAt(resultEnvelope, 'output')
+    const result = Object.keys(resultOutput).length > 0 ? resultOutput : resultEnvelope
     record.launcherRunId = stringAt(result, 'launcher_run_id') || record.launcherRunId
     record.fleetJobId = stringAt(result, 'fleet_job_id') || record.fleetJobId
     const workflowState = stringAt(terminal, 'status')
