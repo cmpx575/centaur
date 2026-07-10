@@ -13,10 +13,12 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
-DEFAULT_BASE_URL = "https://macbook-pro-nipun.tail0b8caf.ts.net:8799"
+AUTH_RELAY_HOST = "fleet-dispatch-auth-relay.spike-centaur.svc.cluster.local"
+DEFAULT_BASE_URL = f"http://{AUTH_RELAY_HOST}:8799"
 DEFAULT_REPO_PATH = "/Users/nipunsharma/github.com/cmpx575/nipun-grokbuild-hermes-test"
 DEFAULT_TIMEOUT = 1800
 _TERMINAL_STATES = {"done", "failed", "cancelled"}
@@ -111,6 +113,14 @@ def _explicit_proxy() -> str | None:
     if enabled not in {"1", "true", "yes", "on"}:
         return None
     return os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")  # noqa: TID251
+
+
+def _transport_policy(base_url: str) -> tuple[str | None, bool]:
+    """Keep the credential-bearing spike relay off all ambient proxies."""
+    if urlparse(base_url).hostname == AUTH_RELAY_HOST:
+        return None, False
+    proxy = _explicit_proxy()
+    return proxy, proxy is None
 
 
 def _secret(name: str, default: str) -> str:
@@ -323,15 +333,16 @@ class ExperimentLauncherClient:
     @property
     def client(self) -> httpx.Client:
         if self._client is None:
-            proxy = _explicit_proxy()
+            base_url = self.base_url
+            proxy, trust_env = _transport_policy(base_url)
             self._client = httpx.Client(
-                base_url=self.base_url,
+                base_url=base_url,
                 headers=self._auth_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
                 verify=_ca_bundle() or True,
                 proxy=proxy,
-                trust_env=proxy is None,
+                trust_env=trust_env,
             )
         return self._client
 
