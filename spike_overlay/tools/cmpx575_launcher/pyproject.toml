@@ -1,0 +1,29 @@
+[project]
+name = "centaur-tool-cmpx575-launcher"
+description = "Typed durable-workflow adapter for cmpx575 launcher shapes"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv>=1.0.0",
+    "typer>=0.12.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+cmpx575-launcher = "centaur_tool_cmpx575_launcher.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.hatch.build.targets.wheel.sources]
+"." = "centaur_tool_cmpx575_launcher"
+
+[tool.centaur]
+module = "client.py"
+secrets = [
+    {type = "http", name = "FLEET_DISPATCH_TOKEN", match_headers = ["Authorization"], hosts = ["macbook-pro-nipun.tail0b8caf.ts.net", "macbook-pro-nipun.tail0b8caf.ts.net:8799", "fleet-dispatch-lan.spike-centaur.svc.cluster.local", "fleet-dispatch-lan.spike-centaur.svc.cluster.local:8799"]},
+]

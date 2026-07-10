@@ -50,7 +50,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     launch = await ctx.step(
         "launch",
         lambda: ctx.call_tool(
-            "experiment-launcher",
+            "cmpx575-launcher",
             "launch",
             {
                 "version": inp.version,
