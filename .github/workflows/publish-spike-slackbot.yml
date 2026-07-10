@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-arm64:
+  build-multiarch:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
@@ -42,13 +42,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push immutable arm64 image
+      - name: Build and push immutable multi-architecture image
         env:
           IMAGE: ghcr.io/cmpx575/centaur/centaur-slackbotv2
           SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           docker buildx build \
-            --platform linux/arm64 \
+            --platform linux/amd64,linux/arm64 \
             --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
             --label "org.opencontainers.image.source=https://github.com/cmpx575/centaur" \
             --tag "${IMAGE}:${SOURCE_SHA}" \
