@@ -13,7 +13,7 @@ import json
 import os
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -367,6 +367,19 @@ class ExperimentLauncherClient:
             "timeout": plan["timeout"],
             "gateway_response": data,
         }
+
+    def status(self, job_id: str) -> dict[str, str]:
+        """Return only the fleet lifecycle state, never the worker result."""
+        clean_job_id = job_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", clean_job_id):
+            raise ValueError("job_id contains unsupported characters")
+        resp = self.client.get(f"/jobs/{quote(clean_job_id, safe='')}")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"fleet-dispatch API error ({resp.status_code}): {resp.text}")
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("fleet-dispatch status returned a non-object")
+        return {"state": str(data.get("state") or "unknown")}
 
     def launch(
         self,

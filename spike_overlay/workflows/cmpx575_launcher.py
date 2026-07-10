@@ -82,14 +82,14 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         status = await ctx.step(
             f"fleet-status-{attempt:04d}",
             lambda: ctx.call_tool(
-                "fleet-dispatch",
+                "cmpx575-launcher",
                 "status",
                 {"job_id": fleet_job_id},
             ),
             step_kind="tool_call",
         )
         if not isinstance(status, dict):
-            raise RuntimeError("fleet_dispatch.status returned a non-object")
+            raise RuntimeError("cmpx575_launcher.status returned a non-object")
         fleet_state = str(status.get("state") or "unknown")
         if fleet_state in _TERMINAL_FLEET_STATES:
             break
