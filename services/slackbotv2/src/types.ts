@@ -113,6 +113,11 @@ export type SlackbotV2Options = {
   fetch?: SlackbotV2Fetch
   /** Milliseconds before an idle execution pauses its sandbox. Defaults to up to 3h. */
   idleTimeoutMs?: number
+  launcherAllowedChannelIds?: readonly string[]
+  launcherAllowedTeamIds?: readonly string[]
+  launcherAllowedUserIds?: readonly string[]
+  launcherMaxPollMs?: number
+  launcherPollIntervalMs?: number
   logger?: Logger
   maxDurationMs?: number
   postgresUrl?: string

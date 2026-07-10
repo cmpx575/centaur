@@ -33,6 +33,11 @@ const options: SlackbotV2Options = {
   botUserId: optionalEnv('SLACK_BOT_USER_ID'),
   defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
   idleTimeoutMs: optionalNumberEnv('SESSION_IDLE_TIMEOUT_MS'),
+  launcherAllowedChannelIds: csvEnv('SLACK_LAUNCHER_ALLOWED_CHANNEL_IDS'),
+  launcherAllowedTeamIds: csvEnv('SLACK_LAUNCHER_ALLOWED_TEAM_IDS'),
+  launcherAllowedUserIds: csvEnv('SLACK_LAUNCHER_ALLOWED_USER_IDS'),
+  launcherMaxPollMs: optionalNumberEnv('SLACK_LAUNCHER_MAX_POLL_MS'),
+  launcherPollIntervalMs: optionalNumberEnv('SLACK_LAUNCHER_POLL_INTERVAL_MS'),
   maxDurationMs: optionalNumberEnv('SESSION_MAX_DURATION_MS'),
   postgresUrl:
     optionalEnv('SLACKBOTV2_DATABASE_URL') ??
@@ -63,6 +68,11 @@ console.log(
     event: 'slackbotv2_started',
     service: 'slackbotv2',
     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
+    launcher_allowlist_counts: {
+      channels: options.launcherAllowedChannelIds?.length ?? 0,
+      teams: options.launcherAllowedTeamIds?.length ?? 0,
+      users: options.launcherAllowedUserIds?.length ?? 0
+    },
     port: server.port,
     api_url: apiUrl
   })
@@ -83,6 +93,13 @@ function requiredEnv(name: string): string {
 
 function stringEnv(name: string, fallback: string): string {
   return optionalEnv(name) ?? fallback
+}
+
+function csvEnv(name: string): string[] {
+  return (optionalEnv(name) ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
 }
 
 function numberEnv(name: string, fallback: number): number {
