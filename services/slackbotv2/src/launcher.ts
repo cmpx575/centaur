@@ -219,7 +219,8 @@ export function launcherMessagePayload(): JsonRecord {
         // Slack allows at most 5 elements per actions block; one button per allowlisted shape.
         elements: LAUNCHER_SHAPES.map((shape, index) => ({
           type: 'button',
-          action_id: LAUNCHER_ACTION_ID,
+          // Slack requires action_id unique within a message; suffix with shape key.
+          action_id: `${LAUNCHER_ACTION_ID}:${shape.key}`,
           text: { type: 'plain_text', text: shape.label, emoji: true },
           value: shape.key,
           ...(index === 0 ? { style: 'primary' as const } : {})
@@ -284,7 +285,10 @@ async function openExperimentModal(
   const action = asRecord(actions[0])
   const actionId = stringAt(action, 'action_id')
   const shapeValue = stringAt(action, 'value')
-  if (actionId !== LAUNCHER_ACTION_ID || !isLauncherShape(shapeValue)) {
+  // Accept bare LAUNCHER_ACTION_ID (Phase-1 launchpad back-compat) and
+  // `${LAUNCHER_ACTION_ID}:${shape}` from multi-button launchpads. Shape is
+  // always taken from value and allowlisted via isLauncherShape.
+  if (!isLauncherActionId(actionId) || !isLauncherShape(shapeValue)) {
     throw new LauncherRequestError('disallowed_action', 400)
   }
   const shape = shapeValue
@@ -721,6 +725,19 @@ function parsePrivateMetadata(value: string): LauncherPrivateMetadata | undefine
 
 export function isLauncherShape(value: string): value is LauncherShape {
   return LAUNCHER_SHAPE_KEYS.has(value)
+}
+
+/**
+ * True for the bare Phase-1 action_id or a multi-button id
+ * `${LAUNCHER_ACTION_ID}:${allowlistedShape}`. Shape payload is still read
+ * from the button `value` field.
+ */
+export function isLauncherActionId(actionId: string): boolean {
+  if (actionId === LAUNCHER_ACTION_ID) return true
+  const prefix = `${LAUNCHER_ACTION_ID}:`
+  if (!actionId.startsWith(prefix)) return false
+  const shape = actionId.slice(prefix.length)
+  return isLauncherShape(shape)
 }
 
 function shapeMeta(shape: LauncherShape): (typeof LAUNCHER_SHAPES)[number] {

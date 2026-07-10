@@ -140,9 +140,24 @@ describe('Centaur Slack launcher signed interaction route', () => {
     expect(actionsBlock.elements.length).toBeLessThanOrEqual(5)
     for (const [index, shape] of LAUNCHER_SHAPES.entries()) {
       const button = actionsBlock.elements[index]
-      expect(button?.action_id).toBe(LAUNCHER_ACTION_ID)
+      expect(button?.action_id).toBe(`${LAUNCHER_ACTION_ID}:${shape.key}`)
       expect(button?.value).toBe(shape.key)
       expect((button?.text as { text: string }).text).toBe(shape.label)
+    }
+  })
+
+  test('launchpad action_ids are unique within the message (Slack rule)', () => {
+    // Slack rejects invalid_blocks when action_id is duplicated in a message.
+    // Regression for the multi-button launchpad that posted five identical ids.
+    const payload = launcherMessagePayload()
+    const actionsBlock = (payload.blocks as Record<string, unknown>[]).find(
+      block => block.type === 'actions'
+    ) as { elements: Array<Record<string, unknown>> }
+    const actionIds = actionsBlock.elements.map(el => el.action_id as string)
+    expect(actionIds).toHaveLength(LAUNCHER_SHAPES.length)
+    expect(new Set(actionIds).size).toBe(actionIds.length)
+    for (const shape of LAUNCHER_SHAPES) {
+      expect(actionIds).toContain(`${LAUNCHER_ACTION_ID}:${shape.key}`)
     }
   })
 
@@ -165,12 +180,41 @@ describe('Centaur Slack launcher signed interaction route', () => {
     expect(JSON.stringify(view)).not.toContain('fixture-signing-secret')
   })
 
+  test('bare and shape-suffixed action_ids both open a modal for a valid shape', async () => {
+    // Bare id: Phase-1 launchpad message still in channel (back-compat).
+    // Suffixed id: multi-button launchpad (Slack uniqueness rule).
+    const cases: Array<{ action_id: string; shape: LauncherShape }> = [
+      { action_id: LAUNCHER_ACTION_ID, shape: 'experiment' },
+      { action_id: `${LAUNCHER_ACTION_ID}:oncall-digest`, shape: 'oncall-digest' }
+    ]
+    for (const { action_id, shape } of cases) {
+      const harness = testHarness()
+      const payload = mutate(blockActionFixture, value => {
+        const action = (value.actions as Record<string, unknown>[])[0] as Record<string, unknown>
+        action.action_id = action_id
+        action.value = shape
+      })
+      const response = await signedRequest(harness.app, payload)
+      expect(response.status).toBe(200)
+      expect(harness.calls).toHaveLength(1)
+      expect(harness.calls[0]?.url).toEndWith('/views.open')
+      const view = harness.calls[0]?.body?.view as Record<string, unknown>
+      const metadata = JSON.parse(String(view.private_metadata)) as { shape: string }
+      expect(metadata.shape).toBe(shape)
+    }
+  })
+
   test('each allowlisted shape button opens a modal carrying that shape in private_metadata', async () => {
     for (const shape of LAUNCHER_SHAPES) {
       const harness = testHarness()
       const payload = mutate(blockActionFixture, value => {
-        ;((value.actions as Record<string, unknown>[])[0] as Record<string, unknown>).value =
-          shape.key
+        const action = (value.actions as Record<string, unknown>[])[0] as Record<
+          string,
+          unknown
+        >
+        // Multi-button launchpad scheme: unique action_id per shape, value = shape key.
+        action.action_id = `${LAUNCHER_ACTION_ID}:${shape.key}`
+        action.value = shape.key
       })
       const response = await signedRequest(harness.app, payload)
       expect(response.status).toBe(200)
