@@ -3,11 +3,15 @@ import type { Logger, StateAdapter } from 'chat'
 import { Hono } from 'hono'
 
 import {
+  CARD_CANCEL_ACTION_ID,
+  CARD_REFRESH_ACTION_ID,
+  CARD_RELAUNCH_ACTION_ID,
   LAUNCHER_ACTION_ID,
   LAUNCHER_CALLBACK_ID,
   LAUNCHER_SHAPES,
   launcherMessagePayload,
   registerSlackLauncher,
+  runCardPayload,
   slackSignature,
   type LauncherShape
 } from '../src/launcher'
@@ -85,17 +89,29 @@ function testHarness(input: {
         created: true
       })
     }
-    if (url.endsWith('/api/workflows/runs/workflow-run-1')) {
+    const cancelMatch = url.match(/\/api\/workflows\/runs\/([^/]+)\/cancel$/)
+    if (cancelMatch && (init?.method ?? 'GET').toUpperCase() === 'POST') {
+      return jsonResponse({
+        ok: true,
+        run_id: decodeURIComponent(cancelMatch[1] ?? 'workflow-run-1'),
+        status: 'cancelling'
+      })
+    }
+    const getMatch = url.match(/\/api\/workflows\/runs\/([^/]+)$/)
+    if (getMatch && (init?.method ?? 'GET').toUpperCase() === 'GET') {
+      const runId = decodeURIComponent(getMatch[1] ?? 'workflow-run-1')
       return jsonResponse({
         ok: true,
         run: workflowStates.shift() ?? {
-          run_id: 'workflow-run-1',
+          run_id: runId,
           status: 'completed',
+          created_at: new Date(NOW_MS - 90_000).toISOString(),
           result: {
             output: {
               launcher_run_id: '2026-07-10_experiment-slack-launcher-proof',
               fleet_job_id: 'fleet-job-1',
-              terminal_state: 'completed'
+              terminal_state: 'completed',
+              shape: 'experiment'
             }
           }
         }
@@ -434,6 +450,210 @@ describe('Centaur Slack launcher signed interaction route', () => {
     expect(action?.action_id).toBe(LAUNCHER_ACTION_ID)
     expect(view.callback_id).toBe(LAUNCHER_CALLBACK_ID)
   })
+
+  test('status card renders richer fields and three action buttons with unique action_ids', () => {
+    const payload = runCardPayload(
+      {
+        channelId: 'C_ALLOWED',
+        createdAt: new Date(NOW_MS - 125_000).toISOString(),
+        fleetJobId: 'fleet-job-1',
+        launcherRunId: 'launcher-run-1',
+        objective: 'Prove card buttons',
+        shape: 'oncall-digest',
+        state: 'running',
+        userId: 'U_ALLOWED',
+        workflowRunId: 'workflow-run-1'
+      },
+      NOW_MS
+    )
+    const blocks = payload.blocks as Record<string, unknown>[]
+    const section = blocks.find(block => block.type === 'section') as {
+      fields: Array<{ text: string }>
+    }
+    const fields = section.fields.map(field => field.text).join('\n')
+    expect(fields).toContain('*Status*')
+    expect(fields).toContain('*Shape*')
+    expect(fields).toContain('📟 Oncall digest')
+    expect(fields).toContain('*Worker*')
+    expect(fields).toContain('`grok`')
+    expect(fields).toContain('*Elapsed*')
+    expect(fields).toContain('2m 5s')
+    expect(fields).toContain('*Workflow run*')
+    expect(fields).toContain('*Launcher run*')
+    expect(fields).toContain('*Fleet job*')
+
+    const actionsBlock = blocks.find(block => block.type === 'actions') as {
+      elements: Array<Record<string, unknown>>
+    }
+    expect(actionsBlock.elements).toHaveLength(3)
+    const actionIds = actionsBlock.elements.map(el => el.action_id as string)
+    expect(actionIds).toEqual([
+      CARD_REFRESH_ACTION_ID,
+      CARD_CANCEL_ACTION_ID,
+      CARD_RELAUNCH_ACTION_ID
+    ])
+    // Slack rejects invalid_blocks when action_id is duplicated in a message.
+    expect(new Set(actionIds).size).toBe(actionIds.length)
+    expect(actionsBlock.elements[0]?.value).toBe('workflow-run-1')
+    expect(actionsBlock.elements[1]?.value).toBe('workflow-run-1')
+    expect(actionsBlock.elements[1]?.style).toBe('danger')
+    const relaunchValue = String(actionsBlock.elements[2]?.value)
+    expect(JSON.parse(relaunchValue)).toEqual({
+      shape: 'oncall-digest',
+      objective: 'Prove card buttons'
+    })
+  })
+
+  test('status card omits Cancel button on terminal states', () => {
+    for (const state of ['completed', 'failed', 'cancelled', 'cancelling'] as const) {
+      const payload = runCardPayload({
+        channelId: 'C_ALLOWED',
+        shape: 'experiment',
+        state,
+        userId: 'U_ALLOWED',
+        workflowRunId: 'workflow-run-1'
+      })
+      const actionsBlock = (payload.blocks as Record<string, unknown>[]).find(
+        block => block.type === 'actions'
+      ) as { elements: Array<Record<string, unknown>> }
+      const actionIds = actionsBlock.elements.map(el => el.action_id as string)
+      expect(actionIds).toEqual([CARD_REFRESH_ACTION_ID, CARD_RELAUNCH_ACTION_ID])
+      expect(actionIds).not.toContain(CARD_CANCEL_ACTION_ID)
+      expect(new Set(actionIds).size).toBe(actionIds.length)
+    }
+  })
+
+  test('card refresh block_action GETs the workflow and updates the card in place', async () => {
+    const harness = testHarness({
+      workflowStates: [
+        { run_id: 'workflow-run-1', status: 'running' },
+        {
+          run_id: 'workflow-run-1',
+          status: 'completed',
+          result: {
+            output: {
+              launcher_run_id: '2026-07-10_experiment-slack-launcher-proof',
+              fleet_job_id: 'fleet-job-1',
+              terminal_state: 'completed'
+            }
+          }
+        },
+        {
+          run_id: 'workflow-run-1',
+          status: 'completed',
+          result: {
+            output: {
+              launcher_run_id: '2026-07-10_experiment-slack-launcher-proof',
+              fleet_job_id: 'fleet-job-1',
+              terminal_state: 'completed',
+              shape: 'experiment'
+            }
+          }
+        }
+      ]
+    })
+    const submit = await signedRequest(harness.app, viewSubmissionFixture)
+    expect(submit.status).toBe(200)
+    await Promise.all(harness.pending)
+    const callsBefore = harness.calls.length
+
+    const refreshPayload = cardBlockAction(CARD_REFRESH_ACTION_ID, 'workflow-run-1')
+    const response = await signedRequest(harness.app, refreshPayload)
+    expect(response.status).toBe(200)
+    await Promise.all(harness.pending)
+
+    const newCalls = harness.calls.slice(callsBefore)
+    const gets = newCalls.filter(
+      call =>
+        call.method === 'GET' && call.url.endsWith('/api/workflows/runs/workflow-run-1')
+    )
+    const updates = newCalls.filter(call => call.url.endsWith('/chat.update'))
+    expect(gets.length).toBeGreaterThanOrEqual(1)
+    expect(updates.length).toBeGreaterThanOrEqual(1)
+    const updated = JSON.stringify(updates.at(-1)?.body)
+    expect(updated).toContain('workflow-run-1')
+    expect(updated).toContain('Completed')
+    expect(updated).toContain(CARD_REFRESH_ACTION_ID)
+    expect(updated).toContain(CARD_RELAUNCH_ACTION_ID)
+    expect(updates.at(-1)?.body?.channel).toBe('C_ALLOWED')
+    expect(updates.at(-1)?.body?.ts).toBe('1783700100.000200')
+  })
+
+  test('card cancel block_action POSTs cancel and updates with honest wording', async () => {
+    const harness = testHarness({
+      workflowStates: [
+        {
+          run_id: 'workflow-run-1',
+          status: 'completed',
+          result: {
+            output: {
+              launcher_run_id: '2026-07-10_experiment-slack-launcher-proof',
+              fleet_job_id: 'fleet-job-1',
+              terminal_state: 'completed'
+            }
+          }
+        }
+      ]
+    })
+    const submit = await signedRequest(harness.app, viewSubmissionFixture)
+    expect(submit.status).toBe(200)
+    await Promise.all(harness.pending)
+
+    // Force the stored record back to non-terminal so Cancel is meaningful.
+    for (const [key, value] of harness.state.values.entries()) {
+      if (typeof key === 'string' && key.includes(':launcher:run:') && value && typeof value === 'object') {
+        const record = value as Record<string, unknown>
+        record.state = 'running'
+        harness.state.values.set(key, record)
+      }
+    }
+
+    const callsBefore = harness.calls.length
+    const cancelPayload = cardBlockAction(CARD_CANCEL_ACTION_ID, 'workflow-run-1')
+    const response = await signedRequest(harness.app, cancelPayload)
+    expect(response.status).toBe(200)
+    await Promise.all(harness.pending)
+
+    const newCalls = harness.calls.slice(callsBefore)
+    const cancelPosts = newCalls.filter(
+      call =>
+        call.method === 'POST' &&
+        call.url.endsWith('/api/workflows/runs/workflow-run-1/cancel')
+    )
+    const updates = newCalls.filter(call => call.url.endsWith('/chat.update'))
+    expect(cancelPosts).toHaveLength(1)
+    expect(updates.length).toBeGreaterThanOrEqual(1)
+    const updated = JSON.stringify(updates.at(-1)?.body)
+    expect(updated).toContain('Cancel requested')
+    expect(updated).toContain('workflow cancelling')
+    expect(updated).toContain('fleet job may still finish')
+    // Must not claim the fleet worker PID was killed.
+    expect(updated.toLowerCase()).not.toContain('fleet job killed')
+    expect(updated.toLowerCase()).not.toContain('worker killed')
+    // Cancel button omitted while cancelling.
+    expect(updated).not.toContain(CARD_CANCEL_ACTION_ID)
+  })
+
+  test('card relaunch block_action opens a modal for the stored shape (objective prefilled)', async () => {
+    const harness = testHarness()
+    const relaunchValue = JSON.stringify({
+      shape: 'knowledge-map-ingest',
+      objective: 'Re-run the knowledge map ingest slice'
+    })
+    const payload = cardBlockAction(CARD_RELAUNCH_ACTION_ID, relaunchValue)
+    const response = await signedRequest(harness.app, payload)
+    expect(response.status).toBe(200)
+    expect(harness.calls).toHaveLength(1)
+    expect(harness.calls[0]?.url).toEndWith('/views.open')
+    const view = harness.calls[0]?.body?.view as Record<string, unknown>
+    expect(view.callback_id).toBe(LAUNCHER_CALLBACK_ID)
+    const metadata = JSON.parse(String(view.private_metadata)) as { shape: string }
+    expect(metadata.shape).toBe('knowledge-map-ingest')
+    expect(JSON.stringify(view)).toContain('Knowledge-map ingest')
+    expect(JSON.stringify(view)).toContain('Re-run the knowledge map ingest slice')
+    // New view id path is Slack-owned; private_metadata does not carry prior idempotency.
+    expect(JSON.stringify(view)).not.toContain('workflow-run-1')
+  })
 })
 
 async function signedRequest(
@@ -478,6 +698,27 @@ function viewSubmissionForShape(shape: LauncherShape): Record<string, unknown> {
       channel_id: 'C_ALLOWED',
       origin_ts: '1783700000.000100'
     })
+  })
+}
+
+function cardBlockAction(actionId: string, value: string): Record<string, unknown> {
+  return mutate(blockActionFixture, payload => {
+    const action = (payload.actions as Record<string, unknown>[])[0] as Record<string, unknown>
+    action.action_id = actionId
+    action.block_id = 'centaur_card_actions'
+    action.value = value
+    ;(payload.container as Record<string, unknown>).message_ts = '1783700100.000200'
+    payload.message = {
+      ts: '1783700100.000200',
+      blocks: runCardPayload({
+        channelId: 'C_ALLOWED',
+        objective: 'Prove the signed Centaur Slack launcher end to end.',
+        shape: 'experiment',
+        state: 'running',
+        userId: 'U_ALLOWED',
+        workflowRunId: 'workflow-run-1'
+      }).blocks
+    }
   })
 }
 

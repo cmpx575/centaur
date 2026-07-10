@@ -8,13 +8,43 @@ export const LAUNCHER_ACTION_ID = 'centaur.launch.experiment.v1'
 export const LAUNCHER_CALLBACK_ID = 'centaur.launcher.submit.v1'
 export const LAUNCHER_WORKFLOW_NAME = 'cmpx575_launcher'
 
+/** Status-card action_ids — must be unique within a Slack message (and across buttons). */
+export const CARD_REFRESH_ACTION_ID = 'centaur.card.refresh.v1'
+export const CARD_CANCEL_ACTION_ID = 'centaur.card.cancel.v1'
+export const CARD_RELAUNCH_ACTION_ID = 'centaur.card.relaunch.v1'
+
 /** Shapes already allowlisted by the cmpx575_launcher workflow — expose, do not redefine. */
 export const LAUNCHER_SHAPES = [
-  { key: 'experiment', label: '🧪 General experiment', title: 'General experiment' },
-  { key: 'oncall-digest', label: '📟 Oncall digest', title: 'Oncall digest' },
-  { key: 'knowledge-map-ingest', label: '🗺️ Knowledge-map ingest', title: 'Knowledge-map ingest' },
-  { key: 'slack-inbox-to-board', label: '📥 Inbox→board', title: 'Inbox→board' },
-  { key: 'quota-scheduler', label: '⏱️ Quota scheduler', title: 'Quota scheduler' }
+  {
+    key: 'experiment',
+    label: '🧪 General experiment',
+    title: 'General experiment',
+    worker: 'grok'
+  },
+  {
+    key: 'oncall-digest',
+    label: '📟 Oncall digest',
+    title: 'Oncall digest',
+    worker: 'grok'
+  },
+  {
+    key: 'knowledge-map-ingest',
+    label: '🗺️ Knowledge-map ingest',
+    title: 'Knowledge-map ingest',
+    worker: 'codex'
+  },
+  {
+    key: 'slack-inbox-to-board',
+    label: '📥 Inbox→board',
+    title: 'Inbox→board',
+    worker: 'codex'
+  },
+  {
+    key: 'quota-scheduler',
+    label: '⏱️ Quota scheduler',
+    title: 'Quota scheduler',
+    worker: 'grok'
+  }
 ] as const
 
 export type LauncherShape = (typeof LAUNCHER_SHAPES)[number]['key']
@@ -35,6 +65,10 @@ const RECORD_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const DEFAULT_POLL_INTERVAL_MS = 5_000
 const DEFAULT_MAX_POLL_MS = 45 * 60 * 1000
 const TERMINAL_WORKFLOW_STATES = new Set(['completed', 'failed', 'cancelled'])
+const TERMINAL_CARD_STATES = new Set(['completed', 'failed', 'cancelled'])
+/** Honest cancel copy: cancels the workflow run, not the fleet worker PID. */
+const CANCEL_REQUESTED_STATUS =
+  'Cancel requested — workflow cancelling; fleet job may still finish'
 
 type JsonRecord = Record<string, unknown>
 
@@ -77,13 +111,25 @@ type LauncherSubmission = {
   viewId: string
 }
 
+type LauncherRunState =
+  | 'claiming'
+  | 'queued'
+  | 'running'
+  | 'cancelling'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+
 type LauncherRunRecord = {
   cardTs?: string
   channelId: string
+  createdAt?: string
   fleetJobId?: string
+  idempotencyKey?: string
   launcherRunId?: string
+  objective?: string
   shape: LauncherShape
-  state: 'claiming' | 'queued' | 'running' | 'completed' | 'failed'
+  state: LauncherRunState
   terminalReplySent?: boolean
   updatedAt: string
   userId: string
@@ -139,19 +185,19 @@ export function registerSlackLauncher(app: Hono, options: SlackLauncherOptions):
         return denyInteraction(c, options, type, 'channel')
       }
       try {
-        await openExperimentModal(payload, teamId, channelId, options)
-        options.logger.info('slack_launcher_modal_opened', {
-          action_id: LAUNCHER_ACTION_ID,
-          channel_id: channelId,
-          team_id: teamId,
-          user_id: userId
-        })
-        return c.text('', 200)
+        const outcome = await dispatchBlockAction(payload, teamId, channelId, userId, options, c)
+        return outcome
       } catch (error) {
-        options.logger.error('slack_launcher_modal_open_failed', {
-          error_code: safeErrorCode(error)
-        })
-        return c.text('unable to open modal', 502)
+        const code = safeErrorCode(error)
+        options.logger.error('slack_launcher_block_action_failed', { error_code: code })
+        if (error instanceof LauncherRequestError) {
+          const status =
+            error.status === 400 || error.status === 403 || error.status === 502
+              ? error.status
+              : 502
+          return c.text(error.code, status)
+        }
+        return c.text('unable to handle action', 502)
       }
     }
 
@@ -274,36 +320,120 @@ export function verifySlackRequest(input: {
   return { ok: true }
 }
 
-async function openExperimentModal(
+async function dispatchBlockAction(
   payload: JsonRecord,
   teamId: string,
   channelId: string,
-  options: SlackLauncherOptions
-): Promise<void> {
+  userId: string,
+  options: SlackLauncherOptions,
+  c: Context
+): Promise<Response> {
   const actions = arrayAt(payload, 'actions')
   if (actions.length !== 1) throw new LauncherRequestError('invalid_action_count', 400)
   const action = asRecord(actions[0])
   const actionId = stringAt(action, 'action_id')
-  const shapeValue = stringAt(action, 'value')
-  // Accept bare LAUNCHER_ACTION_ID (Phase-1 launchpad back-compat) and
-  // `${LAUNCHER_ACTION_ID}:${shape}` from multi-button launchpads. Shape is
-  // always taken from value and allowlisted via isLauncherShape.
-  if (!isLauncherActionId(actionId) || !isLauncherShape(shapeValue)) {
-    throw new LauncherRequestError('disallowed_action', 400)
+  const value = stringAt(action, 'value')
+
+  // Launchpad shape buttons (Phase-1 bare id + multi-button suffixed ids).
+  if (isLauncherActionId(actionId)) {
+    if (!isLauncherShape(value)) throw new LauncherRequestError('disallowed_action', 400)
+    await openLauncherModal({
+      channelId,
+      objective: undefined,
+      options,
+      originTs: stringAt(recordAt(payload, 'container'), 'message_ts'),
+      shape: value,
+      teamId,
+      triggerId: stringAt(payload, 'trigger_id')
+    })
+    options.logger.info('slack_launcher_modal_opened', {
+      action_id: actionId,
+      channel_id: channelId,
+      shape: value,
+      team_id: teamId,
+      user_id: userId
+    })
+    return c.text('', 200)
   }
-  const shape = shapeValue
-  const shapeInfo = shapeMeta(shape)
-  const triggerId = stringAt(payload, 'trigger_id')
-  if (!triggerId) throw new LauncherRequestError('missing_trigger_id', 400)
+
+  if (actionId === CARD_RELAUNCH_ACTION_ID) {
+    const parsed = parseRelaunchValue(value)
+    if (!parsed) throw new LauncherRequestError('disallowed_action', 400)
+    await openLauncherModal({
+      channelId,
+      objective: parsed.objective,
+      options,
+      originTs: stringAt(recordAt(payload, 'container'), 'message_ts'),
+      shape: parsed.shape,
+      teamId,
+      triggerId: stringAt(payload, 'trigger_id')
+    })
+    options.logger.info('slack_launcher_modal_opened', {
+      action_id: actionId,
+      channel_id: channelId,
+      shape: parsed.shape,
+      team_id: teamId,
+      user_id: userId
+    })
+    return c.text('', 200)
+  }
+
+  if (actionId === CARD_REFRESH_ACTION_ID) {
+    const task = handleCardRefresh(payload, channelId, userId, value, options).catch(error => {
+      options.logger.error('slack_launcher_card_refresh_failed', {
+        error_code: safeErrorCode(error),
+        workflow_run_id: value
+      })
+    })
+    scheduleTask(c, task, options)
+    return c.text('', 200)
+  }
+
+  if (actionId === CARD_CANCEL_ACTION_ID) {
+    const task = handleCardCancel(payload, channelId, userId, value, options).catch(error => {
+      options.logger.error('slack_launcher_card_cancel_failed', {
+        error_code: safeErrorCode(error),
+        workflow_run_id: value
+      })
+    })
+    scheduleTask(c, task, options)
+    return c.text('', 200)
+  }
+
+  throw new LauncherRequestError('disallowed_action', 400)
+}
+
+async function openLauncherModal(input: {
+  channelId: string
+  objective?: string
+  options: SlackLauncherOptions
+  originTs: string
+  shape: LauncherShape
+  teamId: string
+  triggerId: string
+}): Promise<void> {
+  if (!input.triggerId) throw new LauncherRequestError('missing_trigger_id', 400)
+  const shapeInfo = shapeMeta(input.shape)
   const metadata: LauncherPrivateMetadata = {
     v: 1,
-    shape,
-    team_id: teamId,
-    channel_id: channelId,
-    origin_ts: stringAt(recordAt(payload, 'container'), 'message_ts')
+    shape: input.shape,
+    team_id: input.teamId,
+    channel_id: input.channelId,
+    origin_ts: input.originTs
   }
-  await slackApi(options, 'views.open', {
-    trigger_id: triggerId,
+  const objectiveElement: JsonRecord = {
+    type: 'plain_text_input',
+    action_id: OBJECTIVE_ACTION_ID,
+    multiline: true,
+    min_length: 1,
+    max_length: 2000,
+    placeholder: { type: 'plain_text', text: 'What should this run prove or build?' }
+  }
+  if (input.objective) {
+    objectiveElement.initial_value = truncatePlainText(input.objective, 2000)
+  }
+  await slackApi(input.options, 'views.open', {
+    trigger_id: input.triggerId,
     view: {
       type: 'modal',
       callback_id: LAUNCHER_CALLBACK_ID,
@@ -318,7 +448,7 @@ async function openExperimentModal(
           elements: [
             {
               type: 'mrkdwn',
-              text: `Launching ${shapeInfo.label} (\`${shape}\`)`
+              text: `Launching ${shapeInfo.label} (\`${input.shape}\`)`
             }
           ]
         },
@@ -326,14 +456,7 @@ async function openExperimentModal(
           type: 'input',
           block_id: OBJECTIVE_BLOCK_ID,
           label: { type: 'plain_text', text: 'Objective' },
-          element: {
-            type: 'plain_text_input',
-            action_id: OBJECTIVE_ACTION_ID,
-            multiline: true,
-            min_length: 1,
-            max_length: 2000,
-            placeholder: { type: 'plain_text', text: 'What should this run prove or build?' }
-          }
+          element: objectiveElement
         },
         {
           type: 'input',
@@ -430,14 +553,23 @@ async function processSubmission(
 
   let record = await getRunRecord(options.state, submission.idempotencyKey)
   try {
-    if (record?.state === 'completed' || record?.state === 'failed') return
+    if (
+      record?.state === 'completed' ||
+      record?.state === 'failed' ||
+      record?.state === 'cancelled'
+    ) {
+      return
+    }
 
     if (!record?.cardTs) {
+      const nowIso = new Date((options.now ?? Date.now)()).toISOString()
       const posted = await slackApi(options, 'chat.postMessage', {
         channel: submission.channelId,
         client_msg_id: deterministicUuid(`${submission.idempotencyKey}:card`),
         ...runCardPayload({
           channelId: submission.channelId,
+          createdAt: nowIso,
+          objective: submission.objective,
           shape: submission.shape,
           state: 'queued',
           userId: submission.userId
@@ -448,9 +580,12 @@ async function processSubmission(
       record = {
         cardTs,
         channelId: submission.channelId,
+        createdAt: nowIso,
+        idempotencyKey: submission.idempotencyKey,
+        objective: submission.objective,
         shape: submission.shape,
         state: 'claiming',
-        updatedAt: new Date((options.now ?? Date.now)()).toISOString(),
+        updatedAt: nowIso,
         userId: submission.userId
       }
       await setRunRecord(options.state, submission.idempotencyKey, record)
@@ -481,23 +616,17 @@ async function processSubmission(
       const workflowRunId = stringAt(created, 'run_id')
       if (!workflowRunId) throw new LauncherRequestError('api_missing_workflow_run_id', 502)
       record.workflowRunId = workflowRunId
+      record.idempotencyKey = submission.idempotencyKey
+      record.objective = record.objective ?? submission.objective
       record.state = 'queued'
       record.updatedAt = new Date((options.now ?? Date.now)()).toISOString()
       await setRunRecord(options.state, submission.idempotencyKey, record)
+      await indexWorkflowRun(options.state, workflowRunId, submission.idempotencyKey)
       await updateRunCard(options, record)
     }
 
     const terminal = await pollWorkflow(options, record)
-    const resultEnvelope = recordAt(terminal, 'result')
-    const resultOutput = recordAt(resultEnvelope, 'output')
-    const result = Object.keys(resultOutput).length > 0 ? resultOutput : resultEnvelope
-    record.launcherRunId = stringAt(result, 'launcher_run_id') || record.launcherRunId
-    record.fleetJobId = stringAt(result, 'fleet_job_id') || record.fleetJobId
-    const workflowState = stringAt(terminal, 'status')
-    const fleetTerminalState = stringAt(result, 'terminal_state')
-    record.state =
-      workflowState === 'completed' && fleetTerminalState !== 'failed' ? 'completed' : 'failed'
-    record.updatedAt = new Date((options.now ?? Date.now)()).toISOString()
+    applyWorkflowRunToRecord(record, terminal, (options.now ?? Date.now)())
     await updateRunCard(options, record)
 
     if (!record.terminalReplySent) {
@@ -583,22 +712,42 @@ async function updateRunCard(
   await slackApi(options, 'chat.update', {
     channel: record.channelId,
     ts: record.cardTs,
-    ...runCardPayload(record)
+    ...runCardPayload(record, (options.now ?? Date.now)())
   })
 }
 
-function runCardPayload(record: Partial<LauncherRunRecord> & { channelId: string; userId: string }): JsonRecord {
+export function runCardPayload(
+  record: Partial<LauncherRunRecord> & { channelId: string; userId: string },
+  nowMs: number = Date.now()
+): JsonRecord {
   const state = record.state ?? 'queued'
   const rawShape = record.shape ?? ''
   const shape: LauncherShape = isLauncherShape(rawShape) ? rawShape : 'experiment'
   const shapeInfo = shapeMeta(shape)
-  const stateDisplay = {
-    claiming: ':large_yellow_circle: Queued',
-    queued: ':large_yellow_circle: Queued',
-    running: ':large_blue_circle: Running',
-    completed: ':white_check_mark: Completed',
-    failed: ':x: Failed'
-  }[state]
+  const stateDisplay = cardStatusDisplay(state)
+  const elements: JsonRecord[] = [
+    {
+      type: 'button',
+      action_id: CARD_REFRESH_ACTION_ID,
+      text: { type: 'plain_text', text: '🔄 Refresh', emoji: true },
+      value: record.workflowRunId ?? ''
+    }
+  ]
+  if (isNonTerminalCardState(state)) {
+    elements.push({
+      type: 'button',
+      action_id: CARD_CANCEL_ACTION_ID,
+      text: { type: 'plain_text', text: '🛑 Cancel', emoji: true },
+      style: 'danger',
+      value: record.workflowRunId ?? ''
+    })
+  }
+  elements.push({
+    type: 'button',
+    action_id: CARD_RELAUNCH_ACTION_ID,
+    text: { type: 'plain_text', text: '↻ Launch again', emoji: true },
+    value: relaunchValue({ objective: record.objective, shape })
+  })
   return {
     text: `Centaur ${shapeInfo.title} ${state}`,
     blocks: [
@@ -610,6 +759,12 @@ function runCardPayload(record: Partial<LauncherRunRecord> & { channelId: string
         type: 'section',
         fields: [
           { type: 'mrkdwn', text: `*Status*\n${stateDisplay}` },
+          { type: 'mrkdwn', text: `*Shape*\n${shapeInfo.label}` },
+          { type: 'mrkdwn', text: `*Worker*\n\`${shapeInfo.worker}\`` },
+          {
+            type: 'mrkdwn',
+            text: `*Elapsed*\n${formatElapsed(record.createdAt, nowMs)}`
+          },
           {
             type: 'mrkdwn',
             text: `*Workflow run*\n${slackCode(record.workflowRunId)}`
@@ -620,6 +775,11 @@ function runCardPayload(record: Partial<LauncherRunRecord> & { channelId: string
           },
           { type: 'mrkdwn', text: `*Fleet job*\n${slackCode(record.fleetJobId)}` }
         ]
+      },
+      {
+        type: 'actions',
+        block_id: 'centaur_card_actions',
+        elements
       },
       {
         type: 'context',
@@ -634,10 +794,237 @@ function runCardPayload(record: Partial<LauncherRunRecord> & { channelId: string
   }
 }
 
+function cardStatusDisplay(state: LauncherRunState | string): string {
+  switch (state) {
+    case 'claiming':
+    case 'queued':
+      return ':large_yellow_circle: Queued'
+    case 'running':
+      return ':large_blue_circle: Running'
+    case 'cancelling':
+      return `:warning: ${CANCEL_REQUESTED_STATUS}`
+    case 'cancelled':
+      return ':no_entry_sign: Cancelled (workflow; fleet job may still have finished)'
+    case 'completed':
+      return ':white_check_mark: Completed'
+    case 'failed':
+      return ':x: Failed'
+    default:
+      return `:large_yellow_circle: ${state}`
+  }
+}
+
+function isNonTerminalCardState(state: string): boolean {
+  return !TERMINAL_CARD_STATES.has(state) && state !== 'cancelling'
+}
+
+function relaunchValue(input: { shape: LauncherShape; objective?: string }): string {
+  if (!input.objective) return input.shape
+  const encoded = JSON.stringify({ shape: input.shape, objective: input.objective })
+  // Slack button value max is 2000 characters.
+  if (encoded.length <= 2000) return encoded
+  return input.shape
+}
+
+function parseRelaunchValue(
+  value: string
+): { shape: LauncherShape; objective?: string } | undefined {
+  if (isLauncherShape(value)) return { shape: value }
+  try {
+    const parsed = JSON.parse(value) as JsonRecord
+    const shape = stringAt(parsed, 'shape')
+    if (!isLauncherShape(shape)) return undefined
+    const objective = stringAt(parsed, 'objective').trim()
+    return { shape, objective: objective || undefined }
+  } catch {
+    return undefined
+  }
+}
+
+function formatElapsed(createdAt: string | undefined, nowMs: number): string {
+  if (!createdAt) return '_pending_'
+  const start = Date.parse(createdAt)
+  if (!Number.isFinite(start)) return '_pending_'
+  const totalSeconds = Math.max(0, Math.floor((nowMs - start) / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes < 60) return `${minutes}m ${seconds}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+async function handleCardRefresh(
+  payload: JsonRecord,
+  channelId: string,
+  userId: string,
+  workflowRunId: string,
+  options: SlackLauncherOptions
+): Promise<void> {
+  if (!workflowRunId) throw new LauncherRequestError('missing_workflow_run_id', 400)
+  const cardTs =
+    stringAt(recordAt(payload, 'container'), 'message_ts') ||
+    stringAt(recordAt(payload, 'message'), 'ts')
+  if (!cardTs) throw new LauncherRequestError('missing_card_ts', 400)
+
+  const record = await resolveCardRecord(options, {
+    cardTs,
+    channelId,
+    shapeHint: shapeHintFromPayload(payload),
+    userId,
+    workflowRunId
+  })
+  const response = await centaurApi(
+    options,
+    `/api/workflows/runs/${encodeURIComponent(workflowRunId)}`
+  )
+  const wrappedRun = recordAt(response, 'run')
+  const run = Object.keys(wrappedRun).length > 0 ? wrappedRun : response
+  applyWorkflowRunToRecord(record, run, (options.now ?? Date.now)())
+  record.channelId = channelId
+  record.cardTs = cardTs
+  record.userId = record.userId || userId
+  if (record.idempotencyKey) {
+    await setRunRecord(options.state, record.idempotencyKey, record)
+  }
+  await updateRunCard(options, record)
+  options.logger.info('slack_launcher_card_refreshed', {
+    channel_id: channelId,
+    state: record.state,
+    workflow_run_id: workflowRunId
+  })
+}
+
+async function handleCardCancel(
+  payload: JsonRecord,
+  channelId: string,
+  userId: string,
+  workflowRunId: string,
+  options: SlackLauncherOptions
+): Promise<void> {
+  if (!workflowRunId) throw new LauncherRequestError('missing_workflow_run_id', 400)
+  const cardTs =
+    stringAt(recordAt(payload, 'container'), 'message_ts') ||
+    stringAt(recordAt(payload, 'message'), 'ts')
+  if (!cardTs) throw new LauncherRequestError('missing_card_ts', 400)
+
+  const record = await resolveCardRecord(options, {
+    cardTs,
+    channelId,
+    shapeHint: shapeHintFromPayload(payload),
+    userId,
+    workflowRunId
+  })
+  if (TERMINAL_CARD_STATES.has(record.state)) {
+    await updateRunCard(options, record)
+    return
+  }
+
+  await centaurApi(options, `/api/workflows/runs/${encodeURIComponent(workflowRunId)}/cancel`, {
+    method: 'POST'
+  })
+  record.state = 'cancelling'
+  record.updatedAt = new Date((options.now ?? Date.now)()).toISOString()
+  record.channelId = channelId
+  record.cardTs = cardTs
+  record.userId = record.userId || userId
+  if (record.idempotencyKey) {
+    await setRunRecord(options.state, record.idempotencyKey, record)
+  }
+  await updateRunCard(options, record)
+  options.logger.info('slack_launcher_card_cancel_requested', {
+    channel_id: channelId,
+    workflow_run_id: workflowRunId
+  })
+}
+
+function applyWorkflowRunToRecord(
+  record: LauncherRunRecord,
+  run: JsonRecord,
+  nowMs: number
+): void {
+  const resultEnvelope = recordAt(run, 'result')
+  const resultOutput = recordAt(resultEnvelope, 'output')
+  const result = Object.keys(resultOutput).length > 0 ? resultOutput : resultEnvelope
+  const outputShape = stringAt(result, 'shape')
+  if (isLauncherShape(outputShape)) record.shape = outputShape
+  record.launcherRunId = stringAt(result, 'launcher_run_id') || record.launcherRunId
+  record.fleetJobId = stringAt(result, 'fleet_job_id') || record.fleetJobId
+  if (!record.createdAt) {
+    const createdAt = stringAt(run, 'created_at') || stringAt(run, 'started_at')
+    if (createdAt) record.createdAt = createdAt
+  }
+  const workflowState = stringAt(run, 'status')
+  const fleetTerminalState = stringAt(result, 'terminal_state')
+  if (workflowState === 'cancelled') {
+    record.state = 'cancelled'
+  } else if (workflowState === 'completed' && fleetTerminalState !== 'failed') {
+    record.state = 'completed'
+  } else if (TERMINAL_WORKFLOW_STATES.has(workflowState) || fleetTerminalState === 'failed') {
+    record.state = 'failed'
+  } else if (workflowState === 'running') {
+    // Preserve honest "cancelling" display until the workflow reaches a terminal state.
+    if (record.state !== 'cancelling') record.state = 'running'
+  } else if (workflowState === 'queued' || workflowState === 'pending') {
+    if (record.state !== 'cancelling') record.state = 'queued'
+  }
+  record.updatedAt = new Date(nowMs).toISOString()
+}
+
+async function resolveCardRecord(
+  options: SlackLauncherOptions,
+  input: {
+    cardTs: string
+    channelId: string
+    shapeHint?: LauncherShape
+    userId: string
+    workflowRunId: string
+  }
+): Promise<LauncherRunRecord> {
+  const idempotencyKey = await options.state.get<string>(workflowIndexKey(input.workflowRunId))
+  if (idempotencyKey) {
+    const existing = await getRunRecord(options.state, idempotencyKey)
+    if (existing) {
+      existing.idempotencyKey = existing.idempotencyKey ?? idempotencyKey
+      existing.workflowRunId = existing.workflowRunId ?? input.workflowRunId
+      return existing
+    }
+  }
+  const nowIso = new Date((options.now ?? Date.now)()).toISOString()
+  return {
+    cardTs: input.cardTs,
+    channelId: input.channelId,
+    createdAt: nowIso,
+    shape: input.shapeHint ?? 'experiment',
+    state: 'running',
+    updatedAt: nowIso,
+    userId: input.userId,
+    workflowRunId: input.workflowRunId
+  }
+}
+
+function shapeHintFromPayload(payload: JsonRecord): LauncherShape | undefined {
+  const message = recordAt(payload, 'message')
+  for (const block of arrayAt(message, 'blocks')) {
+    const elements = arrayAt(asRecord(block), 'elements')
+    for (const element of elements) {
+      const el = asRecord(element)
+      if (stringAt(el, 'action_id') === CARD_RELAUNCH_ACTION_ID) {
+        return parseRelaunchValue(stringAt(el, 'value'))?.shape
+      }
+    }
+  }
+  return undefined
+}
+
 function terminalReplyText(record: LauncherRunRecord): string {
-  const icon = record.state === 'completed' ? '✅' : '❌'
+  const icon =
+    record.state === 'completed' ? '✅' : record.state === 'cancelled' ? '🛑' : '❌'
   const launcher = record.launcherRunId ? `\`${record.launcherRunId}\`` : '`unavailable`'
   const fleet = record.fleetJobId ? `\`${record.fleetJobId}\`` : '`unavailable`'
+  if (record.state === 'cancelled') {
+    return `${icon} Launcher run ${launcher} cancelled (workflow). Fleet job ${fleet} may still have finished.`
+  }
   return `${icon} Launcher run ${launcher} ${record.state}. Fleet job ${fleet}.`
 }
 
@@ -782,6 +1169,10 @@ function launcherRecordKey(idempotencyKey: string): string {
   return `slackbotv2:launcher:run:${createHash('sha256').update(idempotencyKey).digest('hex')}`
 }
 
+function workflowIndexKey(workflowRunId: string): string {
+  return `slackbotv2:launcher:workflow:${createHash('sha256').update(workflowRunId).digest('hex')}`
+}
+
 async function getRunRecord(
   state: StateAdapter,
   idempotencyKey: string
@@ -795,6 +1186,14 @@ async function setRunRecord(
   record: LauncherRunRecord
 ): Promise<void> {
   await state.set(launcherRecordKey(idempotencyKey), record, RECORD_TTL_MS)
+}
+
+async function indexWorkflowRun(
+  state: StateAdapter,
+  workflowRunId: string,
+  idempotencyKey: string
+): Promise<void> {
+  await state.set(workflowIndexKey(workflowRunId), idempotencyKey, RECORD_TTL_MS)
 }
 
 function deterministicUuid(value: string): string {
