@@ -5,8 +5,11 @@ import { Hono } from 'hono'
 import {
   LAUNCHER_ACTION_ID,
   LAUNCHER_CALLBACK_ID,
+  LAUNCHER_SHAPES,
+  launcherMessagePayload,
   registerSlackLauncher,
-  slackSignature
+  slackSignature,
+  type LauncherShape
 } from '../src/launcher'
 
 const SIGNING_SECRET = 'fixture-signing-secret'
@@ -128,7 +131,22 @@ function testHarness(input: {
 }
 
 describe('Centaur Slack launcher signed interaction route', () => {
-  test('valid block action opens the fixed experiment modal and acks promptly', async () => {
+  test('launchpad renders one button per allowlisted shape', () => {
+    const payload = launcherMessagePayload()
+    const actionsBlock = (payload.blocks as Record<string, unknown>[]).find(
+      block => block.type === 'actions'
+    ) as { elements: Array<Record<string, unknown>> }
+    expect(actionsBlock.elements).toHaveLength(LAUNCHER_SHAPES.length)
+    expect(actionsBlock.elements.length).toBeLessThanOrEqual(5)
+    for (const [index, shape] of LAUNCHER_SHAPES.entries()) {
+      const button = actionsBlock.elements[index]
+      expect(button?.action_id).toBe(LAUNCHER_ACTION_ID)
+      expect(button?.value).toBe(shape.key)
+      expect((button?.text as { text: string }).text).toBe(shape.label)
+    }
+  })
+
+  test('valid block action opens the experiment modal and acks promptly', async () => {
     const harness = testHarness()
     const started = performance.now()
     const response = await signedRequest(harness.app, blockActionFixture)
@@ -143,7 +161,43 @@ describe('Centaur Slack launcher signed interaction route', () => {
     expect(view.private_metadata).toBe(
       '{"v":1,"shape":"experiment","team_id":"T_ALLOWED","channel_id":"C_ALLOWED","origin_ts":"1783700000.000100"}'
     )
+    expect(JSON.stringify(view)).toContain('General experiment')
     expect(JSON.stringify(view)).not.toContain('fixture-signing-secret')
+  })
+
+  test('each allowlisted shape button opens a modal carrying that shape in private_metadata', async () => {
+    for (const shape of LAUNCHER_SHAPES) {
+      const harness = testHarness()
+      const payload = mutate(blockActionFixture, value => {
+        ;((value.actions as Record<string, unknown>[])[0] as Record<string, unknown>).value =
+          shape.key
+      })
+      const response = await signedRequest(harness.app, payload)
+      expect(response.status).toBe(200)
+      expect(harness.calls).toHaveLength(1)
+      const view = harness.calls[0]?.body?.view as Record<string, unknown>
+      const metadata = JSON.parse(String(view.private_metadata)) as {
+        shape: string
+        team_id: string
+        channel_id: string
+      }
+      expect(metadata.shape).toBe(shape.key)
+      expect(metadata.team_id).toBe('T_ALLOWED')
+      expect(metadata.channel_id).toBe('C_ALLOWED')
+      expect(JSON.stringify(view)).toContain(shape.title)
+      expect(JSON.stringify(view)).toContain(shape.label)
+    }
+  })
+
+  test('unknown shape button value is rejected and opens no modal', async () => {
+    const harness = testHarness()
+    const payload = mutate(blockActionFixture, value => {
+      ;((value.actions as Record<string, unknown>[])[0] as Record<string, unknown>).value =
+        'not-a-real-shape'
+    })
+    const response = await signedRequest(harness.app, payload)
+    expect([400, 403, 502]).toContain(response.status)
+    expect(harness.calls).toHaveLength(0)
   })
 
   test('one submission creates one card, workflow, terminal update, and thread reply', async () => {
@@ -186,14 +240,67 @@ describe('Centaur Slack launcher signed interaction route', () => {
       'slack-launcher:T_ALLOWED:V_LAUNCH_001:centaur.launcher.submit.v1'
     )
     expect(workflowCreates[0]?.body?.workflow_name).toBe('cmpx575_launcher')
+    const workflowInput = (workflowCreates[0]?.body?.input ?? {}) as Record<string, unknown>
+    expect(workflowInput.shape).toBe('experiment')
     const finalCard = JSON.stringify(cardUpdates.at(-1)?.body)
     expect(finalCard).toContain('2026-07-10_experiment-slack-launcher-proof')
     expect(finalCard).toContain('fleet-job-1')
     expect(finalCard).toContain('Completed')
+    expect(finalCard).toContain('🧪 General experiment')
+    expect(finalCard).toContain('shape `experiment`')
     expect(JSON.stringify(harness.logs)).not.toContain(
       'Prove the signed Centaur Slack launcher end to end.'
     )
     expect(JSON.stringify(harness.logs)).not.toContain('payload=')
+  })
+
+  test('view submission threads each allowlisted shape into workflow input.shape', async () => {
+    for (const shape of LAUNCHER_SHAPES) {
+      const harness = testHarness()
+      const payload = viewSubmissionForShape(shape.key)
+      const response = await signedRequest(harness.app, payload)
+      expect(response.status).toBe(200)
+      await Promise.all(harness.pending)
+
+      const workflowCreates = harness.calls.filter(
+        call => call.url.endsWith('/api/workflows/runs') && call.method === 'POST'
+      )
+      expect(workflowCreates).toHaveLength(1)
+      const workflowInput = (workflowCreates[0]?.body?.input ?? {}) as Record<string, unknown>
+      expect(workflowInput.shape).toBe(shape.key)
+      expect(workflowInput.version).toBe(1)
+
+      const cardPosts = harness.calls.filter(
+        call => call.url.endsWith('/chat.postMessage') && !call.body?.thread_ts
+      )
+      expect(cardPosts).toHaveLength(1)
+      const cardBody = JSON.stringify(cardPosts[0]?.body)
+      expect(cardBody).toContain(shape.label)
+      expect(cardBody).toContain(`shape \`${shape.key}\``)
+    }
+  })
+
+  test('disallowed shape in private_metadata creates no workflow', async () => {
+    const harness = testHarness()
+    const payload = mutate(viewSubmissionFixture, value => {
+      ;(value.view as Record<string, unknown>).private_metadata = JSON.stringify({
+        v: 1,
+        shape: 'not-allowlisted',
+        team_id: 'T_ALLOWED',
+        channel_id: 'C_ALLOWED',
+        origin_ts: '1783700000.000100'
+      })
+    })
+    const response = await signedRequest(harness.app, payload)
+    expect(response.status).toBe(400)
+    expect(harness.calls).toHaveLength(0)
+    expect(
+      harness.logs.some(
+        log =>
+          log.message === 'slack_launcher_submission_rejected' &&
+          (log.data as { reason?: string } | undefined)?.reason === 'invalid_private_metadata'
+      )
+    ).toBe(true)
   })
 
   test('identical view retry never creates a second workflow, card, or terminal reply', async () => {
@@ -315,6 +422,19 @@ function mutate(
   const payload = clone(fixture)
   change(payload)
   return payload
+}
+
+function viewSubmissionForShape(shape: LauncherShape): Record<string, unknown> {
+  return mutate(viewSubmissionFixture, value => {
+    ;(value.view as Record<string, unknown>).id = `V_LAUNCH_${shape}`
+    ;(value.view as Record<string, unknown>).private_metadata = JSON.stringify({
+      v: 1,
+      shape,
+      team_id: 'T_ALLOWED',
+      channel_id: 'C_ALLOWED',
+      origin_ts: '1783700000.000100'
+    })
+  })
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

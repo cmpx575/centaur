@@ -8,6 +8,22 @@ export const LAUNCHER_ACTION_ID = 'centaur.launch.experiment.v1'
 export const LAUNCHER_CALLBACK_ID = 'centaur.launcher.submit.v1'
 export const LAUNCHER_WORKFLOW_NAME = 'cmpx575_launcher'
 
+/** Shapes already allowlisted by the cmpx575_launcher workflow — expose, do not redefine. */
+export const LAUNCHER_SHAPES = [
+  { key: 'experiment', label: '🧪 General experiment', title: 'General experiment' },
+  { key: 'oncall-digest', label: '📟 Oncall digest', title: 'Oncall digest' },
+  { key: 'knowledge-map-ingest', label: '🗺️ Knowledge-map ingest', title: 'Knowledge-map ingest' },
+  { key: 'slack-inbox-to-board', label: '📥 Inbox→board', title: 'Inbox→board' },
+  { key: 'quota-scheduler', label: '⏱️ Quota scheduler', title: 'Quota scheduler' }
+] as const
+
+export type LauncherShape = (typeof LAUNCHER_SHAPES)[number]['key']
+
+const LAUNCHER_SHAPE_BY_KEY = new Map(
+  LAUNCHER_SHAPES.map(shape => [shape.key, shape] as const)
+)
+const LAUNCHER_SHAPE_KEYS = new Set<string>(LAUNCHER_SHAPES.map(shape => shape.key))
+
 const OBJECTIVE_BLOCK_ID = 'objective_block'
 const OBJECTIVE_ACTION_ID = 'objective_input'
 const SLUG_BLOCK_ID = 'slug_block'
@@ -43,7 +59,7 @@ export type SlackLauncherOptions = {
 type LauncherPrivateMetadata = {
   channel_id: string
   origin_ts: string
-  shape: 'experiment'
+  shape: LauncherShape
   team_id: string
   v: 1
 }
@@ -54,7 +70,7 @@ type LauncherSubmission = {
   idempotencyKey: string
   objective: string
   originTs: string
-  shape: 'experiment'
+  shape: LauncherShape
   slug?: string
   teamId: string
   userId: string
@@ -66,7 +82,7 @@ type LauncherRunRecord = {
   channelId: string
   fleetJobId?: string
   launcherRunId?: string
-  shape: 'experiment'
+  shape: LauncherShape
   state: 'claiming' | 'queued' | 'running' | 'completed' | 'failed'
   terminalReplySent?: boolean
   updatedAt: string
@@ -184,7 +200,7 @@ export function registerSlackLauncher(app: Hono, options: SlackLauncherOptions):
 
 export function launcherMessagePayload(): JsonRecord {
   return {
-    text: 'Centaur launcher: start a General experiment.',
+    text: 'Centaur launcher: pick an experiment shape to start.',
     blocks: [
       {
         type: 'header',
@@ -194,28 +210,27 @@ export function launcherMessagePayload(): JsonRecord {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: 'Start a scoped, durable fleet run. The objective is collected in a modal and the confirmed launch is deterministic.'
+          text: 'Start a scoped, durable fleet run. Pick a shape, then enter the objective in the modal. Confirmed launches are deterministic.'
         }
       },
       {
         type: 'actions',
         block_id: 'centaur_launcher_actions',
-        elements: [
-          {
-            type: 'button',
-            action_id: LAUNCHER_ACTION_ID,
-            text: { type: 'plain_text', text: '🧪 General experiment', emoji: true },
-            value: 'experiment',
-            style: 'primary'
-          }
-        ]
+        // Slack allows at most 5 elements per actions block; one button per allowlisted shape.
+        elements: LAUNCHER_SHAPES.map((shape, index) => ({
+          type: 'button',
+          action_id: LAUNCHER_ACTION_ID,
+          text: { type: 'plain_text', text: shape.label, emoji: true },
+          value: shape.key,
+          ...(index === 0 ? { style: 'primary' as const } : {})
+        }))
       },
       {
         type: 'context',
         elements: [
           {
             type: 'mrkdwn',
-            text: 'Phase 1 · signed callbacks · allowlisted to this playground · retry-safe'
+            text: 'Phase 2 · 5 shapes · signed callbacks · allowlisted to this playground · retry-safe'
           }
         ]
       }
@@ -267,17 +282,18 @@ async function openExperimentModal(
   const actions = arrayAt(payload, 'actions')
   if (actions.length !== 1) throw new LauncherRequestError('invalid_action_count', 400)
   const action = asRecord(actions[0])
-  if (
-    stringAt(action, 'action_id') !== LAUNCHER_ACTION_ID ||
-    stringAt(action, 'value') !== 'experiment'
-  ) {
+  const actionId = stringAt(action, 'action_id')
+  const shapeValue = stringAt(action, 'value')
+  if (actionId !== LAUNCHER_ACTION_ID || !isLauncherShape(shapeValue)) {
     throw new LauncherRequestError('disallowed_action', 400)
   }
+  const shape = shapeValue
+  const shapeInfo = shapeMeta(shape)
   const triggerId = stringAt(payload, 'trigger_id')
   if (!triggerId) throw new LauncherRequestError('missing_trigger_id', 400)
   const metadata: LauncherPrivateMetadata = {
     v: 1,
-    shape: 'experiment',
+    shape,
     team_id: teamId,
     channel_id: channelId,
     origin_ts: stringAt(recordAt(payload, 'container'), 'message_ts')
@@ -288,10 +304,20 @@ async function openExperimentModal(
       type: 'modal',
       callback_id: LAUNCHER_CALLBACK_ID,
       private_metadata: JSON.stringify(metadata),
-      title: { type: 'plain_text', text: 'Centaur experiment' },
+      // Slack modal titles max out at 24 characters.
+      title: { type: 'plain_text', text: truncatePlainText(shapeInfo.title, 24), emoji: true },
       submit: { type: 'plain_text', text: 'Launch' },
       close: { type: 'plain_text', text: 'Cancel' },
       blocks: [
+        {
+          type: 'context',
+          elements: [
+            {
+              type: 'mrkdwn',
+              text: `Launching ${shapeInfo.label} (\`${shape}\`)`
+            }
+          ]
+        },
         {
           type: 'input',
           block_id: OBJECTIVE_BLOCK_ID,
@@ -302,7 +328,7 @@ async function openExperimentModal(
             multiline: true,
             min_length: 1,
             max_length: 2000,
-            placeholder: { type: 'plain_text', text: 'What should the experiment prove or build?' }
+            placeholder: { type: 'plain_text', text: 'What should this run prove or build?' }
           }
         },
         {
@@ -337,7 +363,7 @@ function parseSubmission(
   }
   const metadata = parsePrivateMetadata(stringAt(view, 'private_metadata'))
   if (!metadata) return { ok: false, reason: 'invalid_private_metadata' }
-  if (metadata.v !== 1 || metadata.shape !== 'experiment') {
+  if (metadata.v !== 1 || !isLauncherShape(metadata.shape)) {
     return { ok: false, reason: 'disallowed_shape' }
   }
 
@@ -363,7 +389,7 @@ function parseSubmission(
       idempotencyKey: `slack-launcher:${teamId}:${viewId}:${callbackId}`,
       objective,
       originTs: metadata.origin_ts,
-      shape: 'experiment',
+      shape: metadata.shape,
       slug: slug || undefined,
       teamId: metadata.team_id,
       userId,
@@ -408,6 +434,7 @@ async function processSubmission(
         client_msg_id: deterministicUuid(`${submission.idempotencyKey}:card`),
         ...runCardPayload({
           channelId: submission.channelId,
+          shape: submission.shape,
           state: 'queued',
           userId: submission.userId
         })
@@ -558,6 +585,9 @@ async function updateRunCard(
 
 function runCardPayload(record: Partial<LauncherRunRecord> & { channelId: string; userId: string }): JsonRecord {
   const state = record.state ?? 'queued'
+  const rawShape = record.shape ?? ''
+  const shape: LauncherShape = isLauncherShape(rawShape) ? rawShape : 'experiment'
+  const shapeInfo = shapeMeta(shape)
   const stateDisplay = {
     claiming: ':large_yellow_circle: Queued',
     queued: ':large_yellow_circle: Queued',
@@ -566,11 +596,11 @@ function runCardPayload(record: Partial<LauncherRunRecord> & { channelId: string
     failed: ':x: Failed'
   }[state]
   return {
-    text: `Centaur General experiment ${state}`,
+    text: `Centaur ${shapeInfo.title} ${state}`,
     blocks: [
       {
         type: 'header',
-        text: { type: 'plain_text', text: '🧪 General experiment', emoji: true }
+        text: { type: 'plain_text', text: shapeInfo.label, emoji: true }
       },
       {
         type: 'section',
@@ -592,7 +622,7 @@ function runCardPayload(record: Partial<LauncherRunRecord> & { channelId: string
         elements: [
           {
             type: 'mrkdwn',
-            text: `Requested by <@${record.userId}> · shape \`experiment\` · one terminal reply`
+            text: `Requested by <@${record.userId}> · shape \`${shape}\` · one terminal reply`
           }
         ]
       }
@@ -672,16 +702,34 @@ function parsePrivateMetadata(value: string): LauncherPrivateMetadata | undefine
   try {
     const metadata = JSON.parse(value) as JsonRecord
     if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined
+    const shape = stringAt(metadata, 'shape')
+    if (!isLauncherShape(shape)) return undefined
+    const team_id = stringAt(metadata, 'team_id')
+    const channel_id = stringAt(metadata, 'channel_id')
+    if (!team_id || !channel_id) return undefined
     return {
       v: Number(metadata.v) as 1,
-      shape: stringAt(metadata, 'shape') as 'experiment',
-      team_id: stringAt(metadata, 'team_id'),
-      channel_id: stringAt(metadata, 'channel_id'),
+      shape,
+      team_id,
+      channel_id,
       origin_ts: stringAt(metadata, 'origin_ts')
     }
   } catch {
     return undefined
   }
+}
+
+export function isLauncherShape(value: string): value is LauncherShape {
+  return LAUNCHER_SHAPE_KEYS.has(value)
+}
+
+function shapeMeta(shape: LauncherShape): (typeof LAUNCHER_SHAPES)[number] {
+  return LAUNCHER_SHAPE_BY_KEY.get(shape) ?? LAUNCHER_SHAPES[0]
+}
+
+function truncatePlainText(value: string, max: number): string {
+  if (value.length <= max) return value
+  return value.slice(0, Math.max(max - 1, 1)).trimEnd() + '…'
 }
 
 function denyInteraction(
