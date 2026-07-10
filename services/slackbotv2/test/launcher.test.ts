@@ -9,6 +9,10 @@ import {
   LAUNCHER_ACTION_ID,
   LAUNCHER_CALLBACK_ID,
   LAUNCHER_SHAPES,
+  RECENT_OPEN_ACTION_ID,
+  RECENT_SELECT_ACTION_ID,
+  RECENT_SELECT_BLOCK_ID,
+  RECENT_SUBMIT_CALLBACK_ID,
   launcherMessagePayload,
   registerSlackLauncher,
   runCardPayload,
@@ -63,6 +67,8 @@ function testHarness(input: {
   allowedChannelIds?: string[]
   allowedTeamIds?: string[]
   allowedUserIds?: string[]
+  listRuns?: Record<string, unknown>[]
+  listRunsError?: boolean
   workflowStates?: Record<string, unknown>[]
 } = {}) {
   const app = new Hono()
@@ -71,16 +77,26 @@ function testHarness(input: {
   const pending: Promise<unknown>[] = []
   const state = new MemoryState()
   const workflowStates = [...(input.workflowStates ?? [])]
+  const listRuns = [...(input.listRuns ?? [])]
   const fetcher = async (request: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(request)
+    const method = (init?.method ?? 'GET').toUpperCase()
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined
-    calls.push({ body, method: init?.method ?? 'GET', url })
+    calls.push({ body, method, url })
     if (url.endsWith('/views.open')) return jsonResponse({ ok: true, view: { id: 'V_MODAL' } })
     if (url.endsWith('/chat.update')) return jsonResponse({ ok: true, ts: body?.ts })
     if (url.endsWith('/chat.postMessage')) {
       return jsonResponse({ ok: true, ts: body?.thread_ts ? '1783700100.000300' : '1783700100.000200' })
     }
-    if (url.endsWith('/api/workflows/runs') && init?.method === 'POST') {
+    // List: GET /api/workflows/runs or /api/workflows/runs?...
+    if (
+      method === 'GET' &&
+      (url.includes('/api/workflows/runs?') || url.endsWith('/api/workflows/runs'))
+    ) {
+      if (input.listRunsError) return jsonResponse({ ok: false, error: 'list_failed' }, 500)
+      return jsonResponse({ ok: true, runs: listRuns })
+    }
+    if (url.endsWith('/api/workflows/runs') && method === 'POST') {
       return jsonResponse({
         ok: true,
         run_id: 'workflow-run-1',
@@ -89,16 +105,16 @@ function testHarness(input: {
         created: true
       })
     }
-    const cancelMatch = url.match(/\/api\/workflows\/runs\/([^/]+)\/cancel$/)
-    if (cancelMatch && (init?.method ?? 'GET').toUpperCase() === 'POST') {
+    const cancelMatch = url.match(/\/api\/workflows\/runs\/([^/?]+)\/cancel$/)
+    if (cancelMatch && method === 'POST') {
       return jsonResponse({
         ok: true,
         run_id: decodeURIComponent(cancelMatch[1] ?? 'workflow-run-1'),
         status: 'cancelling'
       })
     }
-    const getMatch = url.match(/\/api\/workflows\/runs\/([^/]+)$/)
-    if (getMatch && (init?.method ?? 'GET').toUpperCase() === 'GET') {
+    const getMatch = url.match(/\/api\/workflows\/runs\/([^/?]+)$/)
+    if (getMatch && method === 'GET') {
       const runId = decodeURIComponent(getMatch[1] ?? 'workflow-run-1')
       return jsonResponse({
         ok: true,
@@ -150,7 +166,7 @@ describe('Centaur Slack launcher signed interaction route', () => {
   test('launchpad renders one button per allowlisted shape', () => {
     const payload = launcherMessagePayload()
     const actionsBlock = (payload.blocks as Record<string, unknown>[]).find(
-      block => block.type === 'actions'
+      block => block.type === 'actions' && block.block_id === 'centaur_launcher_actions'
     ) as { elements: Array<Record<string, unknown>> }
     expect(actionsBlock.elements).toHaveLength(LAUNCHER_SHAPES.length)
     expect(actionsBlock.elements.length).toBeLessThanOrEqual(5)
@@ -165,16 +181,37 @@ describe('Centaur Slack launcher signed interaction route', () => {
   test('launchpad action_ids are unique within the message (Slack rule)', () => {
     // Slack rejects invalid_blocks when action_id is duplicated in a message.
     // Regression for the multi-button launchpad that posted five identical ids.
+    // Message-wide: shape block + separate Recent-runs actions block.
     const payload = launcherMessagePayload()
-    const actionsBlock = (payload.blocks as Record<string, unknown>[]).find(
-      block => block.type === 'actions'
-    ) as { elements: Array<Record<string, unknown>> }
-    const actionIds = actionsBlock.elements.map(el => el.action_id as string)
-    expect(actionIds).toHaveLength(LAUNCHER_SHAPES.length)
+    const actionIds: string[] = []
+    for (const block of payload.blocks as Record<string, unknown>[]) {
+      if (block.type !== 'actions') continue
+      for (const el of (block.elements as Array<Record<string, unknown>>) ?? []) {
+        if (typeof el.action_id === 'string') actionIds.push(el.action_id)
+      }
+    }
+    expect(actionIds).toHaveLength(LAUNCHER_SHAPES.length + 1)
     expect(new Set(actionIds).size).toBe(actionIds.length)
     for (const shape of LAUNCHER_SHAPES) {
       expect(actionIds).toContain(`${LAUNCHER_ACTION_ID}:${shape.key}`)
     }
+    expect(actionIds).toContain(RECENT_OPEN_ACTION_ID)
+  })
+
+  test('launchpad renders Recent runs in a separate actions block (Slack max-5 rule)', () => {
+    const payload = launcherMessagePayload()
+    const blocks = payload.blocks as Record<string, unknown>[]
+    const shapeBlock = blocks.find(
+      block => block.type === 'actions' && block.block_id === 'centaur_launcher_actions'
+    ) as { elements: Array<Record<string, unknown>> }
+    const recentBlock = blocks.find(
+      block => block.type === 'actions' && block.block_id === 'centaur_launcher_recent'
+    ) as { elements: Array<Record<string, unknown>> }
+    expect(shapeBlock.elements).toHaveLength(5)
+    expect(shapeBlock.elements.length).toBeLessThanOrEqual(5)
+    expect(recentBlock.elements).toHaveLength(1)
+    expect(recentBlock.elements[0]?.action_id).toBe(RECENT_OPEN_ACTION_ID)
+    expect((recentBlock.elements[0]?.text as { text: string }).text).toBe('📋 Recent runs')
   })
 
   test('valid block action opens the experiment modal and acks promptly', async () => {
@@ -654,6 +691,207 @@ describe('Centaur Slack launcher signed interaction route', () => {
     // New view id path is Slack-owned; private_metadata does not carry prior idempotency.
     expect(JSON.stringify(view)).not.toContain('workflow-run-1')
   })
+
+  test('recent-runs open lists mocked runs and opens a select modal', async () => {
+    const harness = testHarness({
+      listRuns: [
+        {
+          run_id: 'wf-recent-1',
+          workflow_name: 'cmpx575_launcher',
+          status: 'completed',
+          created_at: new Date(NOW_MS - 2 * 60 * 60 * 1000).toISOString(),
+          input: {
+            shape: 'experiment',
+            objective: 'Prove recent-runs re-launch path',
+            slug: 'recent-proof'
+          }
+        },
+        {
+          run_id: 'wf-other',
+          workflow_name: 'nightly_other',
+          status: 'completed',
+          created_at: new Date(NOW_MS - 60 * 60 * 1000).toISOString(),
+          input: { shape: 'experiment', objective: 'should be filtered out' }
+        },
+        {
+          run_id: 'wf-recent-2',
+          workflow_name: 'cmpx575_launcher',
+          status: 'completed',
+          created_at: new Date(NOW_MS - 30 * 60 * 1000).toISOString(),
+          input: {
+            shape: 'oncall-digest',
+            objective: 'Digest last night'
+          }
+        }
+      ]
+    })
+    const response = await signedRequest(harness.app, recentOpenAction())
+    expect(response.status).toBe(200)
+    const open = harness.calls.find(call => call.url.endsWith('/views.open'))
+    expect(open).toBeDefined()
+    const listCall = harness.calls.find(
+      call => call.method === 'GET' && call.url.includes('/api/workflows/runs')
+    )
+    expect(listCall?.url).toContain('workflow_name=cmpx575_launcher')
+    expect(listCall?.url).toContain('limit=15')
+    const view = open?.body?.view as Record<string, unknown>
+    expect(view.callback_id).toBe(RECENT_SUBMIT_CALLBACK_ID)
+    expect(String((view.title as { text: string }).text).length).toBeLessThanOrEqual(24)
+    expect(view.submit).toBeDefined()
+    const blocks = view.blocks as Record<string, unknown>[]
+    const inputBlock = blocks.find(block => block.block_id === RECENT_SELECT_BLOCK_ID) as {
+      element: { type: string; action_id: string; options: Array<Record<string, unknown>> }
+    }
+    expect(inputBlock?.element?.type).toBe('static_select')
+    expect(inputBlock?.element?.action_id).toBe(RECENT_SELECT_ACTION_ID)
+    expect(inputBlock.element.options).toHaveLength(2)
+    for (const option of inputBlock.element.options) {
+      expect(String((option.text as { text: string }).text).length).toBeLessThanOrEqual(75)
+      expect(String(option.value).length).toBeLessThanOrEqual(2000)
+    }
+    const texts = inputBlock.element.options.map(o => (o.text as { text: string }).text)
+    expect(texts.some(t => t.includes('experiment'))).toBe(true)
+    expect(texts.some(t => t.includes('oncall-digest'))).toBe(true)
+    const values = inputBlock.element.options.map(o => JSON.parse(String(o.value)))
+    expect(values).toContainEqual({
+      shape: 'experiment',
+      objective: 'Prove recent-runs re-launch path',
+      slug: 'recent-proof'
+    })
+    expect(values).toContainEqual({
+      shape: 'oncall-digest',
+      objective: 'Digest last night'
+    })
+  })
+
+  test('recent-runs empty list shows empty state and launches nothing on submit', async () => {
+    const harness = testHarness({ listRuns: [] })
+    const openResponse = await signedRequest(harness.app, recentOpenAction())
+    expect(openResponse.status).toBe(200)
+    const view = harness.calls.find(call => call.url.endsWith('/views.open'))?.body
+      ?.view as Record<string, unknown>
+    expect(view.callback_id).toBe(RECENT_SUBMIT_CALLBACK_ID)
+    expect(view.submit).toBeUndefined()
+    expect(JSON.stringify(view.blocks)).toContain('No recent runs yet')
+    expect(JSON.stringify(view.blocks)).not.toContain(RECENT_SELECT_BLOCK_ID)
+
+    const submit = await signedRequest(
+      harness.app,
+      recentViewSubmission({
+        // No select state — empty modal.
+        stateValues: {}
+      })
+    )
+    expect(submit.status).toBe(200)
+    await Promise.all(harness.pending)
+    expect(
+      harness.calls.filter(call => call.url.endsWith('/api/workflows/runs') && call.method === 'POST')
+    ).toHaveLength(0)
+    expect(
+      harness.calls.filter(call => call.url.endsWith('/chat.postMessage'))
+    ).toHaveLength(0)
+    expect(harness.logs.some(log => log.message === 'slack_launcher_recent_noop')).toBe(true)
+  })
+
+  test('recent-runs submit re-launches via existing workflow-create path', async () => {
+    const harness = testHarness()
+    const optionValue = JSON.stringify({
+      shape: 'oncall-digest',
+      objective: 'Re-run from recent menu',
+      slug: 'recent-relaunch'
+    })
+    const response = await signedRequest(
+      harness.app,
+      recentViewSubmission({
+        stateValues: {
+          [RECENT_SELECT_BLOCK_ID]: {
+            [RECENT_SELECT_ACTION_ID]: {
+              type: 'static_select',
+              selected_option: {
+                text: { type: 'plain_text', text: '📟 oncall-digest · "Re-run" · 1h ago' },
+                value: optionValue
+              }
+            }
+          }
+        }
+      })
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(harness.pending)
+
+    const workflowCreates = harness.calls.filter(
+      call => call.url.endsWith('/api/workflows/runs') && call.method === 'POST'
+    )
+    const cardPosts = harness.calls.filter(
+      call => call.url.endsWith('/chat.postMessage') && !call.body?.thread_ts
+    )
+    expect(workflowCreates).toHaveLength(1)
+    expect(cardPosts).toHaveLength(1)
+    expect(workflowCreates[0]?.body?.workflow_name).toBe('cmpx575_launcher')
+    expect(workflowCreates[0]?.body?.idempotency_key).toBe(
+      `slack-launcher:T_ALLOWED:V_RECENT_001:${RECENT_SUBMIT_CALLBACK_ID}`
+    )
+    const workflowInput = (workflowCreates[0]?.body?.input ?? {}) as Record<string, unknown>
+    expect(workflowInput.shape).toBe('oncall-digest')
+    expect(workflowInput.objective).toBe('Re-run from recent menu')
+    expect(workflowInput.slug).toBe('recent-relaunch')
+    const cardBody = JSON.stringify(cardPosts[0]?.body)
+    expect(cardBody).toContain('oncall-digest')
+    expect(cardBody).toContain('📟 Oncall digest')
+  })
+
+  test('recent-runs malformed or unknown selection errors and launches nothing', async () => {
+    const cases = [
+      JSON.stringify({ shape: 'not-a-shape', objective: 'x' }),
+      JSON.stringify({ shape: 'experiment' }), // missing objective
+      'not-json-at-all',
+      'id:missing-run-that-will-404'
+    ]
+    for (const value of cases) {
+      const harness = testHarness()
+      // Force GET-by-id for id: prefix to fail (no matching list/get for that id path returns
+      // a completed run without usable input when workflowStates is empty — still has default
+      // completed result without input). Override by making get return empty input.
+      if (value.startsWith('id:')) {
+        // Default get fixture has no input.shape/objective → unresolvable.
+      }
+      const response = await signedRequest(
+        harness.app,
+        recentViewSubmission({
+          viewId: `V_RECENT_BAD_${value.slice(0, 8)}`,
+          stateValues: {
+            [RECENT_SELECT_BLOCK_ID]: {
+              [RECENT_SELECT_ACTION_ID]: {
+                type: 'static_select',
+                selected_option: {
+                  text: { type: 'plain_text', text: 'bad' },
+                  value
+                }
+              }
+            }
+          }
+        })
+      )
+      expect(response.status).toBe(200)
+      const body = await response.json()
+      expect(body).toEqual({
+        response_action: 'errors',
+        errors: {
+          [RECENT_SELECT_BLOCK_ID]:
+            'Could not resolve that run. Pick another or launch fresh.'
+        }
+      })
+      await Promise.all(harness.pending)
+      expect(
+        harness.calls.filter(
+          call => call.url.endsWith('/api/workflows/runs') && call.method === 'POST'
+        )
+      ).toHaveLength(0)
+      expect(
+        harness.calls.filter(call => call.url.endsWith('/chat.postMessage'))
+      ).toHaveLength(0)
+    }
+  })
 })
 
 async function signedRequest(
@@ -719,6 +957,33 @@ function cardBlockAction(actionId: string, value: string): Record<string, unknow
         workflowRunId: 'workflow-run-1'
       }).blocks
     }
+  })
+}
+
+function recentOpenAction(): Record<string, unknown> {
+  return mutate(blockActionFixture, payload => {
+    const action = (payload.actions as Record<string, unknown>[])[0] as Record<string, unknown>
+    action.action_id = RECENT_OPEN_ACTION_ID
+    action.block_id = 'centaur_launcher_recent'
+    action.value = 'recent'
+  })
+}
+
+function recentViewSubmission(input: {
+  stateValues: Record<string, unknown>
+  viewId?: string
+}): Record<string, unknown> {
+  return mutate(viewSubmissionFixture, value => {
+    const view = value.view as Record<string, unknown>
+    view.id = input.viewId ?? 'V_RECENT_001'
+    view.callback_id = RECENT_SUBMIT_CALLBACK_ID
+    view.private_metadata = JSON.stringify({
+      v: 1,
+      team_id: 'T_ALLOWED',
+      channel_id: 'C_ALLOWED',
+      origin_ts: '1783700000.000100'
+    })
+    view.state = { values: input.stateValues }
   })
 }
 

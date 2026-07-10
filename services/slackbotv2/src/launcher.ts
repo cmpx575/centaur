@@ -8,10 +8,21 @@ export const LAUNCHER_ACTION_ID = 'centaur.launch.experiment.v1'
 export const LAUNCHER_CALLBACK_ID = 'centaur.launcher.submit.v1'
 export const LAUNCHER_WORKFLOW_NAME = 'cmpx575_launcher'
 
+/** Recent-runs menu: separate actions block (Slack max 5 elements per actions block). */
+export const RECENT_OPEN_ACTION_ID = 'centaur.recent.open.v1'
+export const RECENT_SUBMIT_CALLBACK_ID = 'centaur.recent.submit.v1'
+export const RECENT_SELECT_ACTION_ID = 'centaur.recent.select.v1'
+export const RECENT_SELECT_BLOCK_ID = 'recent_run_block'
+
 /** Status-card action_ids — must be unique within a Slack message (and across buttons). */
 export const CARD_REFRESH_ACTION_ID = 'centaur.card.refresh.v1'
 export const CARD_CANCEL_ACTION_ID = 'centaur.card.cancel.v1'
 export const CARD_RELAUNCH_ACTION_ID = 'centaur.card.relaunch.v1'
+
+const RECENT_LIST_LIMIT = 15
+const RECENT_OPTIONS_MAX = 10
+const RECENT_OPTION_TEXT_MAX = 75
+const SLACK_VALUE_MAX = 2000
 
 /** Shapes already allowlisted by the cmpx575_launcher workflow — expose, do not redefine. */
 export const LAUNCHER_SHAPES = [
@@ -98,6 +109,13 @@ type LauncherPrivateMetadata = {
   v: 1
 }
 
+type RecentPrivateMetadata = {
+  channel_id: string
+  origin_ts: string
+  team_id: string
+  v: 1
+}
+
 type LauncherSubmission = {
   callbackId: string
   channelId: string
@@ -109,6 +127,18 @@ type LauncherSubmission = {
   teamId: string
   userId: string
   viewId: string
+}
+
+type RecentRunOption = {
+  /** Compact value stored on the static_select option (≤2000 chars). */
+  value: string
+  /** Human-readable label ≤75 chars. */
+  text: string
+  shape: LauncherShape
+  objective: string
+  slug?: string
+  createdAt?: string
+  workflowRunId?: string
 }
 
 type LauncherRunState =
@@ -202,6 +232,63 @@ export function registerSlackLauncher(app: Hono, options: SlackLauncherOptions):
     }
 
     if (type === 'view_submission') {
+      const view = recordAt(payload, 'view')
+      const callbackId = stringAt(view, 'callback_id')
+
+      if (callbackId === RECENT_SUBMIT_CALLBACK_ID) {
+        let recentSubmission: Awaited<ReturnType<typeof parseRecentSubmission>>
+        try {
+          recentSubmission = await parseRecentSubmission(payload, teamId, userId, options)
+        } catch (error) {
+          options.logger.error('slack_launcher_recent_submission_parse_failed', {
+            error_code: safeErrorCode(error)
+          })
+          return c.text('unable to handle submission', 502)
+        }
+        if (!recentSubmission.ok) {
+          if (recentSubmission.fieldErrors) {
+            return c.json({ response_action: 'errors', errors: recentSubmission.fieldErrors }, 200)
+          }
+          options.logger.warn('slack_launcher_submission_rejected', {
+            reason: recentSubmission.reason,
+            team_id: teamId,
+            user_id: userId
+          })
+          return c.text('invalid submission', 400)
+        }
+        if (recentSubmission.noop) {
+          options.logger.info('slack_launcher_recent_noop', {
+            reason: recentSubmission.reason,
+            team_id: teamId,
+            user_id: userId
+          })
+          return c.text('', 200)
+        }
+        const recentValue = recentSubmission.value
+        if (!isAllowed(recentValue.channelId, options.allowedChannelIds)) {
+          return denyInteraction(c, options, type, 'channel')
+        }
+        if (recentValue.teamId !== teamId) {
+          return denyInteraction(c, options, type, 'metadata_team')
+        }
+        const task = processSubmission(recentValue, options).catch(error => {
+          options.logger.error('slack_launcher_submission_failed', {
+            error_code: safeErrorCode(error),
+            idempotency_key: recentValue.idempotencyKey
+          })
+        })
+        scheduleTask(c, task, options)
+        options.logger.info('slack_launcher_submission_acknowledged', {
+          callback_id: recentValue.callbackId,
+          channel_id: recentValue.channelId,
+          idempotency_key: recentValue.idempotencyKey,
+          team_id: teamId,
+          user_id: userId,
+          view_id: recentValue.viewId
+        })
+        return c.text('', 200)
+      }
+
       const submission = parseSubmission(payload, teamId, userId)
       if (!submission.ok) {
         if (submission.fieldErrors) {
@@ -271,6 +358,19 @@ export function launcherMessagePayload(): JsonRecord {
           value: shape.key,
           ...(index === 0 ? { style: 'primary' as const } : {})
         }))
+      },
+      {
+        // Separate actions block: shape block is already at Slack's 5-element max.
+        type: 'actions',
+        block_id: 'centaur_launcher_recent',
+        elements: [
+          {
+            type: 'button',
+            action_id: RECENT_OPEN_ACTION_ID,
+            text: { type: 'plain_text', text: '📋 Recent runs', emoji: true },
+            value: 'recent'
+          }
+        ]
       },
       {
         type: 'context',
@@ -350,6 +450,23 @@ async function dispatchBlockAction(
       action_id: actionId,
       channel_id: channelId,
       shape: value,
+      team_id: teamId,
+      user_id: userId
+    })
+    return c.text('', 200)
+  }
+
+  if (actionId === RECENT_OPEN_ACTION_ID) {
+    await openRecentRunsModal({
+      channelId,
+      options,
+      originTs: stringAt(recordAt(payload, 'container'), 'message_ts'),
+      teamId,
+      triggerId: stringAt(payload, 'trigger_id')
+    })
+    options.logger.info('slack_launcher_recent_modal_opened', {
+      action_id: actionId,
+      channel_id: channelId,
       team_id: teamId,
       user_id: userId
     })
@@ -473,6 +590,372 @@ async function openLauncherModal(input: {
       ]
     }
   })
+}
+
+async function openRecentRunsModal(input: {
+  channelId: string
+  options: SlackLauncherOptions
+  originTs: string
+  teamId: string
+  triggerId: string
+}): Promise<void> {
+  if (!input.triggerId) throw new LauncherRequestError('missing_trigger_id', 400)
+  const metadata: RecentPrivateMetadata = {
+    v: 1,
+    team_id: input.teamId,
+    channel_id: input.channelId,
+    origin_ts: input.originTs
+  }
+  const nowMs = (input.options.now ?? Date.now)()
+  const recent = await listRecentLauncherRuns(input.options, nowMs)
+  const view: JsonRecord = {
+    type: 'modal',
+    callback_id: RECENT_SUBMIT_CALLBACK_ID,
+    private_metadata: JSON.stringify(metadata),
+    // Slack modal titles max out at 24 characters.
+    title: { type: 'plain_text', text: 'Recent runs', emoji: true },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: [] as JsonRecord[]
+  }
+
+  if (recent.length === 0) {
+    ;(view.blocks as JsonRecord[]).push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '_No recent runs yet._ Launch an experiment from the launchpad first, then check back here to re-run it.'
+      }
+    })
+  } else {
+    view.submit = { type: 'plain_text', text: 'Launch again' }
+    ;(view.blocks as JsonRecord[]).push(
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: 'Pick a recent launcher run to re-launch with the same shape and objective.'
+          }
+        ]
+      },
+      {
+        type: 'input',
+        block_id: RECENT_SELECT_BLOCK_ID,
+        label: { type: 'plain_text', text: 'Recent run' },
+        element: {
+          type: 'static_select',
+          action_id: RECENT_SELECT_ACTION_ID,
+          placeholder: { type: 'plain_text', text: 'Select a recent run', emoji: true },
+          options: recent.map(run => ({
+            text: { type: 'plain_text', text: run.text, emoji: true },
+            value: run.value
+          }))
+        }
+      }
+    )
+  }
+
+  await slackApi(input.options, 'views.open', {
+    trigger_id: input.triggerId,
+    view
+  })
+}
+
+/**
+ * Prefer api-rs list (`GET /api/workflows/runs?workflow_name=…&limit=…`).
+ * Each WorkflowRun includes `input` with `{shape, objective, slug}` from the
+ * launcher POST. Filter client-side by workflow name (server may ignore the
+ * query param). If a row lacks usable input, enrich from the local run-record
+ * store via the workflow_run_id index; skip rows that still can't launch.
+ */
+async function listRecentLauncherRuns(
+  options: SlackLauncherOptions,
+  nowMs: number
+): Promise<RecentRunOption[]> {
+  let items: unknown[] = []
+  try {
+    const query = new URLSearchParams({
+      workflow_name: LAUNCHER_WORKFLOW_NAME,
+      limit: String(RECENT_LIST_LIMIT)
+    })
+    const response = await centaurApi(options, `/api/workflows/runs?${query.toString()}`)
+    items = arrayAt(response, 'runs')
+    if (items.length === 0) items = arrayAt(response, 'items')
+  } catch (error) {
+    options.logger.warn('slack_launcher_recent_list_failed', {
+      error_code: safeErrorCode(error)
+    })
+    return []
+  }
+
+  const optionsOut: RecentRunOption[] = []
+  const seen = new Set<string>()
+  for (const item of items) {
+    if (optionsOut.length >= RECENT_OPTIONS_MAX) break
+    const run = asRecord(item)
+    const workflowName = stringAt(run, 'workflow_name')
+    if (workflowName && workflowName !== LAUNCHER_WORKFLOW_NAME) continue
+    const workflowRunId = stringAt(run, 'run_id')
+    const resolved = await resolveRecentRunLaunchParams(run, options)
+    if (!resolved) continue
+    const value = encodeRecentOptionValue(resolved)
+    if (!value || seen.has(value)) continue
+    seen.add(value)
+    optionsOut.push({
+      value,
+      text: formatRecentOptionLabel(resolved, nowMs),
+      shape: resolved.shape,
+      objective: resolved.objective,
+      slug: resolved.slug,
+      createdAt: resolved.createdAt,
+      workflowRunId: workflowRunId || undefined
+    })
+  }
+  return optionsOut
+}
+
+async function resolveRecentRunLaunchParams(
+  run: JsonRecord,
+  options: SlackLauncherOptions
+): Promise<
+  | {
+      shape: LauncherShape
+      objective: string
+      slug?: string
+      createdAt?: string
+      workflowRunId?: string
+    }
+  | undefined
+> {
+  const workflowRunId = stringAt(run, 'run_id')
+  let input = recordAt(run, 'input')
+  let shape = stringAt(input, 'shape')
+  let objective = stringAt(input, 'objective').trim()
+  let slug = stringAt(input, 'slug').trim() || undefined
+  const createdAt =
+    stringAt(run, 'created_at') || stringAt(run, 'started_at') || undefined
+
+  // Enrich from local run-record when list payload omits usable input.
+  if ((!isLauncherShape(shape) || !objective) && workflowRunId) {
+    const idempotencyKey = await options.state.get<string>(workflowIndexKey(workflowRunId))
+    if (idempotencyKey) {
+      const record = await getRunRecord(options.state, idempotencyKey)
+      if (record) {
+        if (!isLauncherShape(shape) && isLauncherShape(record.shape)) shape = record.shape
+        if (!objective && record.objective) objective = record.objective.trim()
+        if (!slug && record.launcherRunId) {
+          // launcher_run_id often encodes date+slug; keep as last-resort label only.
+        }
+      }
+    }
+  }
+
+  // Last resort: re-fetch the single run (get always carries input when present).
+  if ((!isLauncherShape(shape) || !objective) && workflowRunId) {
+    try {
+      const response = await centaurApi(
+        options,
+        `/api/workflows/runs/${encodeURIComponent(workflowRunId)}`
+      )
+      const wrapped = recordAt(response, 'run')
+      const detail = Object.keys(wrapped).length > 0 ? wrapped : response
+      input = recordAt(detail, 'input')
+      if (!isLauncherShape(shape)) shape = stringAt(input, 'shape')
+      if (!objective) objective = stringAt(input, 'objective').trim()
+      if (!slug) slug = stringAt(input, 'slug').trim() || undefined
+    } catch {
+      // Fall through to skip if still incomplete.
+    }
+  }
+
+  if (!isLauncherShape(shape) || !objective) return undefined
+  return {
+    shape,
+    objective,
+    slug,
+    createdAt,
+    workflowRunId: workflowRunId || undefined
+  }
+}
+
+function encodeRecentOptionValue(input: {
+  shape: LauncherShape
+  objective: string
+  slug?: string
+  workflowRunId?: string
+}): string | undefined {
+  const compact: JsonRecord = { shape: input.shape, objective: input.objective }
+  if (input.slug) compact.slug = input.slug
+  const encoded = JSON.stringify(compact)
+  if (encoded.length <= SLACK_VALUE_MAX) return encoded
+  // Objective too long for the select value — re-fetch by workflow run id on submit.
+  if (input.workflowRunId) return `id:${input.workflowRunId}`
+  return undefined
+}
+
+function formatRecentOptionLabel(
+  input: { shape: LauncherShape; objective: string; createdAt?: string },
+  nowMs: number
+): string {
+  const shapeInfo = shapeMeta(input.shape)
+  // Prefer short shape key with its emoji prefix when label is long.
+  const emoji = shapeInfo.label.split(/\s+/)[0] ?? '🧪'
+  const shapePart = `${emoji} ${input.shape}`
+  const ago = formatRelativeAgo(input.createdAt, nowMs)
+  const suffix = ago ? ` · ${ago}` : ''
+  const budget = RECENT_OPTION_TEXT_MAX - shapePart.length - suffix.length - 5 // ` · ""`
+  const snippet =
+    budget > 4
+      ? `"${truncatePlainText(input.objective.replace(/\s+/g, ' ').trim(), budget - 2)}"`
+      : ''
+  const label = snippet ? `${shapePart} · ${snippet}${suffix}` : `${shapePart}${suffix}`
+  return truncatePlainText(label, RECENT_OPTION_TEXT_MAX)
+}
+
+function formatRelativeAgo(createdAt: string | undefined, nowMs: number): string {
+  if (!createdAt) return ''
+  const start = Date.parse(createdAt)
+  if (!Number.isFinite(start)) return ''
+  const totalSeconds = Math.max(0, Math.floor((nowMs - start) / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s ago`
+  const minutes = Math.floor(totalSeconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
+async function parseRecentSubmission(
+  payload: JsonRecord,
+  teamId: string,
+  userId: string,
+  options: SlackLauncherOptions
+): Promise<
+  | { ok: true; noop: false; value: LauncherSubmission }
+  | { ok: true; noop: true; reason: string }
+  | { ok: false; reason: string; fieldErrors?: Record<string, string> }
+> {
+  const view = recordAt(payload, 'view')
+  const callbackId = stringAt(view, 'callback_id')
+  const viewId = stringAt(view, 'id')
+  if (callbackId !== RECENT_SUBMIT_CALLBACK_ID || !viewId) {
+    return { ok: false, reason: 'disallowed_callback' }
+  }
+  const metadata = parseRecentPrivateMetadata(stringAt(view, 'private_metadata'))
+  if (!metadata) return { ok: false, reason: 'invalid_private_metadata' }
+
+  const values = recordAt(recordAt(view, 'state'), 'values')
+  const selected = recordAt(recordAt(values, RECENT_SELECT_BLOCK_ID), RECENT_SELECT_ACTION_ID)
+  const selectedOption = recordAt(selected, 'selected_option')
+  const rawValue = stringAt(selectedOption, 'value')
+
+  // Empty-state modal has no select; treat submit as a no-op.
+  if (!rawValue) {
+    const hasSelectBlock = Object.keys(values).includes(RECENT_SELECT_BLOCK_ID)
+    if (!hasSelectBlock) return { ok: true, noop: true, reason: 'empty_recent_list' }
+    return {
+      ok: false,
+      reason: 'missing_selection',
+      fieldErrors: { [RECENT_SELECT_BLOCK_ID]: 'Pick a recent run to re-launch.' }
+    }
+  }
+
+  const resolved = await decodeRecentOptionValue(rawValue, options)
+  if (!resolved) {
+    return {
+      ok: false,
+      reason: 'unresolvable_selection',
+      fieldErrors: {
+        [RECENT_SELECT_BLOCK_ID]: 'Could not resolve that run. Pick another or launch fresh.'
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    noop: false,
+    value: {
+      callbackId,
+      channelId: metadata.channel_id,
+      idempotencyKey: `slack-launcher:${teamId}:${viewId}:${callbackId}`,
+      objective: resolved.objective,
+      originTs: metadata.origin_ts,
+      shape: resolved.shape,
+      slug: resolved.slug,
+      teamId: metadata.team_id,
+      userId,
+      viewId
+    }
+  }
+}
+
+async function decodeRecentOptionValue(
+  value: string,
+  options: SlackLauncherOptions
+): Promise<{ shape: LauncherShape; objective: string; slug?: string } | undefined> {
+  if (value.startsWith('id:')) {
+    const workflowRunId = value.slice(3)
+    if (!workflowRunId) return undefined
+    // Prefer local record, then API get.
+    const idempotencyKey = await options.state.get<string>(workflowIndexKey(workflowRunId))
+    if (idempotencyKey) {
+      const record = await getRunRecord(options.state, idempotencyKey)
+      if (record && isLauncherShape(record.shape) && record.objective?.trim()) {
+        return {
+          shape: record.shape,
+          objective: record.objective.trim()
+        }
+      }
+    }
+    try {
+      const response = await centaurApi(
+        options,
+        `/api/workflows/runs/${encodeURIComponent(workflowRunId)}`
+      )
+      const wrapped = recordAt(response, 'run')
+      const detail = Object.keys(wrapped).length > 0 ? wrapped : response
+      return launchParamsFromInput(recordAt(detail, 'input'))
+    } catch {
+      return undefined
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(value) as JsonRecord
+    return launchParamsFromInput(parsed)
+  } catch {
+    return undefined
+  }
+}
+
+function launchParamsFromInput(
+  input: JsonRecord
+): { shape: LauncherShape; objective: string; slug?: string } | undefined {
+  const shape = stringAt(input, 'shape')
+  const objective = stringAt(input, 'objective').trim()
+  if (!isLauncherShape(shape) || !objective) return undefined
+  const slug = stringAt(input, 'slug').trim() || undefined
+  return { shape, objective, slug }
+}
+
+function parseRecentPrivateMetadata(value: string): RecentPrivateMetadata | undefined {
+  try {
+    const metadata = JSON.parse(value) as JsonRecord
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined
+    if (Number(metadata.v) !== 1) return undefined
+    const team_id = stringAt(metadata, 'team_id')
+    const channel_id = stringAt(metadata, 'channel_id')
+    if (!team_id || !channel_id) return undefined
+    return {
+      v: 1,
+      team_id,
+      channel_id,
+      origin_ts: stringAt(metadata, 'origin_ts')
+    }
+  } catch {
+    return undefined
+  }
 }
 
 function parseSubmission(
