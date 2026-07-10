@@ -50,7 +50,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     launch = await ctx.step(
         "launch",
         lambda: ctx.call_tool(
-            "experiment_launcher",
+            "experiment-launcher",
             "launch",
             {
                 "version": inp.version,
@@ -82,7 +82,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
         status = await ctx.step(
             f"fleet-status-{attempt:04d}",
             lambda: ctx.call_tool(
-                "fleet_dispatch",
+                "fleet-dispatch",
                 "status",
                 {"job_id": fleet_job_id},
             ),
