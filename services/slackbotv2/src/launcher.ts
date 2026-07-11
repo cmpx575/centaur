@@ -1256,6 +1256,9 @@ async function updateRunCard(
   })
 }
 
+/** Slack section text max is 3000; keep objective readable on the card. */
+const CARD_OBJECTIVE_MAX = 600
+
 export function runCardPayload(
   record: Partial<LauncherRunRecord> & { channelId: string; userId: string },
   nowMs: number = Date.now()
@@ -1293,49 +1296,63 @@ export function runCardPayload(
     text: { type: 'plain_text', text: '↻ Launch again', emoji: true },
     value: relaunchValue({ objective: record.objective, shape })
   })
+  const blocks: JsonRecord[] = [
+    {
+      type: 'header',
+      text: { type: 'plain_text', text: shapeInfo.label, emoji: true }
+    }
+  ]
+  // Self-describing card: show what the user asked for (record already carries objective).
+  const objectiveText = (record.objective ?? '').trim()
+  if (objectiveText) {
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*Objective*\n${escapeMrkdwn(truncatePlainText(objectiveText, CARD_OBJECTIVE_MAX))}`
+      }
+    })
+  }
+  blocks.push(
+    {
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*Status*\n${stateDisplay}` },
+        { type: 'mrkdwn', text: `*Shape*\n${shapeInfo.label}` },
+        { type: 'mrkdwn', text: `*Worker*\n\`${shapeInfo.worker}\`` },
+        {
+          type: 'mrkdwn',
+          text: `*Elapsed*\n${formatElapsed(record.createdAt, nowMs)}`
+        },
+        {
+          type: 'mrkdwn',
+          text: `*Workflow run*\n${slackCode(record.workflowRunId)}`
+        },
+        {
+          type: 'mrkdwn',
+          text: `*Launcher run*\n${slackCode(record.launcherRunId)}`
+        },
+        { type: 'mrkdwn', text: `*Fleet job*\n${slackCode(record.fleetJobId)}` }
+      ]
+    },
+    {
+      type: 'actions',
+      block_id: 'centaur_card_actions',
+      elements
+    },
+    {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `Requested by <@${record.userId}> · shape \`${shape}\` · one terminal reply`
+        }
+      ]
+    }
+  )
   return {
     text: `Centaur ${shapeInfo.title} ${state}`,
-    blocks: [
-      {
-        type: 'header',
-        text: { type: 'plain_text', text: shapeInfo.label, emoji: true }
-      },
-      {
-        type: 'section',
-        fields: [
-          { type: 'mrkdwn', text: `*Status*\n${stateDisplay}` },
-          { type: 'mrkdwn', text: `*Shape*\n${shapeInfo.label}` },
-          { type: 'mrkdwn', text: `*Worker*\n\`${shapeInfo.worker}\`` },
-          {
-            type: 'mrkdwn',
-            text: `*Elapsed*\n${formatElapsed(record.createdAt, nowMs)}`
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Workflow run*\n${slackCode(record.workflowRunId)}`
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Launcher run*\n${slackCode(record.launcherRunId)}`
-          },
-          { type: 'mrkdwn', text: `*Fleet job*\n${slackCode(record.fleetJobId)}` }
-        ]
-      },
-      {
-        type: 'actions',
-        block_id: 'centaur_card_actions',
-        elements
-      },
-      {
-        type: 'context',
-        elements: [
-          {
-            type: 'mrkdwn',
-            text: `Requested by <@${record.userId}> · shape \`${shape}\` · one terminal reply`
-          }
-        ]
-      }
-    ]
+    blocks
   }
 }
 
@@ -1709,6 +1726,11 @@ function shapeMeta(shape: LauncherShape): (typeof LAUNCHER_SHAPES)[number] {
 function truncatePlainText(value: string, max: number): string {
   if (value.length <= max) return value
   return value.slice(0, Math.max(max - 1, 1)).trimEnd() + '…'
+}
+
+/** Escape user text for Slack mrkdwn so it cannot inject links/mentions or break blocks. */
+function escapeMrkdwn(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
 function denyInteraction(

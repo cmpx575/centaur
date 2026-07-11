@@ -511,7 +511,18 @@ describe('Centaur Slack launcher signed interaction route', () => {
       NOW_MS
     )
     const blocks = payload.blocks as Record<string, unknown>[]
-    const section = blocks.find(block => block.type === 'section') as {
+    // Objective section is first full-width section under the header.
+    const objectiveSection = blocks.find(
+      block =>
+        block.type === 'section' &&
+        typeof (block as { text?: { text?: string } }).text?.text === 'string' &&
+        String((block as { text: { text: string } }).text.text).startsWith('*Objective*')
+    ) as { text: { type: string; text: string } }
+    expect(objectiveSection?.text?.text).toBe('*Objective*\nProve card buttons')
+    // Status/shape fields section follows objective (has fields, not a single text).
+    const section = blocks.find(
+      block => block.type === 'section' && Array.isArray((block as { fields?: unknown }).fields)
+    ) as {
       fields: Array<{ text: string }>
     }
     const fields = section.fields.map(field => field.text).join('\n')
@@ -550,6 +561,96 @@ describe('Centaur Slack launcher signed interaction route', () => {
     for (const value of collectBlockActionValues(payload)) {
       expect(value.length).toBeGreaterThan(0)
     }
+  })
+
+  test('status card shows objective under header; omits block when empty; truncates + escapes mrkdwn', () => {
+    const withObjective = runCardPayload({
+      channelId: 'C_ALLOWED',
+      objective: 'Digest last night page for prd-centaur-na',
+      shape: 'oncall-digest',
+      state: 'running',
+      userId: 'U_ALLOWED',
+      workflowRunId: 'wf-1'
+    })
+    const withBlocks = withObjective.blocks as Array<Record<string, unknown>>
+    expect(withBlocks[0]).toMatchObject({ type: 'header' })
+    expect(withBlocks[1]).toMatchObject({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '*Objective*\nDigest last night page for prd-centaur-na'
+      }
+    })
+    // Fields section still present after objective.
+    expect(withBlocks[2]).toMatchObject({ type: 'section' })
+    expect(Array.isArray((withBlocks[2] as { fields?: unknown }).fields)).toBe(true)
+
+    // Empty / whitespace-only objective → no objective section.
+    for (const objective of [undefined, '', '   ', '\n\t']) {
+      const payload = runCardPayload({
+        channelId: 'C_ALLOWED',
+        objective,
+        shape: 'experiment',
+        state: 'queued',
+        userId: 'U_ALLOWED'
+      })
+      const blocks = payload.blocks as Array<Record<string, unknown>>
+      const objectiveBlocks = blocks.filter(
+        b =>
+          b.type === 'section' &&
+          typeof (b as { text?: { text?: string } }).text?.text === 'string' &&
+          String((b as { text: { text: string } }).text.text).startsWith('*Objective*')
+      )
+      expect(objectiveBlocks).toHaveLength(0)
+      // Header still followed by fields section.
+      expect(blocks[0]?.type).toBe('header')
+      expect(blocks[1]?.type).toBe('section')
+      expect(Array.isArray((blocks[1] as { fields?: unknown }).fields)).toBe(true)
+    }
+
+    // Long objective is truncated with ellipsis (~600 char cap).
+    const longObjective = `${'Prove '.repeat(120)}END`
+    expect(longObjective.length).toBeGreaterThan(600)
+    const truncatedPayload = runCardPayload({
+      channelId: 'C_ALLOWED',
+      objective: longObjective,
+      shape: 'experiment',
+      state: 'running',
+      userId: 'U_ALLOWED',
+      workflowRunId: 'wf-long'
+    })
+    const truncatedText = (
+      (truncatedPayload.blocks as Array<Record<string, unknown>>).find(
+        b =>
+          b.type === 'section' &&
+          typeof (b as { text?: { text?: string } }).text?.text === 'string' &&
+          String((b as { text: { text: string } }).text.text).startsWith('*Objective*')
+      ) as { text: { text: string } }
+    ).text.text
+    expect(truncatedText.startsWith('*Objective*\n')).toBe(true)
+    const body = truncatedText.slice('*Objective*\n'.length)
+    expect(body.endsWith('…')).toBe(true)
+    expect(body.length).toBeLessThanOrEqual(600)
+    expect(body).not.toContain('END')
+
+    // Mrkdwn-sensitive chars are escaped so user text cannot break the card.
+    const tricky = runCardPayload({
+      channelId: 'C_ALLOWED',
+      objective: 'Compare A & B <script> vs >C',
+      shape: 'experiment',
+      state: 'queued',
+      userId: 'U_ALLOWED'
+    })
+    const trickyText = (
+      (tricky.blocks as Array<Record<string, unknown>>).find(
+        b =>
+          b.type === 'section' &&
+          typeof (b as { text?: { text?: string } }).text?.text === 'string' &&
+          String((b as { text: { text: string } }).text.text).startsWith('*Objective*')
+      ) as { text: { text: string } }
+    ).text.text
+    expect(trickyText).toBe('*Objective*\nCompare A &amp; B &lt;script&gt; vs &gt;C')
+    expect(trickyText).not.toContain('<script>')
   })
 
   test('initial pre-id status card has no empty action values and omits Refresh/Cancel', () => {
