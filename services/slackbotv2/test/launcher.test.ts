@@ -13,6 +13,8 @@ import {
   RECENT_SELECT_ACTION_ID,
   RECENT_SELECT_BLOCK_ID,
   RECENT_SUBMIT_CALLBACK_ID,
+  collectBlockActionValues,
+  filterValidRecentOptions,
   launcherMessagePayload,
   registerSlackLauncher,
   runCardPayload,
@@ -230,6 +232,11 @@ describe('Centaur Slack launcher signed interaction route', () => {
       '{"v":1,"shape":"experiment","team_id":"T_ALLOWED","channel_id":"C_ALLOWED","origin_ts":"1783700000.000100"}'
     )
     expect(JSON.stringify(view)).toContain('General experiment')
+    // Shape-specific purpose + tailored objective placeholder (not the old generic copy).
+    const experiment = LAUNCHER_SHAPES.find(s => s.key === 'experiment')!
+    expect(JSON.stringify(view)).toContain(experiment.description)
+    expect(JSON.stringify(view)).toContain(experiment.objectivePrompt)
+    expect(JSON.stringify(view)).not.toContain('What should this run prove or build?')
     expect(JSON.stringify(view)).not.toContain('fixture-signing-secret')
   })
 
@@ -539,6 +546,88 @@ describe('Centaur Slack launcher signed interaction route', () => {
       shape: 'oncall-digest',
       objective: 'Prove card buttons'
     })
+    // No empty values anywhere (Slack invalid_blocks trap).
+    for (const value of collectBlockActionValues(payload)) {
+      expect(value.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('initial pre-id status card has no empty action values and omits Refresh/Cancel', () => {
+    // Live bug: card posted before workflow id existed → Refresh/Cancel value="" →
+    // slack_chat.postMessage_invalid_blocks → whole submission failed.
+    const payload = runCardPayload({
+      channelId: 'C_ALLOWED',
+      userId: 'U_ALLOWED',
+      shape: 'experiment',
+      state: 'queued'
+    })
+    const actionsBlock = (payload.blocks as Record<string, unknown>[]).find(
+      block => block.type === 'actions'
+    ) as { elements: Array<Record<string, unknown>> }
+    const actionIds = actionsBlock.elements.map(el => el.action_id as string)
+    expect(actionIds).toEqual([CARD_RELAUNCH_ACTION_ID])
+    expect(actionIds).not.toContain(CARD_REFRESH_ACTION_ID)
+    expect(actionIds).not.toContain(CARD_CANCEL_ACTION_ID)
+    for (const el of actionsBlock.elements) {
+      expect(typeof el.value).toBe('string')
+      expect(String(el.value).length).toBeGreaterThan(0)
+    }
+    for (const value of collectBlockActionValues(payload)) {
+      expect(value).toBeTruthy()
+      expect(value.length).toBeGreaterThan(0)
+    }
+    // Empty/undefined workflow + launcher + fleet ids still produce valid kit.
+    const emptyIds = runCardPayload({
+      channelId: 'C_ALLOWED',
+      userId: 'U_ALLOWED',
+      shape: 'oncall-digest',
+      state: 'queued',
+      workflowRunId: '',
+      launcherRunId: '',
+      fleetJobId: ''
+    })
+    expect(collectBlockActionValues(emptyIds).every(v => v.length > 0)).toBe(true)
+    expect(
+      (emptyIds.blocks as Record<string, unknown>[])
+        .find(b => b.type === 'actions') as { elements: Array<{ action_id: string }> }
+    ).toMatchObject({
+      elements: [{ action_id: CARD_RELAUNCH_ACTION_ID }]
+    })
+  })
+
+  test('Refresh/Cancel appear only once a non-empty workflow id is present', () => {
+    const withoutId = runCardPayload({
+      channelId: 'C_ALLOWED',
+      userId: 'U_ALLOWED',
+      shape: 'experiment',
+      state: 'running'
+    })
+    const withoutIds = (
+      (withoutId.blocks as Record<string, unknown>[]).find(b => b.type === 'actions') as {
+        elements: Array<{ action_id: string }>
+      }
+    ).elements.map(el => el.action_id)
+    expect(withoutIds).toEqual([CARD_RELAUNCH_ACTION_ID])
+
+    const withId = runCardPayload({
+      channelId: 'C_ALLOWED',
+      userId: 'U_ALLOWED',
+      shape: 'experiment',
+      state: 'running',
+      workflowRunId: 'wf-live-1'
+    })
+    const withIds = (
+      (withId.blocks as Record<string, unknown>[]).find(b => b.type === 'actions') as {
+        elements: Array<{ action_id: string; value: string }>
+      }
+    ).elements
+    expect(withIds.map(el => el.action_id)).toEqual([
+      CARD_REFRESH_ACTION_ID,
+      CARD_CANCEL_ACTION_ID,
+      CARD_RELAUNCH_ACTION_ID
+    ])
+    expect(withIds[0]?.value).toBe('wf-live-1')
+    expect(withIds[1]?.value).toBe('wf-live-1')
   })
 
   test('status card omits Cancel button on terminal states', () => {
@@ -557,6 +646,27 @@ describe('Centaur Slack launcher signed interaction route', () => {
       expect(actionIds).toEqual([CARD_REFRESH_ACTION_ID, CARD_RELAUNCH_ACTION_ID])
       expect(actionIds).not.toContain(CARD_CANCEL_ACTION_ID)
       expect(new Set(actionIds).size).toBe(actionIds.length)
+    }
+  })
+
+  test('each launcher shape modal carries purpose description + tailored objective prompt', async () => {
+    for (const shape of LAUNCHER_SHAPES) {
+      const harness = testHarness()
+      const payload = mutate(blockActionFixture, value => {
+        const action = (value.actions as Record<string, unknown>[])[0] as Record<string, unknown>
+        action.action_id = `${LAUNCHER_ACTION_ID}:${shape.key}`
+        action.value = shape.key
+      })
+      const response = await signedRequest(harness.app, payload)
+      expect(response.status).toBe(200)
+      const view = harness.calls[0]?.body?.view as Record<string, unknown>
+      const viewJson = JSON.stringify(view)
+      expect(viewJson).toContain(shape.description)
+      expect(viewJson).toContain(shape.objectivePrompt)
+      expect(viewJson).toContain(`worker \`${shape.worker}\``)
+      expect(shape.description.length).toBeGreaterThan(20)
+      expect(shape.objectivePrompt.length).toBeGreaterThan(10)
+      expect(shape.objectivePrompt.length).toBeLessThanOrEqual(150)
     }
   })
 
@@ -693,6 +803,8 @@ describe('Centaur Slack launcher signed interaction route', () => {
   })
 
   test('recent-runs open lists mocked runs and opens a select modal', async () => {
+    const longObjective =
+      'Prove recent-runs re-launch path with a deliberately long objective that would exceed Slack option value max when JSON-encoded with shape+slug metadata for static_select'
     const harness = testHarness({
       listRuns: [
         {
@@ -702,7 +814,7 @@ describe('Centaur Slack launcher signed interaction route', () => {
           created_at: new Date(NOW_MS - 2 * 60 * 60 * 1000).toISOString(),
           input: {
             shape: 'experiment',
-            objective: 'Prove recent-runs re-launch path',
+            objective: longObjective,
             slug: 'recent-proof'
           }
         },
@@ -718,6 +830,17 @@ describe('Centaur Slack launcher signed interaction route', () => {
           workflow_name: 'cmpx575_launcher',
           status: 'completed',
           created_at: new Date(NOW_MS - 30 * 60 * 1000).toISOString(),
+          input: {
+            shape: 'oncall-digest',
+            objective: 'Digest last night'
+          }
+        },
+        // Duplicate shape+objective must still produce unique option values.
+        {
+          run_id: 'wf-recent-3',
+          workflow_name: 'cmpx575_launcher',
+          status: 'completed',
+          created_at: new Date(NOW_MS - 15 * 60 * 1000).toISOString(),
           input: {
             shape: 'oncall-digest',
             objective: 'Digest last night'
@@ -744,24 +867,70 @@ describe('Centaur Slack launcher signed interaction route', () => {
     }
     expect(inputBlock?.element?.type).toBe('static_select')
     expect(inputBlock?.element?.action_id).toBe(RECENT_SELECT_ACTION_ID)
-    expect(inputBlock.element.options).toHaveLength(2)
+    expect(inputBlock.element.options).toHaveLength(3)
+    const values = inputBlock.element.options.map(o => String(o.value))
     for (const option of inputBlock.element.options) {
-      expect(String((option.text as { text: string }).text).length).toBeLessThanOrEqual(75)
-      expect(String(option.value).length).toBeLessThanOrEqual(2000)
+      const text = String((option.text as { text: string }).text)
+      const value = String(option.value)
+      expect(text.length).toBeGreaterThan(0)
+      expect(text.length).toBeLessThanOrEqual(75)
+      // Slack option object value max is 150 (not the 2000-char button limit).
+      expect(value.length).toBeGreaterThan(0)
+      expect(value.length).toBeLessThanOrEqual(150)
     }
+    // Values must be unique within the select.
+    expect(new Set(values).size).toBe(values.length)
+    // Prefer id:workflowRunId so long objectives never overflow 150 chars.
+    expect(values).toContain('id:wf-recent-1')
+    expect(values).toContain('id:wf-recent-2')
+    expect(values).toContain('id:wf-recent-3')
     const texts = inputBlock.element.options.map(o => (o.text as { text: string }).text)
     expect(texts.some(t => t.includes('experiment'))).toBe(true)
     expect(texts.some(t => t.includes('oncall-digest'))).toBe(true)
-    const values = inputBlock.element.options.map(o => JSON.parse(String(o.value)))
-    expect(values).toContainEqual({
-      shape: 'experiment',
-      objective: 'Prove recent-runs re-launch path',
-      slug: 'recent-proof'
-    })
-    expect(values).toContainEqual({
-      shape: 'oncall-digest',
-      objective: 'Digest last night'
-    })
+    // Built view has no empty action/option values.
+    expect(collectBlockActionValues(view).every(v => v.length > 0)).toBe(true)
+  })
+
+  test('filterValidRecentOptions drops empty/overlong/duplicate options', () => {
+    const filtered = filterValidRecentOptions([
+      {
+        value: 'id:ok-1',
+        text: '🧪 experiment · "ok"',
+        shape: 'experiment',
+        objective: 'ok'
+      },
+      {
+        value: '',
+        text: 'empty value',
+        shape: 'experiment',
+        objective: 'x'
+      },
+      {
+        value: 'id:ok-1', // duplicate
+        text: 'dup',
+        shape: 'experiment',
+        objective: 'x'
+      },
+      {
+        value: 'id:ok-2',
+        text: 'x'.repeat(76),
+        shape: 'experiment',
+        objective: 'x'
+      },
+      {
+        value: 'v'.repeat(151),
+        text: 'overlong value',
+        shape: 'experiment',
+        objective: 'x'
+      },
+      {
+        value: 'id:ok-3',
+        text: 'good',
+        shape: 'oncall-digest',
+        objective: 'y'
+      }
+    ])
+    expect(filtered.map(o => o.value)).toEqual(['id:ok-1', 'id:ok-3'])
   })
 
   test('recent-runs empty list shows empty state and launches nothing on submit', async () => {
@@ -795,11 +964,13 @@ describe('Centaur Slack launcher signed interaction route', () => {
 
   test('recent-runs submit re-launches via existing workflow-create path', async () => {
     const harness = testHarness()
+    // Compact JSON still accepted (back-compat / short objectives without run id).
     const optionValue = JSON.stringify({
       shape: 'oncall-digest',
       objective: 'Re-run from recent menu',
       slug: 'recent-relaunch'
     })
+    expect(optionValue.length).toBeLessThanOrEqual(150)
     const response = await signedRequest(
       harness.app,
       recentViewSubmission({
@@ -838,6 +1009,73 @@ describe('Centaur Slack launcher signed interaction route', () => {
     const cardBody = JSON.stringify(cardPosts[0]?.body)
     expect(cardBody).toContain('oncall-digest')
     expect(cardBody).toContain('📟 Oncall digest')
+    // Initial card post has no empty button values (pre-workflow-id path).
+    for (const value of collectBlockActionValues(cardPosts[0]?.body ?? {})) {
+      expect(value.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('recent-runs submit resolves id: option values via workflow get', async () => {
+    const harness = testHarness({
+      workflowStates: [
+        {
+          run_id: 'wf-from-id',
+          status: 'completed',
+          input: {
+            shape: 'quota-scheduler',
+            objective: 'Evaluate codex quota for the next low-risk queue',
+            slug: 'quota-eval'
+          },
+          result: {
+            output: {
+              launcher_run_id: '2026-07-10_quota-scheduler-quota-eval',
+              fleet_job_id: 'fleet-job-q',
+              terminal_state: 'completed',
+              shape: 'quota-scheduler'
+            }
+          }
+        },
+        // Submission poll after create uses another GET.
+        {
+          run_id: 'workflow-run-1',
+          status: 'completed',
+          result: {
+            output: {
+              launcher_run_id: '2026-07-10_quota-scheduler-quota-eval',
+              fleet_job_id: 'fleet-job-q',
+              terminal_state: 'completed',
+              shape: 'quota-scheduler'
+            }
+          }
+        }
+      ]
+    })
+    const response = await signedRequest(
+      harness.app,
+      recentViewSubmission({
+        stateValues: {
+          [RECENT_SELECT_BLOCK_ID]: {
+            [RECENT_SELECT_ACTION_ID]: {
+              type: 'static_select',
+              selected_option: {
+                text: { type: 'plain_text', text: '⏱️ quota-scheduler · "Evaluate"' },
+                value: 'id:wf-from-id'
+              }
+            }
+          }
+        }
+      })
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(harness.pending)
+    const workflowCreates = harness.calls.filter(
+      call => call.url.endsWith('/api/workflows/runs') && call.method === 'POST'
+    )
+    expect(workflowCreates).toHaveLength(1)
+    const workflowInput = (workflowCreates[0]?.body?.input ?? {}) as Record<string, unknown>
+    expect(workflowInput.shape).toBe('quota-scheduler')
+    expect(workflowInput.objective).toBe('Evaluate codex quota for the next low-risk queue')
+    expect(workflowInput.slug).toBe('quota-eval')
   })
 
   test('recent-runs malformed or unknown selection errors and launches nothing', async () => {

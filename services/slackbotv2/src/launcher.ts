@@ -22,39 +22,60 @@ export const CARD_RELAUNCH_ACTION_ID = 'centaur.card.relaunch.v1'
 const RECENT_LIST_LIMIT = 15
 const RECENT_OPTIONS_MAX = 10
 const RECENT_OPTION_TEXT_MAX = 75
-const SLACK_VALUE_MAX = 2000
+/** Slack option-object `value` max (static_select). Button values allow 2000. */
+const RECENT_OPTION_VALUE_MAX = 150
+const SLACK_BUTTON_VALUE_MAX = 2000
 
-/** Shapes already allowlisted by the cmpx575_launcher workflow — expose, do not redefine. */
+/**
+ * Shapes already allowlisted by the cmpx575_launcher workflow — expose, do not redefine.
+ * `description` / `objectivePrompt` are grounded in overlay SHAPES goals
+ * (spike_overlay/tools/cmpx575_launcher/client.py) + default workers.
+ */
 export const LAUNCHER_SHAPES = [
   {
     key: 'experiment',
     label: '🧪 General experiment',
     title: 'General experiment',
-    worker: 'grok'
+    worker: 'grok',
+    description:
+      'Launches a scoped orchestration experiment: creates a durable run folder and dispatches a grok fleet worker to clarify the goal, run the first useful slice, and write RETURN.md.',
+    objectivePrompt: 'What should this experiment prove or build?'
   },
   {
     key: 'oncall-digest',
     label: '📟 Oncall digest',
     title: 'Oncall digest',
-    worker: 'grok'
+    worker: 'grok',
+    description:
+      'Produces a read-only health digest for Centaur, spikes, fleet, and repo run state via a grok worker — severity, evidence, and owner-facing next steps only.',
+    objectivePrompt: 'What window or systems should this oncall digest cover?'
   },
   {
     key: 'knowledge-map-ingest',
     label: '🗺️ Knowledge-map ingest',
     title: 'Knowledge-map ingest',
-    worker: 'codex'
+    worker: 'codex',
+    description:
+      'Turns supplied material into safe knowledge-map proposals or field signals (codex worker). Secret-scans first; promotion stays human-gated.',
+    objectivePrompt: 'What material should be ingested, and into which knowledge map?'
   },
   {
     key: 'slack-inbox-to-board',
     label: '📥 Inbox→board',
     title: 'Inbox→board',
-    worker: 'codex'
+    worker: 'codex',
+    description:
+      'Converts Slack/self-DM captures into clarified board items, handoffs, or run briefs (codex worker) without claiming incomplete exports are complete.',
+    objectivePrompt: 'Which inbox or threads should become board items or handoffs?'
   },
   {
     key: 'quota-scheduler',
     label: '⏱️ Quota scheduler',
     title: 'Quota scheduler',
-    worker: 'grok'
+    worker: 'grok',
+    description:
+      'Uses subscription usage signals to recommend what work to queue, defer, or alert on via a grok worker — never leaks credentials into logs or Slack.',
+    objectivePrompt: 'What usage window or queue decision should this scheduler evaluate?'
   }
 ] as const
 
@@ -129,8 +150,8 @@ type LauncherSubmission = {
   viewId: string
 }
 
-type RecentRunOption = {
-  /** Compact value stored on the static_select option (≤2000 chars). */
+export type RecentRunOption = {
+  /** Compact value stored on the static_select option (≤150 chars for select options). */
   value: string
   /** Human-readable label ≤75 chars. */
   text: string
@@ -544,7 +565,11 @@ async function openLauncherModal(input: {
     multiline: true,
     min_length: 1,
     max_length: 2000,
-    placeholder: { type: 'plain_text', text: 'What should this run prove or build?' }
+    // Slack plain_text placeholder max is 150 characters.
+    placeholder: {
+      type: 'plain_text',
+      text: truncatePlainText(shapeInfo.objectivePrompt, 150)
+    }
   }
   if (input.objective) {
     objectiveElement.initial_value = truncatePlainText(input.objective, 2000)
@@ -561,13 +586,11 @@ async function openLauncherModal(input: {
       close: { type: 'plain_text', text: 'Cancel' },
       blocks: [
         {
-          type: 'context',
-          elements: [
-            {
-              type: 'mrkdwn',
-              text: `Launching ${shapeInfo.label} (\`${input.shape}\`)`
-            }
-          ]
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*${shapeInfo.label}* · worker \`${shapeInfo.worker}\`\n${shapeInfo.description}`
+          }
         },
         {
           type: 'input',
@@ -608,6 +631,9 @@ async function openRecentRunsModal(input: {
   }
   const nowMs = (input.options.now ?? Date.now)()
   const recent = await listRecentLauncherRuns(input.options, nowMs)
+  // Final gate: Slack rejects views.open (invalid_arguments) for empty/duplicate
+  // option values, text >75, value >150, or >100 options.
+  const validRecent = filterValidRecentOptions(recent)
   const view: JsonRecord = {
     type: 'modal',
     callback_id: RECENT_SUBMIT_CALLBACK_ID,
@@ -618,7 +644,7 @@ async function openRecentRunsModal(input: {
     blocks: [] as JsonRecord[]
   }
 
-  if (recent.length === 0) {
+  if (validRecent.length === 0) {
     ;(view.blocks as JsonRecord[]).push({
       type: 'section',
       text: {
@@ -646,7 +672,7 @@ async function openRecentRunsModal(input: {
           type: 'static_select',
           action_id: RECENT_SELECT_ACTION_ID,
           placeholder: { type: 'plain_text', text: 'Select a recent run', emoji: true },
-          options: recent.map(run => ({
+          options: validRecent.map(run => ({
             text: { type: 'plain_text', text: run.text, emoji: true },
             value: run.value
           }))
@@ -778,19 +804,50 @@ async function resolveRecentRunLaunchParams(
   }
 }
 
+/**
+ * Encode a static_select option value.
+ *
+ * Slack option `value` max is **150** chars (not the 2000-char button limit).
+ * Prefer `id:${workflowRunId}` when present: always unique within a select
+ * (duplicate shape+objective pairs would otherwise collide) and stays short.
+ * Fall back to compact JSON only when under the 150-char budget.
+ */
 function encodeRecentOptionValue(input: {
   shape: LauncherShape
   objective: string
   slug?: string
   workflowRunId?: string
 }): string | undefined {
+  const workflowRunId = input.workflowRunId?.trim()
+  if (workflowRunId) {
+    const idValue = `id:${workflowRunId}`
+    if (idValue.length > 3 && idValue.length <= RECENT_OPTION_VALUE_MAX) return idValue
+  }
   const compact: JsonRecord = { shape: input.shape, objective: input.objective }
   if (input.slug) compact.slug = input.slug
   const encoded = JSON.stringify(compact)
-  if (encoded.length <= SLACK_VALUE_MAX) return encoded
-  // Objective too long for the select value — re-fetch by workflow run id on submit.
-  if (input.workflowRunId) return `id:${input.workflowRunId}`
+  if (encoded.length > 0 && encoded.length <= RECENT_OPTION_VALUE_MAX) return encoded
   return undefined
+}
+
+/**
+ * Slack static_select option rules enforced before views.open:
+ * non-empty text ≤75, non-empty value ≤150, values unique, ≤100 options.
+ */
+export function filterValidRecentOptions(options: RecentRunOption[]): RecentRunOption[] {
+  const out: RecentRunOption[] = []
+  const seen = new Set<string>()
+  for (const option of options) {
+    if (out.length >= RECENT_OPTIONS_MAX) break
+    const text = (option.text ?? '').trim()
+    const value = (option.value ?? '').trim()
+    if (!text || text.length > RECENT_OPTION_TEXT_MAX) continue
+    if (!value || value.length > RECENT_OPTION_VALUE_MAX) continue
+    if (seen.has(value)) continue
+    seen.add(value)
+    out.push({ ...option, text, value })
+  }
+  return out
 }
 
 function formatRecentOptionLabel(
@@ -1208,22 +1265,27 @@ export function runCardPayload(
   const shape: LauncherShape = isLauncherShape(rawShape) ? rawShape : 'experiment'
   const shapeInfo = shapeMeta(shape)
   const stateDisplay = cardStatusDisplay(state)
-  const elements: JsonRecord[] = [
-    {
+  // Slack rejects the whole message (invalid_blocks) if ANY button has value "".
+  // Refresh/Cancel are only meaningful once a workflow run id exists; the initial
+  // pre-id card posts with at most Relaunch (shape-based, always non-empty).
+  const workflowRunId = (record.workflowRunId ?? '').trim()
+  const elements: JsonRecord[] = []
+  if (workflowRunId) {
+    elements.push({
       type: 'button',
       action_id: CARD_REFRESH_ACTION_ID,
       text: { type: 'plain_text', text: '🔄 Refresh', emoji: true },
-      value: record.workflowRunId ?? ''
-    }
-  ]
-  if (isNonTerminalCardState(state)) {
-    elements.push({
-      type: 'button',
-      action_id: CARD_CANCEL_ACTION_ID,
-      text: { type: 'plain_text', text: '🛑 Cancel', emoji: true },
-      style: 'danger',
-      value: record.workflowRunId ?? ''
+      value: workflowRunId
     })
+    if (isNonTerminalCardState(state)) {
+      elements.push({
+        type: 'button',
+        action_id: CARD_CANCEL_ACTION_ID,
+        text: { type: 'plain_text', text: '🛑 Cancel', emoji: true },
+        style: 'danger',
+        value: workflowRunId
+      })
+    }
   }
   elements.push({
     type: 'button',
@@ -1305,8 +1367,38 @@ function relaunchValue(input: { shape: LauncherShape; objective?: string }): str
   if (!input.objective) return input.shape
   const encoded = JSON.stringify({ shape: input.shape, objective: input.objective })
   // Slack button value max is 2000 characters.
-  if (encoded.length <= 2000) return encoded
+  if (encoded.length <= SLACK_BUTTON_VALUE_MAX) return encoded
   return input.shape
+}
+
+/**
+ * Collect every interactive element `value` from a Block Kit payload (buttons,
+ * static_select options, overflow, checkboxes, radio). Used by tests and as a
+ * final audit that nothing emits Slack-rejected empty values.
+ */
+export function collectBlockActionValues(payload: JsonRecord): string[] {
+  const values: string[] = []
+  const blocks = Array.isArray(payload.blocks) ? payload.blocks : []
+  for (const block of blocks) {
+    collectElementValues(asRecord(block), values)
+  }
+  return values
+}
+
+function collectElementValues(node: JsonRecord, values: string[]): void {
+  if (typeof node.value === 'string') values.push(node.value)
+  if (Array.isArray(node.elements)) {
+    for (const el of node.elements) collectElementValues(asRecord(el), values)
+  }
+  if (Array.isArray(node.options)) {
+    for (const opt of node.options) collectElementValues(asRecord(opt), values)
+  }
+  if (node.element && typeof node.element === 'object') {
+    collectElementValues(asRecord(node.element), values)
+  }
+  if (node.accessory && typeof node.accessory === 'object') {
+    collectElementValues(asRecord(node.accessory), values)
+  }
 }
 
 function parseRelaunchValue(
