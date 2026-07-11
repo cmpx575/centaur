@@ -1,0 +1,1838 @@
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import type { Logger, StateAdapter } from 'chat'
+import type { Context, Hono } from 'hono'
+
+import type { SlackbotV2Fetch } from './types'
+
+export const LAUNCHER_ACTION_ID = 'centaur.launch.experiment.v1'
+export const LAUNCHER_CALLBACK_ID = 'centaur.launcher.submit.v1'
+export const LAUNCHER_WORKFLOW_NAME = 'cmpx575_launcher'
+
+/** Recent-runs menu: separate actions block (Slack max 5 elements per actions block). */
+export const RECENT_OPEN_ACTION_ID = 'centaur.recent.open.v1'
+export const RECENT_SUBMIT_CALLBACK_ID = 'centaur.recent.submit.v1'
+export const RECENT_SELECT_ACTION_ID = 'centaur.recent.select.v1'
+export const RECENT_SELECT_BLOCK_ID = 'recent_run_block'
+
+/** Status-card action_ids — must be unique within a Slack message (and across buttons). */
+export const CARD_REFRESH_ACTION_ID = 'centaur.card.refresh.v1'
+export const CARD_CANCEL_ACTION_ID = 'centaur.card.cancel.v1'
+export const CARD_RELAUNCH_ACTION_ID = 'centaur.card.relaunch.v1'
+
+const RECENT_LIST_LIMIT = 15
+const RECENT_OPTIONS_MAX = 10
+const RECENT_OPTION_TEXT_MAX = 75
+/** Slack option-object `value` max (static_select). Button values allow 2000. */
+const RECENT_OPTION_VALUE_MAX = 150
+const SLACK_BUTTON_VALUE_MAX = 2000
+
+/**
+ * Shapes already allowlisted by the cmpx575_launcher workflow — expose, do not redefine.
+ * `description` / `objectivePrompt` are grounded in overlay SHAPES goals
+ * (spike_overlay/tools/cmpx575_launcher/client.py) + default workers.
+ */
+export const LAUNCHER_SHAPES = [
+  {
+    key: 'experiment',
+    label: '🧪 General experiment',
+    title: 'General experiment',
+    worker: 'grok',
+    description:
+      'Launches a scoped orchestration experiment: creates a durable run folder and dispatches a grok fleet worker to clarify the goal, run the first useful slice, and write RETURN.md.',
+    objectivePrompt: 'What should this experiment prove or build?'
+  },
+  {
+    key: 'oncall-digest',
+    label: '📟 Oncall digest',
+    title: 'Oncall digest',
+    worker: 'grok',
+    description:
+      'Produces a read-only health digest for Centaur, spikes, fleet, and repo run state via a grok worker — severity, evidence, and owner-facing next steps only.',
+    objectivePrompt: 'What window or systems should this oncall digest cover?'
+  },
+  {
+    key: 'knowledge-map-ingest',
+    label: '🗺️ Knowledge-map ingest',
+    title: 'Knowledge-map ingest',
+    worker: 'codex',
+    description:
+      'Turns supplied material into safe knowledge-map proposals or field signals (codex worker). Secret-scans first; promotion stays human-gated.',
+    objectivePrompt: 'What material should be ingested, and into which knowledge map?'
+  },
+  {
+    key: 'slack-inbox-to-board',
+    label: '📥 Inbox→board',
+    title: 'Inbox→board',
+    worker: 'codex',
+    description:
+      'Converts Slack/self-DM captures into clarified board items, handoffs, or run briefs (codex worker) without claiming incomplete exports are complete.',
+    objectivePrompt: 'Which inbox or threads should become board items or handoffs?'
+  },
+  {
+    key: 'quota-scheduler',
+    label: '⏱️ Quota scheduler',
+    title: 'Quota scheduler',
+    worker: 'grok',
+    description:
+      'Uses subscription usage signals to recommend what work to queue, defer, or alert on via a grok worker — never leaks credentials into logs or Slack.',
+    objectivePrompt: 'What usage window or queue decision should this scheduler evaluate?'
+  }
+] as const
+
+export type LauncherShape = (typeof LAUNCHER_SHAPES)[number]['key']
+
+const LAUNCHER_SHAPE_BY_KEY = new Map(
+  LAUNCHER_SHAPES.map(shape => [shape.key, shape] as const)
+)
+const LAUNCHER_SHAPE_KEYS = new Set<string>(LAUNCHER_SHAPES.map(shape => shape.key))
+
+const OBJECTIVE_BLOCK_ID = 'objective_block'
+const OBJECTIVE_ACTION_ID = 'objective_input'
+const SLUG_BLOCK_ID = 'slug_block'
+const SLUG_ACTION_ID = 'slug_input'
+const MAX_SIGNATURE_AGE_SECONDS = 5 * 60
+const CLAIM_TTL_MS = 5 * 60 * 1000
+const CLAIM_REFRESH_MS = 60 * 1000
+const RECORD_TTL_MS = 30 * 24 * 60 * 60 * 1000
+const DEFAULT_POLL_INTERVAL_MS = 5_000
+const DEFAULT_MAX_POLL_MS = 45 * 60 * 1000
+const TERMINAL_WORKFLOW_STATES = new Set(['completed', 'failed', 'cancelled'])
+const TERMINAL_CARD_STATES = new Set(['completed', 'failed', 'cancelled'])
+/** Honest cancel copy: cancels the workflow run, not the fleet worker PID. */
+const CANCEL_REQUESTED_STATUS =
+  'Cancel requested — workflow cancelling; fleet job may still finish'
+
+type JsonRecord = Record<string, unknown>
+
+export type SlackLauncherOptions = {
+  allowedChannelIds: readonly string[]
+  allowedTeamIds: readonly string[]
+  allowedUserIds: readonly string[]
+  apiKey?: string
+  apiUrl: string
+  botToken: string
+  fetch?: SlackbotV2Fetch
+  logger: Logger
+  maxPollMs?: number
+  now?: () => number
+  pollIntervalMs?: number
+  schedule?: (promise: Promise<unknown>) => void
+  signingSecret: string
+  slackApiUrl?: string
+  state: StateAdapter
+}
+
+type LauncherPrivateMetadata = {
+  channel_id: string
+  origin_ts: string
+  shape: LauncherShape
+  team_id: string
+  v: 1
+}
+
+type RecentPrivateMetadata = {
+  channel_id: string
+  origin_ts: string
+  team_id: string
+  v: 1
+}
+
+type LauncherSubmission = {
+  callbackId: string
+  channelId: string
+  idempotencyKey: string
+  objective: string
+  originTs: string
+  shape: LauncherShape
+  slug?: string
+  teamId: string
+  userId: string
+  viewId: string
+}
+
+export type RecentRunOption = {
+  /** Compact value stored on the static_select option (≤150 chars for select options). */
+  value: string
+  /** Human-readable label ≤75 chars. */
+  text: string
+  shape: LauncherShape
+  objective: string
+  slug?: string
+  createdAt?: string
+  workflowRunId?: string
+}
+
+type LauncherRunState =
+  | 'claiming'
+  | 'queued'
+  | 'running'
+  | 'cancelling'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+
+type LauncherRunRecord = {
+  cardTs?: string
+  channelId: string
+  createdAt?: string
+  fleetJobId?: string
+  idempotencyKey?: string
+  launcherRunId?: string
+  objective?: string
+  shape: LauncherShape
+  state: LauncherRunState
+  terminalReplySent?: boolean
+  updatedAt: string
+  userId: string
+  workflowRunId?: string
+}
+
+class LauncherRequestError extends Error {
+  constructor(
+    readonly code: string,
+    readonly status: number
+  ) {
+    super(code)
+  }
+}
+
+export function registerSlackLauncher(app: Hono, options: SlackLauncherOptions): void {
+  app.post('/api/webhooks/slack/actions', async c => {
+    const rawBody = await c.req.raw.clone().text()
+    const verification = verifySlackRequest({
+      nowMs: (options.now ?? Date.now)(),
+      rawBody,
+      signature: c.req.header('x-slack-signature'),
+      signingSecret: options.signingSecret,
+      timestamp: c.req.header('x-slack-request-timestamp')
+    })
+    if (!verification.ok) {
+      options.logger.warn('slack_launcher_request_rejected', { reason: verification.reason })
+      return c.text('invalid request', 401)
+    }
+
+    const parsed = parseInteractionPayload(rawBody)
+    if (!parsed.ok) {
+      options.logger.warn('slack_launcher_payload_rejected', { reason: parsed.reason })
+      return c.text('invalid payload', 400)
+    }
+
+    const payload = parsed.payload
+    const type = stringAt(payload, 'type')
+    const teamId = stringAt(recordAt(payload, 'team'), 'id')
+    const userId = stringAt(recordAt(payload, 'user'), 'id')
+    if (!isAllowed(teamId, options.allowedTeamIds)) {
+      return denyInteraction(c, options, type, 'team')
+    }
+    if (!isAllowed(userId, options.allowedUserIds)) {
+      return denyInteraction(c, options, type, 'user')
+    }
+
+    if (type === 'block_actions') {
+      const channelId =
+        stringAt(recordAt(payload, 'channel'), 'id') ||
+        stringAt(recordAt(payload, 'container'), 'channel_id')
+      if (!isAllowed(channelId, options.allowedChannelIds)) {
+        return denyInteraction(c, options, type, 'channel')
+      }
+      try {
+        const outcome = await dispatchBlockAction(payload, teamId, channelId, userId, options, c)
+        return outcome
+      } catch (error) {
+        const code = safeErrorCode(error)
+        options.logger.error('slack_launcher_block_action_failed', { error_code: code })
+        if (error instanceof LauncherRequestError) {
+          const status =
+            error.status === 400 || error.status === 403 || error.status === 502
+              ? error.status
+              : 502
+          return c.text(error.code, status)
+        }
+        return c.text('unable to handle action', 502)
+      }
+    }
+
+    if (type === 'view_submission') {
+      const view = recordAt(payload, 'view')
+      const callbackId = stringAt(view, 'callback_id')
+
+      if (callbackId === RECENT_SUBMIT_CALLBACK_ID) {
+        let recentSubmission: Awaited<ReturnType<typeof parseRecentSubmission>>
+        try {
+          recentSubmission = await parseRecentSubmission(payload, teamId, userId, options)
+        } catch (error) {
+          options.logger.error('slack_launcher_recent_submission_parse_failed', {
+            error_code: safeErrorCode(error)
+          })
+          return c.text('unable to handle submission', 502)
+        }
+        if (!recentSubmission.ok) {
+          if (recentSubmission.fieldErrors) {
+            return c.json({ response_action: 'errors', errors: recentSubmission.fieldErrors }, 200)
+          }
+          options.logger.warn('slack_launcher_submission_rejected', {
+            reason: recentSubmission.reason,
+            team_id: teamId,
+            user_id: userId
+          })
+          return c.text('invalid submission', 400)
+        }
+        if (recentSubmission.noop) {
+          options.logger.info('slack_launcher_recent_noop', {
+            reason: recentSubmission.reason,
+            team_id: teamId,
+            user_id: userId
+          })
+          return c.text('', 200)
+        }
+        const recentValue = recentSubmission.value
+        if (!isAllowed(recentValue.channelId, options.allowedChannelIds)) {
+          return denyInteraction(c, options, type, 'channel')
+        }
+        if (recentValue.teamId !== teamId) {
+          return denyInteraction(c, options, type, 'metadata_team')
+        }
+        const task = processSubmission(recentValue, options).catch(error => {
+          options.logger.error('slack_launcher_submission_failed', {
+            error_code: safeErrorCode(error),
+            idempotency_key: recentValue.idempotencyKey
+          })
+        })
+        scheduleTask(c, task, options)
+        options.logger.info('slack_launcher_submission_acknowledged', {
+          callback_id: recentValue.callbackId,
+          channel_id: recentValue.channelId,
+          idempotency_key: recentValue.idempotencyKey,
+          team_id: teamId,
+          user_id: userId,
+          view_id: recentValue.viewId
+        })
+        return c.text('', 200)
+      }
+
+      const submission = parseSubmission(payload, teamId, userId)
+      if (!submission.ok) {
+        if (submission.fieldErrors) {
+          return c.json({ response_action: 'errors', errors: submission.fieldErrors }, 200)
+        }
+        options.logger.warn('slack_launcher_submission_rejected', {
+          reason: submission.reason,
+          team_id: teamId,
+          user_id: userId
+        })
+        return c.text('invalid submission', 400)
+      }
+      if (!isAllowed(submission.value.channelId, options.allowedChannelIds)) {
+        return denyInteraction(c, options, type, 'channel')
+      }
+      if (submission.value.teamId !== teamId) {
+        return denyInteraction(c, options, type, 'metadata_team')
+      }
+
+      const task = processSubmission(submission.value, options).catch(error => {
+        options.logger.error('slack_launcher_submission_failed', {
+          error_code: safeErrorCode(error),
+          idempotency_key: submission.value.idempotencyKey
+        })
+      })
+      scheduleTask(c, task, options)
+      options.logger.info('slack_launcher_submission_acknowledged', {
+        callback_id: submission.value.callbackId,
+        channel_id: submission.value.channelId,
+        idempotency_key: submission.value.idempotencyKey,
+        team_id: teamId,
+        user_id: userId,
+        view_id: submission.value.viewId
+      })
+      return c.text('', 200)
+    }
+
+    options.logger.info('slack_launcher_interaction_ignored', { interaction_type: type })
+    return c.text('', 200)
+  })
+}
+
+export function launcherMessagePayload(): JsonRecord {
+  return {
+    text: 'Centaur launcher: pick an experiment shape to start.',
+    blocks: [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: 'Centaur launchpad', emoji: true }
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: 'Start a scoped, durable fleet run. Pick a shape, then enter the objective in the modal. Confirmed launches are deterministic.'
+        }
+      },
+      {
+        type: 'actions',
+        block_id: 'centaur_launcher_actions',
+        // Slack allows at most 5 elements per actions block; one button per allowlisted shape.
+        elements: LAUNCHER_SHAPES.map((shape, index) => ({
+          type: 'button',
+          // Slack requires action_id unique within a message; suffix with shape key.
+          action_id: `${LAUNCHER_ACTION_ID}:${shape.key}`,
+          text: { type: 'plain_text', text: shape.label, emoji: true },
+          value: shape.key,
+          ...(index === 0 ? { style: 'primary' as const } : {})
+        }))
+      },
+      {
+        // Separate actions block: shape block is already at Slack's 5-element max.
+        type: 'actions',
+        block_id: 'centaur_launcher_recent',
+        elements: [
+          {
+            type: 'button',
+            action_id: RECENT_OPEN_ACTION_ID,
+            text: { type: 'plain_text', text: '📋 Recent runs', emoji: true },
+            value: 'recent'
+          }
+        ]
+      },
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: 'Phase 2 · 5 shapes · signed callbacks · allowlisted to this playground · retry-safe'
+          }
+        ]
+      }
+    ]
+  }
+}
+
+export function slackSignature(signingSecret: string, timestamp: string, rawBody: string): string {
+  return `v0=${createHmac('sha256', signingSecret)
+    .update(`v0:${timestamp}:${rawBody}`, 'utf8')
+    .digest('hex')}`
+}
+
+export function verifySlackRequest(input: {
+  nowMs: number
+  rawBody: string
+  signature?: string
+  signingSecret: string
+  timestamp?: string
+}): { ok: true } | { ok: false; reason: string } {
+  const timestamp = input.timestamp?.trim() ?? ''
+  const timestampSeconds = Number.parseInt(timestamp, 10)
+  if (!timestamp || !Number.isFinite(timestampSeconds)) {
+    return { ok: false, reason: 'missing_timestamp' }
+  }
+  const ageSeconds = Math.abs(Math.floor(input.nowMs / 1000) - timestampSeconds)
+  if (ageSeconds > MAX_SIGNATURE_AGE_SECONDS) {
+    return { ok: false, reason: 'stale_timestamp' }
+  }
+  const actual = input.signature?.trim() ?? ''
+  const expected = slackSignature(input.signingSecret, timestamp, input.rawBody)
+  const actualBuffer = Buffer.from(actual, 'utf8')
+  const expectedBuffer = Buffer.from(expected, 'utf8')
+  if (
+    actualBuffer.length !== expectedBuffer.length ||
+    !timingSafeEqual(actualBuffer, expectedBuffer)
+  ) {
+    return { ok: false, reason: 'invalid_signature' }
+  }
+  return { ok: true }
+}
+
+async function dispatchBlockAction(
+  payload: JsonRecord,
+  teamId: string,
+  channelId: string,
+  userId: string,
+  options: SlackLauncherOptions,
+  c: Context
+): Promise<Response> {
+  const actions = arrayAt(payload, 'actions')
+  if (actions.length !== 1) throw new LauncherRequestError('invalid_action_count', 400)
+  const action = asRecord(actions[0])
+  const actionId = stringAt(action, 'action_id')
+  const value = stringAt(action, 'value')
+
+  // Launchpad shape buttons (Phase-1 bare id + multi-button suffixed ids).
+  if (isLauncherActionId(actionId)) {
+    if (!isLauncherShape(value)) throw new LauncherRequestError('disallowed_action', 400)
+    await openLauncherModal({
+      channelId,
+      objective: undefined,
+      options,
+      originTs: stringAt(recordAt(payload, 'container'), 'message_ts'),
+      shape: value,
+      teamId,
+      triggerId: stringAt(payload, 'trigger_id')
+    })
+    options.logger.info('slack_launcher_modal_opened', {
+      action_id: actionId,
+      channel_id: channelId,
+      shape: value,
+      team_id: teamId,
+      user_id: userId
+    })
+    return c.text('', 200)
+  }
+
+  if (actionId === RECENT_OPEN_ACTION_ID) {
+    await openRecentRunsModal({
+      channelId,
+      options,
+      originTs: stringAt(recordAt(payload, 'container'), 'message_ts'),
+      teamId,
+      triggerId: stringAt(payload, 'trigger_id')
+    })
+    options.logger.info('slack_launcher_recent_modal_opened', {
+      action_id: actionId,
+      channel_id: channelId,
+      team_id: teamId,
+      user_id: userId
+    })
+    return c.text('', 200)
+  }
+
+  if (actionId === CARD_RELAUNCH_ACTION_ID) {
+    const parsed = parseRelaunchValue(value)
+    if (!parsed) throw new LauncherRequestError('disallowed_action', 400)
+    await openLauncherModal({
+      channelId,
+      objective: parsed.objective,
+      options,
+      originTs: stringAt(recordAt(payload, 'container'), 'message_ts'),
+      shape: parsed.shape,
+      teamId,
+      triggerId: stringAt(payload, 'trigger_id')
+    })
+    options.logger.info('slack_launcher_modal_opened', {
+      action_id: actionId,
+      channel_id: channelId,
+      shape: parsed.shape,
+      team_id: teamId,
+      user_id: userId
+    })
+    return c.text('', 200)
+  }
+
+  if (actionId === CARD_REFRESH_ACTION_ID) {
+    const task = handleCardRefresh(payload, channelId, userId, value, options).catch(error => {
+      options.logger.error('slack_launcher_card_refresh_failed', {
+        error_code: safeErrorCode(error),
+        workflow_run_id: value
+      })
+    })
+    scheduleTask(c, task, options)
+    return c.text('', 200)
+  }
+
+  if (actionId === CARD_CANCEL_ACTION_ID) {
+    const task = handleCardCancel(payload, channelId, userId, value, options).catch(error => {
+      options.logger.error('slack_launcher_card_cancel_failed', {
+        error_code: safeErrorCode(error),
+        workflow_run_id: value
+      })
+    })
+    scheduleTask(c, task, options)
+    return c.text('', 200)
+  }
+
+  throw new LauncherRequestError('disallowed_action', 400)
+}
+
+async function openLauncherModal(input: {
+  channelId: string
+  objective?: string
+  options: SlackLauncherOptions
+  originTs: string
+  shape: LauncherShape
+  teamId: string
+  triggerId: string
+}): Promise<void> {
+  if (!input.triggerId) throw new LauncherRequestError('missing_trigger_id', 400)
+  const shapeInfo = shapeMeta(input.shape)
+  const metadata: LauncherPrivateMetadata = {
+    v: 1,
+    shape: input.shape,
+    team_id: input.teamId,
+    channel_id: input.channelId,
+    origin_ts: input.originTs
+  }
+  const objectiveElement: JsonRecord = {
+    type: 'plain_text_input',
+    action_id: OBJECTIVE_ACTION_ID,
+    multiline: true,
+    min_length: 1,
+    max_length: 2000,
+    // Slack plain_text placeholder max is 150 characters.
+    placeholder: {
+      type: 'plain_text',
+      text: truncatePlainText(shapeInfo.objectivePrompt, 150)
+    }
+  }
+  if (input.objective) {
+    objectiveElement.initial_value = truncatePlainText(input.objective, 2000)
+  }
+  await slackApi(input.options, 'views.open', {
+    trigger_id: input.triggerId,
+    view: {
+      type: 'modal',
+      callback_id: LAUNCHER_CALLBACK_ID,
+      private_metadata: JSON.stringify(metadata),
+      // Slack modal titles max out at 24 characters.
+      title: { type: 'plain_text', text: truncatePlainText(shapeInfo.title, 24), emoji: true },
+      submit: { type: 'plain_text', text: 'Launch' },
+      close: { type: 'plain_text', text: 'Cancel' },
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*${shapeInfo.label}* · worker \`${shapeInfo.worker}\`\n${shapeInfo.description}`
+          }
+        },
+        {
+          type: 'input',
+          block_id: OBJECTIVE_BLOCK_ID,
+          label: { type: 'plain_text', text: 'Objective' },
+          element: objectiveElement
+        },
+        {
+          type: 'input',
+          block_id: SLUG_BLOCK_ID,
+          optional: true,
+          label: { type: 'plain_text', text: 'Short slug (optional)' },
+          element: {
+            type: 'plain_text_input',
+            action_id: SLUG_ACTION_ID,
+            max_length: 63,
+            placeholder: { type: 'plain_text', text: 'e.g. slack-launcher-proof' }
+          }
+        }
+      ]
+    }
+  })
+}
+
+async function openRecentRunsModal(input: {
+  channelId: string
+  options: SlackLauncherOptions
+  originTs: string
+  teamId: string
+  triggerId: string
+}): Promise<void> {
+  if (!input.triggerId) throw new LauncherRequestError('missing_trigger_id', 400)
+  const metadata: RecentPrivateMetadata = {
+    v: 1,
+    team_id: input.teamId,
+    channel_id: input.channelId,
+    origin_ts: input.originTs
+  }
+  const nowMs = (input.options.now ?? Date.now)()
+  const recent = await listRecentLauncherRuns(input.options, nowMs)
+  // Final gate: Slack rejects views.open (invalid_arguments) for empty/duplicate
+  // option values, text >75, value >150, or >100 options.
+  const validRecent = filterValidRecentOptions(recent)
+  const view: JsonRecord = {
+    type: 'modal',
+    callback_id: RECENT_SUBMIT_CALLBACK_ID,
+    private_metadata: JSON.stringify(metadata),
+    // Slack modal titles max out at 24 characters.
+    title: { type: 'plain_text', text: 'Recent runs', emoji: true },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: [] as JsonRecord[]
+  }
+
+  if (validRecent.length === 0) {
+    ;(view.blocks as JsonRecord[]).push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '_No recent runs yet._ Launch an experiment from the launchpad first, then check back here to re-run it.'
+      }
+    })
+  } else {
+    view.submit = { type: 'plain_text', text: 'Launch again' }
+    ;(view.blocks as JsonRecord[]).push(
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: 'Pick a recent launcher run to re-launch with the same shape and objective.'
+          }
+        ]
+      },
+      {
+        type: 'input',
+        block_id: RECENT_SELECT_BLOCK_ID,
+        label: { type: 'plain_text', text: 'Recent run' },
+        element: {
+          type: 'static_select',
+          action_id: RECENT_SELECT_ACTION_ID,
+          placeholder: { type: 'plain_text', text: 'Select a recent run', emoji: true },
+          options: validRecent.map(run => ({
+            text: { type: 'plain_text', text: run.text, emoji: true },
+            value: run.value
+          }))
+        }
+      }
+    )
+  }
+
+  await slackApi(input.options, 'views.open', {
+    trigger_id: input.triggerId,
+    view
+  })
+}
+
+/**
+ * Prefer api-rs list (`GET /api/workflows/runs?workflow_name=…&limit=…`).
+ * Each WorkflowRun includes `input` with `{shape, objective, slug}` from the
+ * launcher POST. Filter client-side by workflow name (server may ignore the
+ * query param). If a row lacks usable input, enrich from the local run-record
+ * store via the workflow_run_id index; skip rows that still can't launch.
+ */
+async function listRecentLauncherRuns(
+  options: SlackLauncherOptions,
+  nowMs: number
+): Promise<RecentRunOption[]> {
+  let items: unknown[] = []
+  try {
+    const query = new URLSearchParams({
+      workflow_name: LAUNCHER_WORKFLOW_NAME,
+      limit: String(RECENT_LIST_LIMIT)
+    })
+    const response = await centaurApi(options, `/api/workflows/runs?${query.toString()}`)
+    items = arrayAt(response, 'runs')
+    if (items.length === 0) items = arrayAt(response, 'items')
+  } catch (error) {
+    options.logger.warn('slack_launcher_recent_list_failed', {
+      error_code: safeErrorCode(error)
+    })
+    return []
+  }
+
+  const optionsOut: RecentRunOption[] = []
+  const seen = new Set<string>()
+  for (const item of items) {
+    if (optionsOut.length >= RECENT_OPTIONS_MAX) break
+    const run = asRecord(item)
+    const workflowName = stringAt(run, 'workflow_name')
+    if (workflowName && workflowName !== LAUNCHER_WORKFLOW_NAME) continue
+    const workflowRunId = stringAt(run, 'run_id')
+    const resolved = await resolveRecentRunLaunchParams(run, options)
+    if (!resolved) continue
+    const value = encodeRecentOptionValue(resolved)
+    if (!value || seen.has(value)) continue
+    seen.add(value)
+    optionsOut.push({
+      value,
+      text: formatRecentOptionLabel(resolved, nowMs),
+      shape: resolved.shape,
+      objective: resolved.objective,
+      slug: resolved.slug,
+      createdAt: resolved.createdAt,
+      workflowRunId: workflowRunId || undefined
+    })
+  }
+  return optionsOut
+}
+
+async function resolveRecentRunLaunchParams(
+  run: JsonRecord,
+  options: SlackLauncherOptions
+): Promise<
+  | {
+      shape: LauncherShape
+      objective: string
+      slug?: string
+      createdAt?: string
+      workflowRunId?: string
+    }
+  | undefined
+> {
+  const workflowRunId = stringAt(run, 'run_id')
+  let input = recordAt(run, 'input')
+  let shape = stringAt(input, 'shape')
+  let objective = stringAt(input, 'objective').trim()
+  let slug = stringAt(input, 'slug').trim() || undefined
+  const createdAt =
+    stringAt(run, 'created_at') || stringAt(run, 'started_at') || undefined
+
+  // Enrich from local run-record when list payload omits usable input.
+  if ((!isLauncherShape(shape) || !objective) && workflowRunId) {
+    const idempotencyKey = await options.state.get<string>(workflowIndexKey(workflowRunId))
+    if (idempotencyKey) {
+      const record = await getRunRecord(options.state, idempotencyKey)
+      if (record) {
+        if (!isLauncherShape(shape) && isLauncherShape(record.shape)) shape = record.shape
+        if (!objective && record.objective) objective = record.objective.trim()
+        if (!slug && record.launcherRunId) {
+          // launcher_run_id often encodes date+slug; keep as last-resort label only.
+        }
+      }
+    }
+  }
+
+  // Last resort: re-fetch the single run (get always carries input when present).
+  if ((!isLauncherShape(shape) || !objective) && workflowRunId) {
+    try {
+      const response = await centaurApi(
+        options,
+        `/api/workflows/runs/${encodeURIComponent(workflowRunId)}`
+      )
+      const wrapped = recordAt(response, 'run')
+      const detail = Object.keys(wrapped).length > 0 ? wrapped : response
+      input = recordAt(detail, 'input')
+      if (!isLauncherShape(shape)) shape = stringAt(input, 'shape')
+      if (!objective) objective = stringAt(input, 'objective').trim()
+      if (!slug) slug = stringAt(input, 'slug').trim() || undefined
+    } catch {
+      // Fall through to skip if still incomplete.
+    }
+  }
+
+  if (!isLauncherShape(shape) || !objective) return undefined
+  return {
+    shape,
+    objective,
+    slug,
+    createdAt,
+    workflowRunId: workflowRunId || undefined
+  }
+}
+
+/**
+ * Encode a static_select option value.
+ *
+ * Slack option `value` max is **150** chars (not the 2000-char button limit).
+ * Prefer `id:${workflowRunId}` when present: always unique within a select
+ * (duplicate shape+objective pairs would otherwise collide) and stays short.
+ * Fall back to compact JSON only when under the 150-char budget.
+ */
+function encodeRecentOptionValue(input: {
+  shape: LauncherShape
+  objective: string
+  slug?: string
+  workflowRunId?: string
+}): string | undefined {
+  const workflowRunId = input.workflowRunId?.trim()
+  if (workflowRunId) {
+    const idValue = `id:${workflowRunId}`
+    if (idValue.length > 3 && idValue.length <= RECENT_OPTION_VALUE_MAX) return idValue
+  }
+  const compact: JsonRecord = { shape: input.shape, objective: input.objective }
+  if (input.slug) compact.slug = input.slug
+  const encoded = JSON.stringify(compact)
+  if (encoded.length > 0 && encoded.length <= RECENT_OPTION_VALUE_MAX) return encoded
+  return undefined
+}
+
+/**
+ * Slack static_select option rules enforced before views.open:
+ * non-empty text ≤75, non-empty value ≤150, values unique, ≤100 options.
+ */
+export function filterValidRecentOptions(options: RecentRunOption[]): RecentRunOption[] {
+  const out: RecentRunOption[] = []
+  const seen = new Set<string>()
+  for (const option of options) {
+    if (out.length >= RECENT_OPTIONS_MAX) break
+    const text = (option.text ?? '').trim()
+    const value = (option.value ?? '').trim()
+    if (!text || text.length > RECENT_OPTION_TEXT_MAX) continue
+    if (!value || value.length > RECENT_OPTION_VALUE_MAX) continue
+    if (seen.has(value)) continue
+    seen.add(value)
+    out.push({ ...option, text, value })
+  }
+  return out
+}
+
+function formatRecentOptionLabel(
+  input: { shape: LauncherShape; objective: string; createdAt?: string },
+  nowMs: number
+): string {
+  const shapeInfo = shapeMeta(input.shape)
+  // Prefer short shape key with its emoji prefix when label is long.
+  const emoji = shapeInfo.label.split(/\s+/)[0] ?? '🧪'
+  const shapePart = `${emoji} ${input.shape}`
+  const ago = formatRelativeAgo(input.createdAt, nowMs)
+  const suffix = ago ? ` · ${ago}` : ''
+  const budget = RECENT_OPTION_TEXT_MAX - shapePart.length - suffix.length - 5 // ` · ""`
+  const snippet =
+    budget > 4
+      ? `"${truncatePlainText(input.objective.replace(/\s+/g, ' ').trim(), budget - 2)}"`
+      : ''
+  const label = snippet ? `${shapePart} · ${snippet}${suffix}` : `${shapePart}${suffix}`
+  return truncatePlainText(label, RECENT_OPTION_TEXT_MAX)
+}
+
+function formatRelativeAgo(createdAt: string | undefined, nowMs: number): string {
+  if (!createdAt) return ''
+  const start = Date.parse(createdAt)
+  if (!Number.isFinite(start)) return ''
+  const totalSeconds = Math.max(0, Math.floor((nowMs - start) / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s ago`
+  const minutes = Math.floor(totalSeconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
+async function parseRecentSubmission(
+  payload: JsonRecord,
+  teamId: string,
+  userId: string,
+  options: SlackLauncherOptions
+): Promise<
+  | { ok: true; noop: false; value: LauncherSubmission }
+  | { ok: true; noop: true; reason: string }
+  | { ok: false; reason: string; fieldErrors?: Record<string, string> }
+> {
+  const view = recordAt(payload, 'view')
+  const callbackId = stringAt(view, 'callback_id')
+  const viewId = stringAt(view, 'id')
+  if (callbackId !== RECENT_SUBMIT_CALLBACK_ID || !viewId) {
+    return { ok: false, reason: 'disallowed_callback' }
+  }
+  const metadata = parseRecentPrivateMetadata(stringAt(view, 'private_metadata'))
+  if (!metadata) return { ok: false, reason: 'invalid_private_metadata' }
+
+  const values = recordAt(recordAt(view, 'state'), 'values')
+  const selected = recordAt(recordAt(values, RECENT_SELECT_BLOCK_ID), RECENT_SELECT_ACTION_ID)
+  const selectedOption = recordAt(selected, 'selected_option')
+  const rawValue = stringAt(selectedOption, 'value')
+
+  // Empty-state modal has no select; treat submit as a no-op.
+  if (!rawValue) {
+    const hasSelectBlock = Object.keys(values).includes(RECENT_SELECT_BLOCK_ID)
+    if (!hasSelectBlock) return { ok: true, noop: true, reason: 'empty_recent_list' }
+    return {
+      ok: false,
+      reason: 'missing_selection',
+      fieldErrors: { [RECENT_SELECT_BLOCK_ID]: 'Pick a recent run to re-launch.' }
+    }
+  }
+
+  const resolved = await decodeRecentOptionValue(rawValue, options)
+  if (!resolved) {
+    return {
+      ok: false,
+      reason: 'unresolvable_selection',
+      fieldErrors: {
+        [RECENT_SELECT_BLOCK_ID]: 'Could not resolve that run. Pick another or launch fresh.'
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    noop: false,
+    value: {
+      callbackId,
+      channelId: metadata.channel_id,
+      idempotencyKey: `slack-launcher:${teamId}:${viewId}:${callbackId}`,
+      objective: resolved.objective,
+      originTs: metadata.origin_ts,
+      shape: resolved.shape,
+      slug: resolved.slug,
+      teamId: metadata.team_id,
+      userId,
+      viewId
+    }
+  }
+}
+
+async function decodeRecentOptionValue(
+  value: string,
+  options: SlackLauncherOptions
+): Promise<{ shape: LauncherShape; objective: string; slug?: string } | undefined> {
+  if (value.startsWith('id:')) {
+    const workflowRunId = value.slice(3)
+    if (!workflowRunId) return undefined
+    // Prefer local record, then API get.
+    const idempotencyKey = await options.state.get<string>(workflowIndexKey(workflowRunId))
+    if (idempotencyKey) {
+      const record = await getRunRecord(options.state, idempotencyKey)
+      if (record && isLauncherShape(record.shape) && record.objective?.trim()) {
+        return {
+          shape: record.shape,
+          objective: record.objective.trim()
+        }
+      }
+    }
+    try {
+      const response = await centaurApi(
+        options,
+        `/api/workflows/runs/${encodeURIComponent(workflowRunId)}`
+      )
+      const wrapped = recordAt(response, 'run')
+      const detail = Object.keys(wrapped).length > 0 ? wrapped : response
+      return launchParamsFromInput(recordAt(detail, 'input'))
+    } catch {
+      return undefined
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(value) as JsonRecord
+    return launchParamsFromInput(parsed)
+  } catch {
+    return undefined
+  }
+}
+
+function launchParamsFromInput(
+  input: JsonRecord
+): { shape: LauncherShape; objective: string; slug?: string } | undefined {
+  const shape = stringAt(input, 'shape')
+  const objective = stringAt(input, 'objective').trim()
+  if (!isLauncherShape(shape) || !objective) return undefined
+  const slug = stringAt(input, 'slug').trim() || undefined
+  return { shape, objective, slug }
+}
+
+function parseRecentPrivateMetadata(value: string): RecentPrivateMetadata | undefined {
+  try {
+    const metadata = JSON.parse(value) as JsonRecord
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined
+    if (Number(metadata.v) !== 1) return undefined
+    const team_id = stringAt(metadata, 'team_id')
+    const channel_id = stringAt(metadata, 'channel_id')
+    if (!team_id || !channel_id) return undefined
+    return {
+      v: 1,
+      team_id,
+      channel_id,
+      origin_ts: stringAt(metadata, 'origin_ts')
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function parseSubmission(
+  payload: JsonRecord,
+  teamId: string,
+  userId: string
+):
+  | { ok: true; value: LauncherSubmission }
+  | { ok: false; reason: string; fieldErrors?: Record<string, string> } {
+  const view = recordAt(payload, 'view')
+  const callbackId = stringAt(view, 'callback_id')
+  const viewId = stringAt(view, 'id')
+  if (callbackId !== LAUNCHER_CALLBACK_ID || !viewId) {
+    return { ok: false, reason: 'disallowed_callback' }
+  }
+  const metadata = parsePrivateMetadata(stringAt(view, 'private_metadata'))
+  if (!metadata) return { ok: false, reason: 'invalid_private_metadata' }
+  if (metadata.v !== 1 || !isLauncherShape(metadata.shape)) {
+    return { ok: false, reason: 'disallowed_shape' }
+  }
+
+  const values = recordAt(recordAt(view, 'state'), 'values')
+  const objective = stringAt(recordAt(recordAt(values, OBJECTIVE_BLOCK_ID), OBJECTIVE_ACTION_ID), 'value').trim()
+  const slug = stringAt(recordAt(recordAt(values, SLUG_BLOCK_ID), SLUG_ACTION_ID), 'value').trim()
+  const fieldErrors: Record<string, string> = {}
+  if (!objective || objective.length > 2000) {
+    fieldErrors[OBJECTIVE_BLOCK_ID] = 'Enter an objective between 1 and 2000 characters.'
+  }
+  if (slug && !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug)) {
+    fieldErrors[SLUG_BLOCK_ID] = 'Use 1–63 lowercase letters, digits, or hyphens.'
+  }
+  if (Object.keys(fieldErrors).length > 0) {
+    return { ok: false, reason: 'invalid_fields', fieldErrors }
+  }
+
+  return {
+    ok: true,
+    value: {
+      callbackId,
+      channelId: metadata.channel_id,
+      idempotencyKey: `slack-launcher:${teamId}:${viewId}:${callbackId}`,
+      objective,
+      originTs: metadata.origin_ts,
+      shape: metadata.shape,
+      slug: slug || undefined,
+      teamId: metadata.team_id,
+      userId,
+      viewId
+    }
+  }
+}
+
+async function processSubmission(
+  submission: LauncherSubmission,
+  options: SlackLauncherOptions
+): Promise<void> {
+  const claimKey = launcherClaimKey(submission.idempotencyKey)
+  const claimToken = randomUUID()
+  const acquired = await options.state.setIfNotExists(claimKey, claimToken, CLAIM_TTL_MS)
+  if (!acquired) {
+    options.logger.info('slack_launcher_duplicate_ignored', {
+      idempotency_key: submission.idempotencyKey,
+      view_id: submission.viewId
+    })
+    return
+  }
+
+  const refresh = setInterval(() => {
+    void options.state
+      .get<string>(claimKey)
+      .then(current =>
+        current === claimToken
+          ? options.state.set(claimKey, claimToken, CLAIM_TTL_MS)
+          : undefined
+      )
+      .catch(() => undefined)
+  }, CLAIM_REFRESH_MS)
+
+  let record = await getRunRecord(options.state, submission.idempotencyKey)
+  try {
+    if (
+      record?.state === 'completed' ||
+      record?.state === 'failed' ||
+      record?.state === 'cancelled'
+    ) {
+      return
+    }
+
+    if (!record?.cardTs) {
+      const nowIso = new Date((options.now ?? Date.now)()).toISOString()
+      const posted = await slackApi(options, 'chat.postMessage', {
+        channel: submission.channelId,
+        client_msg_id: deterministicUuid(`${submission.idempotencyKey}:card`),
+        ...runCardPayload({
+          channelId: submission.channelId,
+          createdAt: nowIso,
+          objective: submission.objective,
+          shape: submission.shape,
+          state: 'queued',
+          userId: submission.userId
+        })
+      })
+      const cardTs = stringAt(posted, 'ts')
+      if (!cardTs) throw new LauncherRequestError('slack_missing_card_ts', 502)
+      record = {
+        cardTs,
+        channelId: submission.channelId,
+        createdAt: nowIso,
+        idempotencyKey: submission.idempotencyKey,
+        objective: submission.objective,
+        shape: submission.shape,
+        state: 'claiming',
+        updatedAt: nowIso,
+        userId: submission.userId
+      }
+      await setRunRecord(options.state, submission.idempotencyKey, record)
+    }
+
+    if (!record.workflowRunId) {
+      const created = await centaurApi(options, '/api/workflows/runs', {
+        method: 'POST',
+        body: {
+          workflow_name: LAUNCHER_WORKFLOW_NAME,
+          idempotency_key: submission.idempotencyKey,
+          input: {
+            version: 1,
+            shape: submission.shape,
+            objective: submission.objective,
+            slug: submission.slug ?? '',
+            requested_by: `slack:${submission.userId}`,
+            source: {
+              team_id: submission.teamId,
+              channel_id: submission.channelId,
+              thread_ts: record.cardTs,
+              origin_ts: submission.originTs
+            },
+            idempotency_key: submission.idempotencyKey
+          }
+        }
+      })
+      const workflowRunId = stringAt(created, 'run_id')
+      if (!workflowRunId) throw new LauncherRequestError('api_missing_workflow_run_id', 502)
+      record.workflowRunId = workflowRunId
+      record.idempotencyKey = submission.idempotencyKey
+      record.objective = record.objective ?? submission.objective
+      record.state = 'queued'
+      record.updatedAt = new Date((options.now ?? Date.now)()).toISOString()
+      await setRunRecord(options.state, submission.idempotencyKey, record)
+      await indexWorkflowRun(options.state, workflowRunId, submission.idempotencyKey)
+      await updateRunCard(options, record)
+    }
+
+    const terminal = await pollWorkflow(options, record)
+    applyWorkflowRunToRecord(record, terminal, (options.now ?? Date.now)())
+    await updateRunCard(options, record)
+
+    if (!record.terminalReplySent) {
+      await slackApi(options, 'chat.postMessage', {
+        channel: record.channelId,
+        thread_ts: record.cardTs,
+        client_msg_id: deterministicUuid(`${submission.idempotencyKey}:terminal`),
+        text: terminalReplyText(record)
+      })
+      record.terminalReplySent = true
+    }
+    await setRunRecord(options.state, submission.idempotencyKey, record)
+    options.logger.info('slack_launcher_run_terminal', {
+      fleet_job_id: record.fleetJobId,
+      idempotency_key: submission.idempotencyKey,
+      launcher_run_id: record.launcherRunId,
+      state: record.state,
+      workflow_run_id: record.workflowRunId
+    })
+  } catch (error) {
+    if (record?.cardTs) {
+      record.state = 'failed'
+      record.updatedAt = new Date((options.now ?? Date.now)()).toISOString()
+      await updateRunCard(options, record).catch(() => undefined)
+      if (!record.terminalReplySent) {
+        await slackApi(options, 'chat.postMessage', {
+          channel: record.channelId,
+          thread_ts: record.cardTs,
+          client_msg_id: deterministicUuid(`${submission.idempotencyKey}:terminal`),
+          text: terminalReplyText(record)
+        })
+          .then(() => {
+            if (record) record.terminalReplySent = true
+          })
+          .catch(() => undefined)
+      }
+      await setRunRecord(options.state, submission.idempotencyKey, record).catch(() => undefined)
+    }
+    throw error
+  } finally {
+    clearInterval(refresh)
+    try {
+      const current = await options.state.get<string>(claimKey)
+      if (current === claimToken) await options.state.delete(claimKey)
+    } catch {
+      // TTL expiry is the crash-safe release path.
+    }
+  }
+}
+
+async function pollWorkflow(
+  options: SlackLauncherOptions,
+  record: LauncherRunRecord
+): Promise<JsonRecord> {
+  const startedAt = (options.now ?? Date.now)()
+  const maxPollMs = options.maxPollMs ?? DEFAULT_MAX_POLL_MS
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
+  let runningCardShown = record.state === 'running'
+  while ((options.now ?? Date.now)() - startedAt <= maxPollMs) {
+    const response = await centaurApi(
+      options,
+      `/api/workflows/runs/${encodeURIComponent(record.workflowRunId ?? '')}`
+    )
+    const wrappedRun = recordAt(response, 'run')
+    const run = Object.keys(wrappedRun).length > 0 ? wrappedRun : response
+    const status = stringAt(run, 'status')
+    if (TERMINAL_WORKFLOW_STATES.has(status)) return run
+    if (status === 'running' && !runningCardShown) {
+      record.state = 'running'
+      record.updatedAt = new Date((options.now ?? Date.now)()).toISOString()
+      await updateRunCard(options, record)
+      runningCardShown = true
+    }
+    await sleep(pollIntervalMs)
+  }
+  return { status: 'failed', failure: { code: 'workflow_poll_timeout' } }
+}
+
+async function updateRunCard(
+  options: SlackLauncherOptions,
+  record: LauncherRunRecord
+): Promise<void> {
+  await slackApi(options, 'chat.update', {
+    channel: record.channelId,
+    ts: record.cardTs,
+    ...runCardPayload(record, (options.now ?? Date.now)())
+  })
+}
+
+/** Slack section text max is 3000; keep objective readable on the card. */
+const CARD_OBJECTIVE_MAX = 600
+
+export function runCardPayload(
+  record: Partial<LauncherRunRecord> & { channelId: string; userId: string },
+  nowMs: number = Date.now()
+): JsonRecord {
+  const state = record.state ?? 'queued'
+  const rawShape = record.shape ?? ''
+  const shape: LauncherShape = isLauncherShape(rawShape) ? rawShape : 'experiment'
+  const shapeInfo = shapeMeta(shape)
+  const stateDisplay = cardStatusDisplay(state)
+  // Slack rejects the whole message (invalid_blocks) if ANY button has value "".
+  // Refresh/Cancel are only meaningful once a workflow run id exists; the initial
+  // pre-id card posts with at most Relaunch (shape-based, always non-empty).
+  const workflowRunId = (record.workflowRunId ?? '').trim()
+  const elements: JsonRecord[] = []
+  if (workflowRunId) {
+    elements.push({
+      type: 'button',
+      action_id: CARD_REFRESH_ACTION_ID,
+      text: { type: 'plain_text', text: '🔄 Refresh', emoji: true },
+      value: workflowRunId
+    })
+    if (isNonTerminalCardState(state)) {
+      elements.push({
+        type: 'button',
+        action_id: CARD_CANCEL_ACTION_ID,
+        text: { type: 'plain_text', text: '🛑 Cancel', emoji: true },
+        style: 'danger',
+        value: workflowRunId
+      })
+    }
+  }
+  elements.push({
+    type: 'button',
+    action_id: CARD_RELAUNCH_ACTION_ID,
+    text: { type: 'plain_text', text: '↻ Launch again', emoji: true },
+    value: relaunchValue({ objective: record.objective, shape })
+  })
+  const blocks: JsonRecord[] = [
+    {
+      type: 'header',
+      text: { type: 'plain_text', text: shapeInfo.label, emoji: true }
+    }
+  ]
+  // Self-describing card: show what the user asked for (record already carries objective).
+  const objectiveText = (record.objective ?? '').trim()
+  if (objectiveText) {
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*Objective*\n${escapeMrkdwn(truncatePlainText(objectiveText, CARD_OBJECTIVE_MAX))}`
+      }
+    })
+  }
+  blocks.push(
+    {
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*Status*\n${stateDisplay}` },
+        { type: 'mrkdwn', text: `*Shape*\n${shapeInfo.label}` },
+        { type: 'mrkdwn', text: `*Worker*\n\`${shapeInfo.worker}\`` },
+        {
+          type: 'mrkdwn',
+          text: `*Elapsed*\n${formatElapsed(record.createdAt, nowMs)}`
+        },
+        {
+          type: 'mrkdwn',
+          text: `*Workflow run*\n${slackCode(record.workflowRunId)}`
+        },
+        {
+          type: 'mrkdwn',
+          text: `*Launcher run*\n${slackCode(record.launcherRunId)}`
+        },
+        { type: 'mrkdwn', text: `*Fleet job*\n${slackCode(record.fleetJobId)}` }
+      ]
+    },
+    {
+      type: 'actions',
+      block_id: 'centaur_card_actions',
+      elements
+    },
+    {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `Requested by <@${record.userId}> · shape \`${shape}\` · one terminal reply`
+        }
+      ]
+    }
+  )
+  return {
+    text: `Centaur ${shapeInfo.title} ${state}`,
+    blocks
+  }
+}
+
+function cardStatusDisplay(state: LauncherRunState | string): string {
+  switch (state) {
+    case 'claiming':
+    case 'queued':
+      return ':large_yellow_circle: Queued'
+    case 'running':
+      return ':large_blue_circle: Running'
+    case 'cancelling':
+      return `:warning: ${CANCEL_REQUESTED_STATUS}`
+    case 'cancelled':
+      return ':no_entry_sign: Cancelled (workflow; fleet job may still have finished)'
+    case 'completed':
+      return ':white_check_mark: Completed'
+    case 'failed':
+      return ':x: Failed'
+    default:
+      return `:large_yellow_circle: ${state}`
+  }
+}
+
+function isNonTerminalCardState(state: string): boolean {
+  return !TERMINAL_CARD_STATES.has(state) && state !== 'cancelling'
+}
+
+function relaunchValue(input: { shape: LauncherShape; objective?: string }): string {
+  if (!input.objective) return input.shape
+  const encoded = JSON.stringify({ shape: input.shape, objective: input.objective })
+  // Slack button value max is 2000 characters.
+  if (encoded.length <= SLACK_BUTTON_VALUE_MAX) return encoded
+  return input.shape
+}
+
+/**
+ * Collect every interactive element `value` from a Block Kit payload (buttons,
+ * static_select options, overflow, checkboxes, radio). Used by tests and as a
+ * final audit that nothing emits Slack-rejected empty values.
+ */
+export function collectBlockActionValues(payload: JsonRecord): string[] {
+  const values: string[] = []
+  const blocks = Array.isArray(payload.blocks) ? payload.blocks : []
+  for (const block of blocks) {
+    collectElementValues(asRecord(block), values)
+  }
+  return values
+}
+
+function collectElementValues(node: JsonRecord, values: string[]): void {
+  if (typeof node.value === 'string') values.push(node.value)
+  if (Array.isArray(node.elements)) {
+    for (const el of node.elements) collectElementValues(asRecord(el), values)
+  }
+  if (Array.isArray(node.options)) {
+    for (const opt of node.options) collectElementValues(asRecord(opt), values)
+  }
+  if (node.element && typeof node.element === 'object') {
+    collectElementValues(asRecord(node.element), values)
+  }
+  if (node.accessory && typeof node.accessory === 'object') {
+    collectElementValues(asRecord(node.accessory), values)
+  }
+}
+
+function parseRelaunchValue(
+  value: string
+): { shape: LauncherShape; objective?: string } | undefined {
+  if (isLauncherShape(value)) return { shape: value }
+  try {
+    const parsed = JSON.parse(value) as JsonRecord
+    const shape = stringAt(parsed, 'shape')
+    if (!isLauncherShape(shape)) return undefined
+    const objective = stringAt(parsed, 'objective').trim()
+    return { shape, objective: objective || undefined }
+  } catch {
+    return undefined
+  }
+}
+
+function formatElapsed(createdAt: string | undefined, nowMs: number): string {
+  if (!createdAt) return '_pending_'
+  const start = Date.parse(createdAt)
+  if (!Number.isFinite(start)) return '_pending_'
+  const totalSeconds = Math.max(0, Math.floor((nowMs - start) / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes < 60) return `${minutes}m ${seconds}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+async function handleCardRefresh(
+  payload: JsonRecord,
+  channelId: string,
+  userId: string,
+  workflowRunId: string,
+  options: SlackLauncherOptions
+): Promise<void> {
+  if (!workflowRunId) throw new LauncherRequestError('missing_workflow_run_id', 400)
+  const cardTs =
+    stringAt(recordAt(payload, 'container'), 'message_ts') ||
+    stringAt(recordAt(payload, 'message'), 'ts')
+  if (!cardTs) throw new LauncherRequestError('missing_card_ts', 400)
+
+  const record = await resolveCardRecord(options, {
+    cardTs,
+    channelId,
+    shapeHint: shapeHintFromPayload(payload),
+    userId,
+    workflowRunId
+  })
+  const response = await centaurApi(
+    options,
+    `/api/workflows/runs/${encodeURIComponent(workflowRunId)}`
+  )
+  const wrappedRun = recordAt(response, 'run')
+  const run = Object.keys(wrappedRun).length > 0 ? wrappedRun : response
+  applyWorkflowRunToRecord(record, run, (options.now ?? Date.now)())
+  record.channelId = channelId
+  record.cardTs = cardTs
+  record.userId = record.userId || userId
+  if (record.idempotencyKey) {
+    await setRunRecord(options.state, record.idempotencyKey, record)
+  }
+  await updateRunCard(options, record)
+  options.logger.info('slack_launcher_card_refreshed', {
+    channel_id: channelId,
+    state: record.state,
+    workflow_run_id: workflowRunId
+  })
+}
+
+async function handleCardCancel(
+  payload: JsonRecord,
+  channelId: string,
+  userId: string,
+  workflowRunId: string,
+  options: SlackLauncherOptions
+): Promise<void> {
+  if (!workflowRunId) throw new LauncherRequestError('missing_workflow_run_id', 400)
+  const cardTs =
+    stringAt(recordAt(payload, 'container'), 'message_ts') ||
+    stringAt(recordAt(payload, 'message'), 'ts')
+  if (!cardTs) throw new LauncherRequestError('missing_card_ts', 400)
+
+  const record = await resolveCardRecord(options, {
+    cardTs,
+    channelId,
+    shapeHint: shapeHintFromPayload(payload),
+    userId,
+    workflowRunId
+  })
+  if (TERMINAL_CARD_STATES.has(record.state)) {
+    await updateRunCard(options, record)
+    return
+  }
+
+  await centaurApi(options, `/api/workflows/runs/${encodeURIComponent(workflowRunId)}/cancel`, {
+    method: 'POST'
+  })
+  record.state = 'cancelling'
+  record.updatedAt = new Date((options.now ?? Date.now)()).toISOString()
+  record.channelId = channelId
+  record.cardTs = cardTs
+  record.userId = record.userId || userId
+  if (record.idempotencyKey) {
+    await setRunRecord(options.state, record.idempotencyKey, record)
+  }
+  await updateRunCard(options, record)
+  options.logger.info('slack_launcher_card_cancel_requested', {
+    channel_id: channelId,
+    workflow_run_id: workflowRunId
+  })
+}
+
+function applyWorkflowRunToRecord(
+  record: LauncherRunRecord,
+  run: JsonRecord,
+  nowMs: number
+): void {
+  const resultEnvelope = recordAt(run, 'result')
+  const resultOutput = recordAt(resultEnvelope, 'output')
+  const result = Object.keys(resultOutput).length > 0 ? resultOutput : resultEnvelope
+  const outputShape = stringAt(result, 'shape')
+  if (isLauncherShape(outputShape)) record.shape = outputShape
+  record.launcherRunId = stringAt(result, 'launcher_run_id') || record.launcherRunId
+  record.fleetJobId = stringAt(result, 'fleet_job_id') || record.fleetJobId
+  if (!record.createdAt) {
+    const createdAt = stringAt(run, 'created_at') || stringAt(run, 'started_at')
+    if (createdAt) record.createdAt = createdAt
+  }
+  const workflowState = stringAt(run, 'status')
+  const fleetTerminalState = stringAt(result, 'terminal_state')
+  if (workflowState === 'cancelled') {
+    record.state = 'cancelled'
+  } else if (workflowState === 'completed' && fleetTerminalState !== 'failed') {
+    record.state = 'completed'
+  } else if (TERMINAL_WORKFLOW_STATES.has(workflowState) || fleetTerminalState === 'failed') {
+    record.state = 'failed'
+  } else if (workflowState === 'running') {
+    // Preserve honest "cancelling" display until the workflow reaches a terminal state.
+    if (record.state !== 'cancelling') record.state = 'running'
+  } else if (workflowState === 'queued' || workflowState === 'pending') {
+    if (record.state !== 'cancelling') record.state = 'queued'
+  }
+  record.updatedAt = new Date(nowMs).toISOString()
+}
+
+async function resolveCardRecord(
+  options: SlackLauncherOptions,
+  input: {
+    cardTs: string
+    channelId: string
+    shapeHint?: LauncherShape
+    userId: string
+    workflowRunId: string
+  }
+): Promise<LauncherRunRecord> {
+  const idempotencyKey = await options.state.get<string>(workflowIndexKey(input.workflowRunId))
+  if (idempotencyKey) {
+    const existing = await getRunRecord(options.state, idempotencyKey)
+    if (existing) {
+      existing.idempotencyKey = existing.idempotencyKey ?? idempotencyKey
+      existing.workflowRunId = existing.workflowRunId ?? input.workflowRunId
+      return existing
+    }
+  }
+  const nowIso = new Date((options.now ?? Date.now)()).toISOString()
+  return {
+    cardTs: input.cardTs,
+    channelId: input.channelId,
+    createdAt: nowIso,
+    shape: input.shapeHint ?? 'experiment',
+    state: 'running',
+    updatedAt: nowIso,
+    userId: input.userId,
+    workflowRunId: input.workflowRunId
+  }
+}
+
+function shapeHintFromPayload(payload: JsonRecord): LauncherShape | undefined {
+  const message = recordAt(payload, 'message')
+  for (const block of arrayAt(message, 'blocks')) {
+    const elements = arrayAt(asRecord(block), 'elements')
+    for (const element of elements) {
+      const el = asRecord(element)
+      if (stringAt(el, 'action_id') === CARD_RELAUNCH_ACTION_ID) {
+        return parseRelaunchValue(stringAt(el, 'value'))?.shape
+      }
+    }
+  }
+  return undefined
+}
+
+function terminalReplyText(record: LauncherRunRecord): string {
+  const icon =
+    record.state === 'completed' ? '✅' : record.state === 'cancelled' ? '🛑' : '❌'
+  const launcher = record.launcherRunId ? `\`${record.launcherRunId}\`` : '`unavailable`'
+  const fleet = record.fleetJobId ? `\`${record.fleetJobId}\`` : '`unavailable`'
+  if (record.state === 'cancelled') {
+    return `${icon} Launcher run ${launcher} cancelled (workflow). Fleet job ${fleet} may still have finished.`
+  }
+  return `${icon} Launcher run ${launcher} ${record.state}. Fleet job ${fleet}.`
+}
+
+async function slackApi(
+  options: SlackLauncherOptions,
+  method: string,
+  body: JsonRecord
+): Promise<JsonRecord> {
+  const fetcher = options.fetch ?? globalThis.fetch
+  const base = (options.slackApiUrl ?? 'https://slack.com/api').replace(/\/+$/, '')
+  const response = await fetcher(`${base}/${method}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${options.botToken}`,
+      'Content-Type': 'application/json; charset=utf-8'
+    },
+    body: JSON.stringify(body)
+  })
+  const data = await response.json().catch(() => ({}))
+  const result = asRecord(data)
+  if (!response.ok || result.ok !== true) {
+    throw new LauncherRequestError(
+      `slack_${method}_${stringAt(result, 'error') || response.status}`,
+      response.status
+    )
+  }
+  return result
+}
+
+async function centaurApi(
+  options: SlackLauncherOptions,
+  path: string,
+  request: { method?: string; body?: JsonRecord } = {}
+): Promise<JsonRecord> {
+  const fetcher = options.fetch ?? globalThis.fetch
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (options.apiKey) headers.Authorization = `Bearer ${options.apiKey}`
+  const response = await fetcher(`${options.apiUrl.replace(/\/+$/, '')}${path}`, {
+    method: request.method ?? 'GET',
+    headers,
+    body: request.body ? JSON.stringify(request.body) : undefined
+  })
+  if (!response.ok) {
+    throw new LauncherRequestError(`centaur_api_http_${response.status}`, response.status)
+  }
+  return asRecord(await response.json().catch(() => ({})))
+}
+
+function parseInteractionPayload(
+  rawBody: string
+): { ok: true; payload: JsonRecord } | { ok: false; reason: string } {
+  try {
+    const payloadText = new URLSearchParams(rawBody).get('payload')
+    if (!payloadText) return { ok: false, reason: 'missing_payload' }
+    const payload = JSON.parse(payloadText)
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return { ok: false, reason: 'payload_not_object' }
+    }
+    return { ok: true, payload: payload as JsonRecord }
+  } catch {
+    return { ok: false, reason: 'malformed_payload' }
+  }
+}
+
+function parsePrivateMetadata(value: string): LauncherPrivateMetadata | undefined {
+  try {
+    const metadata = JSON.parse(value) as JsonRecord
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined
+    const shape = stringAt(metadata, 'shape')
+    if (!isLauncherShape(shape)) return undefined
+    const team_id = stringAt(metadata, 'team_id')
+    const channel_id = stringAt(metadata, 'channel_id')
+    if (!team_id || !channel_id) return undefined
+    return {
+      v: Number(metadata.v) as 1,
+      shape,
+      team_id,
+      channel_id,
+      origin_ts: stringAt(metadata, 'origin_ts')
+    }
+  } catch {
+    return undefined
+  }
+}
+
+export function isLauncherShape(value: string): value is LauncherShape {
+  return LAUNCHER_SHAPE_KEYS.has(value)
+}
+
+/**
+ * True for the bare Phase-1 action_id or a multi-button id
+ * `${LAUNCHER_ACTION_ID}:${allowlistedShape}`. Shape payload is still read
+ * from the button `value` field.
+ */
+export function isLauncherActionId(actionId: string): boolean {
+  if (actionId === LAUNCHER_ACTION_ID) return true
+  const prefix = `${LAUNCHER_ACTION_ID}:`
+  if (!actionId.startsWith(prefix)) return false
+  const shape = actionId.slice(prefix.length)
+  return isLauncherShape(shape)
+}
+
+function shapeMeta(shape: LauncherShape): (typeof LAUNCHER_SHAPES)[number] {
+  return LAUNCHER_SHAPE_BY_KEY.get(shape) ?? LAUNCHER_SHAPES[0]
+}
+
+function truncatePlainText(value: string, max: number): string {
+  if (value.length <= max) return value
+  return value.slice(0, Math.max(max - 1, 1)).trimEnd() + '…'
+}
+
+/** Escape user text for Slack mrkdwn so it cannot inject links/mentions or break blocks. */
+function escapeMrkdwn(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function denyInteraction(
+  c: Context,
+  options: SlackLauncherOptions,
+  interactionType: string,
+  dimension: string
+): Response {
+  options.logger.warn('slack_launcher_interaction_denied', {
+    dimension,
+    interaction_type: interactionType
+  })
+  return c.text('forbidden', 403)
+}
+
+function scheduleTask(c: Context, promise: Promise<unknown>, options: SlackLauncherOptions): void {
+  if (options.schedule) {
+    options.schedule(promise)
+    return
+  }
+  try {
+    c.executionCtx.waitUntil(promise)
+  } catch {
+    void promise.catch(() => undefined)
+  }
+}
+
+function launcherClaimKey(idempotencyKey: string): string {
+  return `slackbotv2:launcher:claim:${createHash('sha256').update(idempotencyKey).digest('hex')}`
+}
+
+function launcherRecordKey(idempotencyKey: string): string {
+  return `slackbotv2:launcher:run:${createHash('sha256').update(idempotencyKey).digest('hex')}`
+}
+
+function workflowIndexKey(workflowRunId: string): string {
+  return `slackbotv2:launcher:workflow:${createHash('sha256').update(workflowRunId).digest('hex')}`
+}
+
+async function getRunRecord(
+  state: StateAdapter,
+  idempotencyKey: string
+): Promise<LauncherRunRecord | undefined> {
+  return (await state.get<LauncherRunRecord>(launcherRecordKey(idempotencyKey))) ?? undefined
+}
+
+async function setRunRecord(
+  state: StateAdapter,
+  idempotencyKey: string,
+  record: LauncherRunRecord
+): Promise<void> {
+  await state.set(launcherRecordKey(idempotencyKey), record, RECORD_TTL_MS)
+}
+
+async function indexWorkflowRun(
+  state: StateAdapter,
+  workflowRunId: string,
+  idempotencyKey: string
+): Promise<void> {
+  await state.set(workflowIndexKey(workflowRunId), idempotencyKey, RECORD_TTL_MS)
+}
+
+function deterministicUuid(value: string): string {
+  const chars = createHash('sha256').update(value).digest('hex').slice(0, 32).split('')
+  chars[12] = '5'
+  chars[16] = ['8', '9', 'a', 'b'][Number.parseInt(chars[16] ?? '0', 16) % 4] ?? '8'
+  const hex = chars.join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+function safeErrorCode(error: unknown): string {
+  if (error instanceof LauncherRequestError) return error.code
+  if (error instanceof Error && error.name) return error.name
+  return 'unknown_error'
+}
+
+function slackCode(value: string | undefined): string {
+  return value ? `\`${value}\`` : '_pending_'
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, Math.max(ms, 0)))
+}
+
+function isAllowed(value: string, allowlist: readonly string[]): boolean {
+  return Boolean(value) && allowlist.includes(value)
+}
+
+function asRecord(value: unknown): JsonRecord {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : {}
+}
+
+function recordAt(value: JsonRecord, key: string): JsonRecord {
+  return asRecord(value[key])
+}
+
+function arrayAt(value: JsonRecord, key: string): unknown[] {
+  return Array.isArray(value[key]) ? value[key] : []
+}
+
+function stringAt(value: JsonRecord, key: string): string {
+  return typeof value[key] === 'string' ? value[key] : ''
+}

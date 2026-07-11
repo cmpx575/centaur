@@ -24,6 +24,7 @@ import {
   type RendererEvent
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
+import { registerSlackLauncher } from './launcher'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import { renderSlackDisplayText, slackMessagePromptText } from './slack-display-text'
 import { slackUserIdForMessage } from './slack-user'
@@ -315,6 +316,21 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   }
   app.post('/api/webhooks/slack', handleSlackWebhook)
   app.post('/api/slack/events', handleSlackWebhook)
+  registerSlackLauncher(app, {
+    allowedChannelIds: options.launcherAllowedChannelIds ?? [],
+    allowedTeamIds: options.launcherAllowedTeamIds ?? [],
+    allowedUserIds: options.launcherAllowedUserIds ?? [],
+    apiKey: options.apiKey,
+    apiUrl: options.apiUrl,
+    botToken: options.botToken,
+    fetch: options.fetch,
+    logger,
+    maxPollMs: options.launcherMaxPollMs,
+    pollIntervalMs: options.launcherPollIntervalMs,
+    signingSecret: options.signingSecret,
+    slackApiUrl: options.slackApiUrl,
+    state
+  })
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options)

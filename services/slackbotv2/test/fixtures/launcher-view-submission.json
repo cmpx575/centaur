@@ -1,0 +1,28 @@
+{
+  "type": "view_submission",
+  "team": { "id": "T_ALLOWED", "domain": "cmpx575-test" },
+  "user": { "id": "U_ALLOWED", "username": "noor" },
+  "api_app_id": "A0BE6AFS4RM",
+  "view": {
+    "id": "V_LAUNCH_001",
+    "type": "modal",
+    "callback_id": "centaur.launcher.submit.v1",
+    "private_metadata": "{\"v\":1,\"shape\":\"experiment\",\"team_id\":\"T_ALLOWED\",\"channel_id\":\"C_ALLOWED\",\"origin_ts\":\"1783700000.000100\"}",
+    "state": {
+      "values": {
+        "objective_block": {
+          "objective_input": {
+            "type": "plain_text_input",
+            "value": "Prove the signed Centaur Slack launcher end to end."
+          }
+        },
+        "slug_block": {
+          "slug_input": {
+            "type": "plain_text_input",
+            "value": "slack-launcher-proof"
+          }
+        }
+      }
+    }
+  }
+}
