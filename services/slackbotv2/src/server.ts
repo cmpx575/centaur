@@ -26,6 +26,8 @@ const consoleLogger = {
 
 const options: SlackbotV2Options = {
   apiUrl,
+  fabricIntakeUrl: optionalEnv('FABRIC_INTAKE_URL'),
+  fabricTokenPath: optionalEnv('FABRIC_TOKEN_PATH'),
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),

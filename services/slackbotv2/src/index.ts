@@ -24,6 +24,7 @@ import {
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
 import { registerSlackLauncher } from './launcher'
+import { handleFabricWebhook } from './fabric'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import { renderSlackDisplayText, slackMessagePromptText } from './slack-display-text'
 import { slackUserIdForMessage } from './slack-user'
@@ -235,6 +236,8 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     const webhookStartedAtMs = nowMs()
     const route = c.req.path
     const rawBody = await c.req.raw.clone().text()
+    const fabricResponse = await handleFabricWebhook(c.req.raw, rawBody, options, promise => waitUntil(c, promise))
+    if (fabricResponse) return fabricResponse
     const eventType = slackWebhookEventType(rawBody)
     let outcome = 'success'
     try {

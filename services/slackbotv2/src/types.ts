@@ -94,6 +94,8 @@ export type SlackbotV2ExecuteSessionResponse = {
 export type SlackbotV2Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 export type SlackbotV2Options = {
+  fabricIntakeUrl?: string
+  fabricTokenPath?: string
   allowedExternalTeamIds?: readonly string[]
   apiKey?: string
   apiUrl: string
