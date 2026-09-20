@@ -877,6 +877,11 @@ ingress:
 httpRoutes: []
 
 networkPolicy:
+  # Explicit deployment exceptions for provider routes that bypass iron-proxy.
+  # Empty by default. Use exact destinations and ports; do not allow all egress.
+  sandboxExtraEgress:
+    podSelector: {}
+    rules: []
   enabled: true
   ingressSourceNamespaces: []
   apiIngressSourceNamespaces: []
