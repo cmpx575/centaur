@@ -14,6 +14,7 @@ async function fixture(work: (send: (payload:any, signed?:boolean)=>Promise<Resp
     const path=new URL(String(url)).pathname,body=init.body?JSON.parse(init.body):undefined;calls.push({path,body})
     if(path==='/v1/runs' && init.method==='GET')return Response.json({runs:[]})
     if(path==='/v1/recipes')return Response.json({recipes:[recipe]})
+    if(path==='/v1/work-items')return Response.json({projects:[{name:'Research',items:[{name:'Review prior work',identifier:'RES-1',url:'https://plane.example.test/work'}]}],stale:false})
     if(path==='/v1/runs' && init.method==='POST')return failure?Response.json({error:failure},{status:failure==='TEMPORARY'?503:409}):Response.json({created:true},{status:202})
     if(path==='/api/chat.postMessage')return Response.json({ok:true,ts:'2'})
     if(path==='/api/views.open')return Response.json({ok:true})
@@ -76,4 +77,26 @@ test('connector attribution is handled for recent runs, menus and named recipes'
   expect(calls.filter(c=>c.path.endsWith('chat.postMessage')).at(-1).body.blocks).toBeDefined()
   await send(event('fabric run review focused https://plane.example.test/work *Sent using* <@UCHATGPT>'))
   expect(calls.filter(c=>c.path==='/v1/runs' && c.body)).toHaveLength(1)
+}))
+
+test('choosing a work item submits the same typed intake and ambiguous input stays in the form',async()=>fixture(async(send,calls)=>{
+  await send(opening)
+  const view=calls.find(c=>c.path.endsWith('views.open')).body.view
+  expect(view.blocks.find((b:any)=>b.block_id==='work').element.option_groups[0].label.text).toBe('Research')
+  const selected=submission(view)
+  selected.view.state.values.plane.url.value=''
+  ;(selected.view.state.values as any).work={item:{selected_option:{value:'https://plane.example.test/work'}}}
+  await send(selected)
+  expect(calls.find(c=>c.path==='/v1/runs' && c.body).body.planeUrl).toBe('https://plane.example.test/work')
+  selected.view.state.values.plane.url.value='https://plane.example.test/different'
+  expect(await (await send(selected))!.json()).toMatchObject({response_action:'errors'})
+  expect(calls.filter(c=>c.path==='/v1/runs' && c.body)).toHaveLength(1)
+}))
+
+test('navigation is read only and actor gates also protect buttons',async()=>fixture(async(send,calls)=>{
+  const recent={...opening,actions:[{action_id:'fabric_recipe_recent'}]}
+  await send(recent)
+  expect(calls.find(c=>c.path.endsWith('chat.postMessage')).body.blocks).toBeDefined()
+  expect((await send({...recent,user:{id:'OTHER'}}))?.status).toBe(403)
+  expect(calls.filter(c=>c.path==='/v1/runs' && c.body)).toHaveLength(0)
 }))

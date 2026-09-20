@@ -8,7 +8,8 @@ import { verifySlackRequest } from './launcher'
 import type { SlackbotV2Options } from './types'
 import { handleRecipeWebhook } from './fabric-recipes'
 
-type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string; planeUrl?: string;
+export type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string; planeUrl?: string;
+  view?: { title: string; status: string; nextAction: string; closure: string; checked: boolean; closed: boolean };
   recipe?: { title: string; version: string; profileTitle: string; planDigest: string; roles: string[] };
   context?: { sources: Array<{name: string}>; packetDigest: string; coverage: string };
   result?: { report?: string; error?: string; checker?: { reason?: string }; terminal?: {
@@ -110,6 +111,45 @@ export function formatRun(run: Run): string {
   return lines.join('\n')
 }
 
+export const slackText = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+const plain = (text: string) => ({ type: 'plain_text', text })
+const section = (text: string) => ({ type: 'section', text: { type: 'mrkdwn', text } })
+
+export function runSummary(run: Run): string {
+  if (!run.view) return formatRun(run)
+  return `*${slackText(run.view.title)}* · *${run.view.status}*\n${run.view.nextAction}\n${run.view.closure}`
+}
+
+export function runActions(run: Run) {
+  return { type: 'actions', elements: [
+    { type: 'button', action_id: 'fabric_recipe_details', text: plain('View run'), value: run.requestId },
+    ...(run.planeUrl ? [{ type: 'button', action_id: 'fabric_recipe_plane', text: plain('Open in Plane'), url: run.planeUrl }] : [])
+  ] }
+}
+
+export function recentRuns(runs: Run[]) {
+  const text = runs.length ? runs.map(r => `${r.view?.title ?? r.recipe?.title ?? 'Evidence review'}: ${r.view?.status ?? r.state}`).join('\n')
+    : 'No fabric runs in this channel yet. Choose a recipe to start.'
+  return { text, blocks: [section('*Recent work*'),
+    ...(runs.length ? runs.flatMap(r => [section(runSummary(r)), runActions(r)]) : [section(text)]),
+    { type: 'actions', elements: [
+      { type: 'button', action_id: 'fabric_recipe_menu', text: plain('Start work') },
+      { type: 'button', action_id: 'fabric_recipe_recent', text: plain('Refresh runs') }
+    ] }
+  ] }
+}
+
+export function runView(run: Run) {
+  const report = run.result?.report
+  const blocks = [section(runSummary(run)), section(slackText(formatRun(run)).slice(0, 2900))]
+  if (report) {
+    blocks.push(section(run.view?.checked && run.view?.closed ? '*Checked result*' : '*Worker draft — review the verification above*'))
+    for (let i = 0; i < Math.min(report.length, 24000); i += 2400) blocks.push(section(slackText(report.slice(i, i + 2400)).slice(0, 2900)))
+  }
+  if (run.planeUrl) blocks.push(section(`<${run.planeUrl}|Open the full work item in Plane>`))
+  return { type: 'modal', title: plain('Run details'), close: plain('Close'), blocks }
+}
+
 /** A single consumer uses the existing bot credential; no token is copied to
  * the fabric or workers. Pending obligations live in the fabric ledger.
  * The send/ack gap can repeat a message; it never launches another worker.
@@ -121,11 +161,15 @@ export async function drainFabricDeliveries(options: SlackbotV2Options): Promise
     const run = delivery.run
     if (!options.launcherAllowedChannelIds?.includes(run.channelId)) throw new Error('fabric_delivery_outside_allowlist')
     const report = run.result?.report
-    const text = formatRun(run) + (report ? `\n\n${run.state === 'COMPLETED' ? 'Checked result' : 'Unaccepted worker draft'}:\n${report.slice(0, 26000)}` : '')
+    const text = runSummary(run) + (report ? `\n\n${run.state === 'COMPLETED' ? 'Checked result' : 'Unaccepted worker draft'}:\n${slackText(report.slice(0, 600))}` : '')
+    const blocks = [section(runSummary(run)),
+      ...(run.recipe ? [section(`*${slackText(run.recipe.title)}* · ${slackText(run.recipe.profileTitle)}\n${run.recipe.roles.map(slackText).join(' → ')}`)] : []),
+      ...(run.result?.checker?.reason ? [section('*Checker:* ' + slackText(run.result.checker.reason).slice(0, 1700))] : []),
+      ...(report ? [section(`*${run.state === 'COMPLETED' ? 'Result preview' : 'Unaccepted draft preview'}*\n${slackText(report.slice(0, 600))}`)] : []), runActions(run)]
     const hash = createHash('sha256').update(delivery.id).digest('hex')
     const clientMessageId = `${hash.slice(0,8)}-${hash.slice(8,12)}-4${hash.slice(13,16)}-a${hash.slice(17,20)}-${hash.slice(20,32)}`
     const sent = await slack(options, 'chat.postMessage', { channel: run.channelId, thread_ts: run.threadTs,
-      text, client_msg_id: clientMessageId, unfurl_links: false, unfurl_media: false })
+      text, blocks, client_msg_id: clientMessageId, unfurl_links: false, unfurl_media: false })
     if (!sent.ts) throw new Error('fabric_delivery_unverified')
     const ack = await intake(options, '/v1/deliveries/ack', { id: delivery.id, receipt: sent.ts })
     if (!ack.ok) throw new Error('fabric_delivery_ack_pending')

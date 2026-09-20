@@ -1,7 +1,7 @@
 /** Recipe choices are read from the fabric; this file owns only Slack UX. */
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { verifySlackRequest } from './launcher'
-import { intake, slack, formatRun, fabricMessageText } from './fabric'
+import { intake, slack, formatRun, fabricMessageText, recentRuns, runView, slackText, type Run } from './fabric'
 import type { SlackbotV2Options } from './types'
 
 export type Recipe = { id: string; version: string; digest: string; title: string; description: string;
@@ -11,28 +11,39 @@ type Origin = { teamId: string; channelId: string; userId: string; threadTs: str
 const plain = (text: string) => ({ type: 'plain_text', text })
 const section = (text: string) => ({ type: 'section', text: { type: 'mrkdwn', text } })
 const prefix = 'fabric_recipe_'
+type WorkMenu = { stale?: boolean; projects: Array<{ name: string; limited?: boolean;
+  items: Array<{ name: string; identifier: string; url: string }> }> }
+type Availability = { remaining: number; open: boolean; admitUntil: number }
 
-export function recipeMenu(recipes: Recipe[]) {
+export function recipeMenu(recipes: Recipe[], availability?: Availability) {
   return { text: 'Choose a recipe for this work. Each recipe includes its team, context and checks.', blocks: [
-    section('*Run work with a recipe*\nChoose a process, link the Plane item, and use its configured team.'),
-    ...recipes.flatMap(r => [section(`*${r.title}*\n${r.description}\n${r.roles.join(' → ')}`),
+    section('*Start work*\nChoose a recipe, pick the work item, and review how the team will run it.'),
+    ...(availability ? [section(availability.open ? `${availability.remaining} runs available in this batch.` : 'This batch cannot start another run. An operator needs to renew its capacity or admission window.')] : []),
+    ...recipes.flatMap(r => [section(`*${slackText(r.title)}*\n${slackText(r.description)}\n${r.roles.map(slackText).join(' → ')}`),
       { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'open', text: plain('Choose how to run'), value: r.id }] }]),
+    { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'recent', text: plain('Recent work') }] },
     section('You can also mention `fabric run review focused <Plane-item-link>` or `fabric runs` to return to recent work.')
   ] }
 }
 
-export function recipeView(recipe: Recipe, metadata: string) {
+export function recipeView(recipe: Recipe, metadata: string, work?: WorkMenu) {
   const options = Object.entries(recipe.profiles).map(([value, p]) => ({ text: plain(p.title), value, description: plain(p.description.slice(0,75)) }))
-  return { type: 'modal', callback_id: prefix + 'submit', title: plain('Run a recipe'), submit: plain('Run'), close: plain('Back'),
+  const groups = work?.projects.filter(p => p.items.length).slice(0, 10).map(p => ({ label: plain(p.name.slice(0,75)),
+    options: p.items.slice(0,30).map(i => ({ text: plain(`${i.identifier} · ${i.name}`.slice(0,75)), value: i.url })) })) ?? []
+  return { type: 'modal', callback_id: prefix + 'submit', title: plain('Start work'), submit: plain('Start'), close: plain('Back'),
     private_metadata: metadata, blocks: [section(`*${recipe.title}* · ${recipe.version}\n${recipe.description}\n*Team:* ${recipe.roles.join(' → ')}`),
-      { type: 'input', block_id: 'plane', label: plain('Plane work item'),
-        hint: plain('Use an item from an enabled project. Its objective will guide selection of prior work.'),
+      ...(groups.length ? [{ type: 'input', block_id: 'work', optional: true, label: plain('Project and work item'),
+        hint: plain('Recent items from enabled projects. The latest objective is read when the work starts.'),
+        element: { type: 'static_select', action_id: 'item', placeholder: plain('Choose work from Plane'), option_groups: groups } }] : []),
+      ...(work?.stale ? [section('The item list could not be refreshed. You can paste the current Plane link below.')] : []),
+      { type: 'input', block_id: 'plane', optional: groups.length > 0, label: plain(groups.length ? 'Or paste a Plane work-item link' : 'Plane work item'),
+        hint: plain('Choose one item above or paste one link. Only enabled projects can run.'),
         element: { type: 'plain_text_input', action_id: 'url', max_length: 500 } },
       { type: 'input', block_id: 'profile', label: plain('How to run'),
         element: { type: 'static_select', action_id: 'choice', options,
           initial_option: options.find(o => o.value === recipe.defaultProfile) } },
       ...Object.values(recipe.profiles).map(p => section(`*${p.title}:* ${p.description}`)),
-      section('The selected sources and team will appear in this thread and the Plane item. Changing mode does not change access.')
+      section('Starting creates one run. Hermes coordinates a separate worker and checker. The outcome returns to this thread and the Plane item; temporary access and resources close afterward.')
     ] }
 }
 
@@ -63,8 +74,9 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const mention = payload.type === 'event_callback' && event?.type === 'app_mention' && !event.bot_id && !event.subtype
     && /^fabric\s+(recipes|run|runs)(?:\s|$)/i.test(text)
   const opening = payload.type === 'block_actions' && action?.action_id === prefix + 'open'
+  const navigation = payload.type === 'block_actions' && [prefix+'recent', prefix+'menu', prefix+'details', prefix+'plane'].includes(action?.action_id)
   const submission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'submit'
-  if (!mention && !opening && !submission) return
+  if (!mention && !opening && !submission && !navigation) return
   const signed = verifySlackRequest({ nowMs: Date.now(), rawBody: raw, signingSecret: options.signingSecret,
     signature: request.headers.get('x-slack-signature') ?? undefined, timestamp: request.headers.get('x-slack-request-timestamp') ?? undefined })
   if (!signed.ok) return new Response('invalid request', { status: 401 })
@@ -82,21 +94,29 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const query = new URLSearchParams({ teamId: origin.teamId, channelId: origin.channelId, userId: origin.userId })
   const reply = (body: Record<string, unknown>) => slack(options, 'chat.postMessage', { ...body,
     channel: origin.channelId, thread_ts: origin.threadTs, unfurl_links: false, unfurl_media: false })
-  if (mention && /^fabric\s+runs\s*$/i.test(text)) {
+  if (navigation && action.action_id === prefix+'plane') return new Response('ok')
+  if ((mention && /^fabric\s+runs\s*$/i.test(text)) || (navigation && [prefix+'recent',prefix+'details'].includes(action.action_id))) {
     const result = await intake(options, '/v1/runs?' + query)
     if (!result.ok) return new Response('retry', { status: result.status >= 500 ? 503 : 403 })
-    waitUntil(reply({ text: result.value.runs.length ? result.value.runs.map(formatRun).join('\n\n') : 'No fabric runs in this channel yet. Use `fabric recipes` to start.' }))
+    if (action?.action_id === prefix+'details') {
+      const run = (result.value.runs as Run[]).find(r => r.requestId === action.value)
+      if (!run) { waitUntil(reply({text:'This run is outside the recent list. Open its Plane item for the retained result.'})); return new Response('ok') }
+      await slack(options, 'views.open', {trigger_id:payload.trigger_id, view:runView(run)})
+    } else waitUntil(reply(recentRuns(result.value.runs)))
     return new Response('ok')
   }
   if (submission) {
     const values = payload.view.state?.values ?? {}
     const profile = values.profile?.choice?.selected_option?.value ?? ''
-    const planeUrl = (values.plane?.url?.value ?? '').trim()
+    const pasted = (values.plane?.url?.value ?? '').trim()
+    const selected = values.work?.item?.selected_option?.value ?? ''
+    if ((!pasted && !selected) || (pasted && selected)) return Response.json({ response_action:'errors', errors:{plane:'Choose one item or paste one link, then start.'} })
+    const planeUrl = pasted || selected
     const result = await intake(options, '/v1/runs', recipeRequest(saved.recipe, profile, planeUrl, origin, payload.view.id))
     if (!result.ok) {
       if (result.status >= 500) return new Response('retry', { status: 503 })
       const key = /PROFILE|RECIPE/.test(result.value.error ?? '') ? 'profile' : 'plane'
-      return Response.json({ response_action: 'errors', errors: { [key]: `Could not start: ${result.value.error ?? 'unavailable'}.` } })
+      return Response.json({ response_action: 'errors', errors: { [key]: refusalText(result.value.error) } })
     }
     return Response.json({ response_action: 'clear' })
   }
@@ -106,12 +126,13 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   if (opening) {
     const recipe = recipes.find(r => r.id === action.value)
     if (!recipe) return new Response('unknown recipe', { status: 409 })
+    const work = await intake(options, '/v1/work-items?' + query)
     await slack(options, 'views.open', { trigger_id: payload.trigger_id,
-      view: recipeView(recipe, seal({ origin, recipe: { id: recipe.id, version: recipe.version, digest: recipe.digest, taskType: recipe.taskType } }, options.signingSecret)) })
+      view: recipeView(recipe, seal({ origin, recipe: { id: recipe.id, version: recipe.version, digest: recipe.digest, taskType: recipe.taskType } }, options.signingSecret), work.ok ? work.value as WorkMenu : undefined) })
     return new Response('ok')
   }
-  if (/^fabric\s+recipes\s*$/i.test(text)) {
-    waitUntil(reply(recipeMenu(recipes)))
+  if (/^fabric\s+recipes\s*$/i.test(text) || (navigation && action.action_id === prefix+'menu')) {
+    waitUntil(reply(recipeMenu(recipes, result.value.availability)))
     return new Response('ok')
   }
   const match = /^fabric\s+run\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?\s*$/i.exec(text)
@@ -123,7 +144,21 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const submitted = await intake(options, '/v1/runs', recipeRequest(recipe, match[2]?.toLowerCase() ?? recipe.defaultProfile, match[3]!, origin, payload.event_id ?? event.ts))
   if (!submitted.ok) {
     if (submitted.status >= 500) return new Response('retry', { status: 503 })
-    waitUntil(reply({ text: `Could not start: ${submitted.value.error ?? 'unavailable'}.` }))
+    waitUntil(reply({ text: refusalText(submitted.value.error) }))
   } else if (!submitted.value.created) waitUntil(reply({ text: formatRun(submitted.value as any) }))
   return new Response('ok')
+}
+
+export function refusalText(error: unknown) {
+  const code = String(error ?? 'unavailable')
+  const reasons: Record<string,string> = {
+    WAITING_CAPACITY:'This batch has no runs left. An operator needs to add a fresh batch.',
+    ADMISSION_EXPIRED:'This batch has expired. An operator needs to renew it before work can start.',
+    RECIPE_CHANGED_REFRESH_MENU:'This recipe changed. Close this form and open the menu again.',
+    PLANE_PROJECT_OUTSIDE_ALLOWLIST:'This project is not enabled. Choose an item from an enabled project.',
+    INVALID_PLANE_URL:'Paste a work-item link from the connected Plane workspace.',
+    INVALID_PLANE_ITEM_PATH:'Paste a link to a specific Plane work item.',
+    UNSUPPORTED_PROFILE:'Choose one of the recipe modes shown in this form.'
+  }
+  return (reasons[code] ?? 'The request could not start. Check the selected work and recipe.') + ` (${code})`
 }
