@@ -644,6 +644,13 @@ apiRs:
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
 # (:8080) and streams responses back. Listens on :3001.
 slackbotv2:
+  # Optional typed execution-fabric transport. Results use a durable outbox.
+  fabric:
+    enabled: false
+    intakeUrl: ""
+    serviceAccountName: fabric-slack-frontdoor
+    namespace: execution-fabric
+    port: 8080
   # Optional compatibility auth for the separately allowlisted custom launcher.
   # Uses a 60-second workflow-read/write JWT, never the normal ingress key.
   launcherWorkflowAuthEnabled: false

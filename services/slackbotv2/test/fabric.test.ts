@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createHmac } from 'node:crypto'
-import { fabricCommand, formatRun, handleFabricWebhook } from '../src/fabric'
+import { fabricCommand, formatRun, handleFabricWebhook, drainFabricDeliveries } from '../src/fabric'
 
 describe('typed fabric transport', () => {
   const payload = { type: 'event_callback', team_id: 'T1', event: { type: 'app_mention', user: 'U1', channel: 'C1', ts: '1789846137.000001', text: '<@UBOT> fabric review first' } }
@@ -39,4 +39,28 @@ describe('typed fabric transport', () => {
     expect(text).toContain('— FAILED')
     expect(text).toContain('Access closed: false')
   })
+})
+
+
+test('Plane links are preserved without allowing footer instructions', () => {
+  const raw = JSON.stringify({type:'event_callback', event:{type:'app_mention',text:'<@UBOT> fabric review next <https://plane.example.test/w/projects/p/issues/i/|work item>\nhttps://evil.test/'}})
+  expect(fabricCommand(raw)?.planeUrl).toBe('https://plane.example.test/w/projects/p/issues/i/')
+})
+
+test('a fresh consumer drains retained output and acknowledges only after Slack accepts it', async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const dir = mkdtempSync(tmpdir() + '/fabric-outbox-')
+  writeFileSync(dir + '/token', 'test-identity')
+  let sent = false, acknowledged = false
+  const delivery = {id:'run:result:slack',run:{requestId:'request',runId:'run',state:'COMPLETED',channelId:'C1',threadTs:'1',result:{report:'Useful checked answer'}}}
+  const options = { apiUrl:'',botToken:'test',signingSecret:'test',fabricIntakeUrl:'http://intake',fabricTokenPath:dir+'/token',launcherAllowedChannelIds:['C1'],
+    fetch: (async (url: any, init: any) => {
+      if (String(url).endsWith('/v1/deliveries')) return Response.json({deliveries:[delivery]})
+      if (String(url).endsWith('/chat.postMessage')) {sent=true;expect(JSON.parse(init.body).text).toContain('Useful checked answer');return Response.json({ok:true,ts:'2'})}
+      if (String(url).endsWith('/v1/deliveries/ack')) {expect(sent).toBe(true);acknowledged=true;return Response.json({ok:true})}
+      throw new Error('unexpected request')
+    }) as typeof fetch }
+  try { await drainFabricDeliveries(options);expect(acknowledged).toBe(true) }
+  finally {rmSync(dir,{recursive:true,force:true})}
 })

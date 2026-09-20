@@ -2,15 +2,16 @@
  * Reuses the live-proven launcher signature verifier and allowlists. No model
  * sits between a confirmed supported command and the durable intake commit.
  */
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { verifySlackRequest } from './launcher'
 import type { SlackbotV2Options } from './types'
 
-type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string;
+type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string; planeUrl?: string;
   result?: { report?: string; error?: string; checker?: { reason?: string }; terminal?: {
     artifactVerified?: boolean; authorityClosed?: boolean; disposalVerified?: boolean; taskOutcome?: string } } }
 
-export function fabricCommand(raw: string): { payload: Record<string, any>; command: string; requestId?: string } | undefined {
+export function fabricCommand(raw: string): { payload: Record<string, any>; command: string; requestId?: string; planeUrl?: string } | undefined {
   let payload: Record<string, any>
   try { payload = JSON.parse(raw) } catch { return }
   const event = payload.event
@@ -20,7 +21,8 @@ export function fabricCommand(raw: string): { payload: Record<string, any>; comm
   const text = String(event.text ?? '').replace(/[\u200B-\u200D\u2060\u2063\uFEFF]/g, '').trim().split('\n')[0]!.replace(/^<@[A-Z0-9]+(?:\|[^>]+)?>\s*/, '').trim()
   if (!/^fabric(?:\s|$)/i.test(text)) return
   const m = /^fabric\s+(review|status)\s+([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})(?![a-zA-Z0-9._-])/i.exec(text)
-  return { payload, command: m?.[1]?.toLowerCase() ?? 'unsupported', requestId: m?.[2] }
+  const link = text.match(/(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?/)
+  return { payload, command: m?.[1]?.toLowerCase() ?? 'unsupported', requestId: m?.[2], planeUrl: link?.[1] }
 }
 
 export async function handleFabricWebhook(request: Request, raw: string, options: SlackbotV2Options,
@@ -32,7 +34,7 @@ export async function handleFabricWebhook(request: Request, raw: string, options
     signature: request.headers.get('x-slack-signature') ?? undefined,
     timestamp: request.headers.get('x-slack-request-timestamp') ?? undefined })
   if (!signed.ok) return new Response('invalid request', { status: 401 })
-  const { payload, command, requestId } = parsed
+  const { payload, command, requestId, planeUrl } = parsed
   const event = payload.event
   if (!options.launcherAllowedTeamIds?.includes(payload.team_id) ||
       !options.launcherAllowedChannelIds?.includes(event.channel) ||
@@ -41,13 +43,13 @@ export async function handleFabricWebhook(request: Request, raw: string, options
   const reply = (text: string, ts = threadTs) => slack(options, 'chat.postMessage', {
     channel: event.channel, thread_ts: ts, text, unfurl_links: false, unfurl_media: false })
   if (command === 'unsupported') {
-    waitUntil(reply('Supported: `@centaur fabric review <request-id>` or `@centaur fabric status <request-id>`. This pilot only reviews the retained fabric evidence.'))
+    waitUntil(reply('Supported: `@centaur fabric review <request-id> <Plane-work-item-link>` or `@centaur fabric status <request-id>`. This service reviews retained fabric evidence against the linked objective.'))
     return new Response('ok')
   }
   const path = command === 'review' ? '/v1/runs' : `/v1/run?teamId=${encodeURIComponent(payload.team_id)}&requestId=${encodeURIComponent(requestId!)}`
   const result = await intake(options, path, command === 'review' ? {
     requestId, taskType: 'retained-evidence-review', teamId: payload.team_id,
-    channelId: event.channel, threadTs, userId: event.user } : undefined)
+    channelId: event.channel, threadTs, userId: event.user, ...(planeUrl ? { planeUrl } : {}) } : undefined)
   if (!result.ok) {
     // Do not acknowledge transient failures: Slack can retry the same event.
     if (result.status >= 500) return new Response('retry', { status: 503 })
@@ -57,11 +59,9 @@ export async function handleFabricWebhook(request: Request, raw: string, options
   const run = result.value as Run & { created?: boolean }
   if (command === 'status' || !run.created) {
     waitUntil(reply(formatRun(run)))
-  } else {
-    waitUntil(followRun(options, run, payload.team_id).catch(() => {
-      options.logger?.warn('fabric_result_delivery_pending', { run_id: run.runId })
-    }))
   }
+  // New requests are rendered by the durable outbox consumer. The webhook
+  // acknowledgement cannot strand result delivery on process restart.
   return new Response('ok')
 }
 
@@ -84,6 +84,7 @@ async function slack(options: SlackbotV2Options, method: string, body: unknown) 
 
 export function formatRun(run: Run): string {
   const lines = [`*Hermes fabric review — ${run.state}*`, `Request: \`${run.requestId}\` · Run: \`${run.runId}\``]
+  if (run.planeUrl) lines.push(`Plane: ${run.planeUrl}`)
   if (run.result?.terminal) {
     const t = run.result.terminal
     lines.push(`Task: ${t.taskOutcome}. Checked artifact: ${t.artifactVerified === true}. Access closed: ${t.authorityClosed === true}. Resources disposed: ${t.disposalVerified === true}.`)
@@ -93,31 +94,37 @@ export function formatRun(run: Run): string {
   return lines.join('\n')
 }
 
-async function followRun(options: SlackbotV2Options, initial: Run, teamId: string) {
-  const card = await slack(options, 'chat.postMessage', { channel: initial.channelId, thread_ts: initial.threadTs,
-    text: formatRun(initial), unfurl_links: false, unfurl_media: false })
-  const until = Date.now() + 930000
-  let last = initial.state
-  while (Date.now() < until) {
-    await new Promise(resolve => setTimeout(resolve, 5000))
-    let result
-    try { result = await intake(options, `/v1/run?teamId=${encodeURIComponent(teamId)}&requestId=${encodeURIComponent(initial.requestId)}`) }
-    catch { continue }
-    if (!result.ok) continue
-    const run = result.value as Run
-    const terminal = ['COMPLETED', 'FAILED', 'UNKNOWN'].includes(run.state)
-    if (run.state !== last || terminal) {
-      await slack(options, 'chat.update', { channel: initial.channelId, ts: card.ts, text: formatRun(run) })
-      last = run.state
-    }
-    if (terminal) {
-      const report = run.result?.report
-      if (report) await slack(options, 'chat.postMessage', { channel: initial.channelId, thread_ts: initial.threadTs,
-        text: `${run.state === 'COMPLETED' ? 'Checked result' : 'Retained worker draft; acceptance failed'} for \`${run.runId}\`:\n${report.slice(0, 26000)}`,
-        unfurl_links: false, unfurl_media: false })
-      return
-    }
+/** A single consumer uses the existing bot credential; no token is copied to
+ * the fabric or workers. Pending obligations live in the fabric ledger.
+ * The send/ack gap can repeat a message; it never launches another worker.
+ */
+export async function drainFabricDeliveries(options: SlackbotV2Options): Promise<void> {
+  const pending = await intake(options, '/v1/deliveries')
+  if (!pending.ok) throw new Error('fabric_outbox_unavailable')
+  for (const delivery of pending.value.deliveries as Array<{ id: string; run: Run }>) {
+    const run = delivery.run
+    if (!options.launcherAllowedChannelIds?.includes(run.channelId)) throw new Error('fabric_delivery_outside_allowlist')
+    const report = run.result?.report
+    const text = formatRun(run) + (report ? `\n\n${run.state === 'COMPLETED' ? 'Checked result' : 'Unaccepted worker draft'}:\n${report.slice(0, 26000)}` : '')
+    const hash = createHash('sha256').update(delivery.id).digest('hex')
+    const clientMessageId = `${hash.slice(0,8)}-${hash.slice(8,12)}-4${hash.slice(13,16)}-a${hash.slice(17,20)}-${hash.slice(20,32)}`
+    const sent = await slack(options, 'chat.postMessage', { channel: run.channelId, thread_ts: run.threadTs,
+      text, client_msg_id: clientMessageId, unfurl_links: false, unfurl_media: false })
+    if (!sent.ts) throw new Error('fabric_delivery_unverified')
+    const ack = await intake(options, '/v1/deliveries/ack', { id: delivery.id, receipt: sent.ts })
+    if (!ack.ok) throw new Error('fabric_delivery_ack_pending')
   }
-  await slack(options, 'chat.update', { channel: initial.channelId, ts: card.ts,
-    text: `Result delivery needs a status check. Run \`${initial.runId}\` is retained. Use \`@centaur fabric status ${initial.requestId}\`.` })
+}
+
+export function startFabricDelivery(options: SlackbotV2Options): () => void {
+  if (!options.fabricIntakeUrl) return () => {}
+  let stopped = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const tick = async () => {
+    try { await drainFabricDeliveries(options) }
+    catch { options.logger?.warn('fabric_result_delivery_pending') }
+    if (!stopped) { timer = setTimeout(tick, 5000); timer.unref?.() }
+  }
+  void tick()
+  return () => { stopped = true; if (timer) clearTimeout(timer) }
 }
