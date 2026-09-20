@@ -11,6 +11,10 @@ describe('typed fabric transport', () => {
     expect(fabricCommand(JSON.stringify(payload))?.requestId).toBe('first')
     expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric deploy production' } }))?.command).toBe('unsupported')
   })
+  test('connector attribution cannot turn into task instructions', () => {
+    expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT|centaur> fabric review first\n\n*Sent using* <@UCHATGPT>' } }))?.requestId).toBe('first')
+    expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric deploy prod\n\nfabric review first' } }))?.command).toBe('unsupported')
+  })
   test('unsigned callback never reaches intake', async () => {
     const raw = JSON.stringify(payload)
     const response = await handleFabricWebhook(new Request('https://example.test'), raw,
