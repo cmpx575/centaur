@@ -4,10 +4,12 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { handleFabricWebhook } from '../src/fabric'
 import { recipeMenu, recipeView, type Recipe } from '../src/fabric-recipes'
+import { createSlackbotV2 } from '../src/index'
+import { createMemoryState } from '@chat-adapter/state-memory'
 
 const recipe: Recipe = { id:'evidence-review',version:'1.0.0',digest:'a'.repeat(64),title:'Review prior work',description:'A checked review',aliases:['review'],taskType:'retained-evidence-review',defaultProfile:'focused',roles:['Coordinator','Worker','Checker'],profiles:{focused:{title:'Focused',description:'Three sources',maxCalls:{coordinator:4,worker:4,checker:6}},full:{title:'Full packet',description:'Seven sources',maxCalls:{coordinator:4,worker:8,checker:6}}} }
 const event = (text: string, id='E1') => ({type:'event_callback',team_id:'T1',event_id:id,event:{type:'app_mention',user:'U1',channel:'C1',ts:'1789846137.000001',text:'<@UBOT> '+text}})
-async function fixture(work: (send: (payload:any, signed?:boolean)=>Promise<Response|undefined>, calls:any[])=>Promise<void>, failure?:string) {
+async function fixture(work: (send: (payload:any, signed?:boolean)=>Promise<Response|undefined>, calls:any[])=>Promise<void>, failure?:string, throughRoute=false) {
   const dir=mkdtempSync(tmpdir()+'/fabric-recipes-');writeFileSync(dir+'/token','test-identity')
   const calls:any[]=[], waits:Promise<unknown>[]=[]
   const options={apiUrl:'',botToken:'test',signingSecret:'test',fabricIntakeUrl:'http://intake',fabricTokenPath:dir+'/token',launcherAllowedTeamIds:['T1'],launcherAllowedChannelIds:['C1'],launcherAllowedUserIds:['U1'],fetch:(async(url:any,init:any)=>{
@@ -20,11 +22,13 @@ async function fixture(work: (send: (payload:any, signed?:boolean)=>Promise<Resp
     if(path==='/api/views.open')return Response.json({ok:true})
     throw new Error('unexpected '+path)
   }) as typeof fetch}
+  const bot=throughRoute?createSlackbotV2({...options,state:createMemoryState(),recoverRenderObligationsOnStart:false}):undefined
   const send=async(payload:any,signed=true)=>{
     const raw=payload.type==='event_callback'?JSON.stringify(payload):new URLSearchParams({payload:JSON.stringify(payload)}).toString(),stamp=String(Math.floor(Date.now()/1000))
     const signature='v0='+createHmac('sha256','test').update(`v0:${stamp}:${raw}`).digest('hex')
-    const req=new Request('http://localhost/slack/events',{headers:signed?{'x-slack-signature':signature,'x-slack-request-timestamp':stamp}:{}})
-    const response=await handleFabricWebhook(req,raw,options,p=>waits.push(p));await Promise.all(waits);return response
+    const path=payload.type==='event_callback'?'/api/slack/events':'/api/webhooks/slack/actions'
+    const req=new Request('http://localhost'+path,{method:'POST',body:raw,headers:signed?{'x-slack-signature':signature,'x-slack-request-timestamp':stamp}:{}})
+    const response=bot?await bot.app.request(req):await handleFabricWebhook(req,raw,options,p=>waits.push(p));await Promise.all(waits);return response
   }
   try{await work(send,calls)}finally{rmSync(dir,{recursive:true,force:true})}
 }
@@ -100,3 +104,12 @@ test('navigation is read only and actor gates also protect buttons',async()=>fix
   expect((await send({...recent,user:{id:'OTHER'}}))?.status).toBe(403)
   expect(calls.filter(c=>c.path==='/v1/runs' && c.body)).toHaveLength(0)
 }))
+
+test('the configured legacy actions endpoint opens and submits recipes before launcher fallback',async()=>fixture(async(send,calls)=>{
+  expect((await send(opening,false))?.status).toBe(401)
+  expect((await send(opening))?.status).toBe(200)
+  const view=calls.find(c=>c.path.endsWith('views.open')).body.view
+  expect((await send(submission(view)))?.status).toBe(200)
+  expect(calls.filter(c=>c.path==='/v1/runs' && c.body)).toHaveLength(1)
+  expect((await send({...opening,actions:[{action_id:'unsupported_legacy_action',value:'bad'}]}))?.status).toBe(400)
+},undefined,true))
