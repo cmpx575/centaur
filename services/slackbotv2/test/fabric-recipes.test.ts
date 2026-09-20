@@ -12,6 +12,7 @@ async function fixture(work: (send: (payload:any, signed?:boolean)=>Promise<Resp
   const calls:any[]=[], waits:Promise<unknown>[]=[]
   const options={apiUrl:'',botToken:'test',signingSecret:'test',fabricIntakeUrl:'http://intake',fabricTokenPath:dir+'/token',launcherAllowedTeamIds:['T1'],launcherAllowedChannelIds:['C1'],launcherAllowedUserIds:['U1'],fetch:(async(url:any,init:any)=>{
     const path=new URL(String(url)).pathname,body=init.body?JSON.parse(init.body):undefined;calls.push({path,body})
+    if(path==='/v1/runs' && init.method==='GET')return Response.json({runs:[]})
     if(path==='/v1/recipes')return Response.json({recipes:[recipe]})
     if(path==='/v1/runs' && init.method==='POST')return failure?Response.json({error:failure},{status:failure==='TEMPORARY'?503:409}):Response.json({created:true},{status:202})
     if(path==='/api/chat.postMessage')return Response.json({ok:true,ts:'2'})
@@ -66,3 +67,13 @@ test('all recipe choice descriptions meet Slack option limits',()=>{
   const view=recipeView({...recipe,profiles:{focused:{...recipe.profiles.focused!,description:'x'.repeat(200)}}},'test')
   const select:any=view.blocks.find((b:any)=>b.block_id==='profile');expect(select.element.options[0].description.text.length).toBe(75)
 })
+
+test('connector attribution is handled for recent runs, menus and named recipes',async()=>fixture(async(send,calls)=>{
+  await send(event('fabric runs *Sent using* <@UCHATGPT>'))
+  expect(calls.filter(c=>c.path==='/v1/runs' && !c.body)).toHaveLength(1)
+  expect(calls.find(c=>c.path.endsWith('chat.postMessage')).body.text).toContain('No fabric runs')
+  await send(event('fabric recipes *Sent using* <@UCHATGPT>'))
+  expect(calls.filter(c=>c.path.endsWith('chat.postMessage')).at(-1).body.blocks).toBeDefined()
+  await send(event('fabric run review focused https://plane.example.test/work *Sent using* <@UCHATGPT>'))
+  expect(calls.filter(c=>c.path==='/v1/runs' && c.body)).toHaveLength(1)
+}))

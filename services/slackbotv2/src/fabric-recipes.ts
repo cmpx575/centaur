@@ -1,7 +1,7 @@
 /** Recipe choices are read from the fabric; this file owns only Slack UX. */
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { verifySlackRequest } from './launcher'
-import { intake, slack, formatRun } from './fabric'
+import { intake, slack, formatRun, fabricMessageText } from './fabric'
 import type { SlackbotV2Options } from './types'
 
 export type Recipe = { id: string; version: string; digest: string; title: string; description: string;
@@ -59,8 +59,7 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   let payload: any
   try { payload = JSON.parse(raw.startsWith('payload=') ? new URLSearchParams(raw).get('payload')! : raw) } catch { return }
   const event = payload.event, action = payload.actions?.[0]
-  const text = String(event?.text ?? '').replace(/[\u200B-\u200D\u2060\u2063\uFEFF]/g, '').trim().split('\n')[0]!
-    .replace(/^<@[A-Z0-9]+(?:\|[^>]+)?>\s*/, '').trim()
+  const text = fabricMessageText(event?.text)
   const mention = payload.type === 'event_callback' && event?.type === 'app_mention' && !event.bot_id && !event.subtype
     && /^fabric\s+(recipes|run|runs)(?:\s|$)/i.test(text)
   const opening = payload.type === 'block_actions' && action?.action_id === prefix + 'open'

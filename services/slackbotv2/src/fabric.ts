@@ -14,6 +14,13 @@ type Run = { requestId: string; runId: string; state: string; channelId: string;
   result?: { report?: string; error?: string; checker?: { reason?: string }; terminal?: {
     artifactVerified?: boolean; authorityClosed?: boolean; disposalVerified?: boolean; taskOutcome?: string } } }
 
+/** Only the first line is a command; connector attribution is never task input. */
+export function fabricMessageText(value: unknown): string {
+  return String(value ?? '').replace(/[\u200B-\u200D\u2060\u2063\uFEFF]/g, '').trim().split('\n')[0]!
+    .replace(/^<@[A-Z0-9]+(?:\|[^>]+)?>\s*/, '')
+    .replace(/\s+\*?Sent using\*?\s+.*$/i, '').trim()
+}
+
 export function fabricCommand(raw: string): { payload: Record<string, any>; command: string; requestId?: string; planeUrl?: string } | undefined {
   let payload: Record<string, any>
   try { payload = JSON.parse(raw) } catch { return }
@@ -21,7 +28,7 @@ export function fabricCommand(raw: string): { payload: Record<string, any>; comm
   if (payload.type !== 'event_callback' || event?.type !== 'app_mention' || event.bot_id || event.subtype) return
   // The connector appends an attribution footer. Only the first line is a
   // typed verb and identifier; subsequent text never becomes a task prompt or authority.
-  const text = String(event.text ?? '').replace(/[\u200B-\u200D\u2060\u2063\uFEFF]/g, '').trim().split('\n')[0]!.replace(/^<@[A-Z0-9]+(?:\|[^>]+)?>\s*/, '').trim()
+  const text = fabricMessageText(event.text)
   if (!/^fabric(?:\s|$)/i.test(text)) return
   const m = /^fabric\s+(review|status)\s+([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})(?![a-zA-Z0-9._-])/i.exec(text)
   const link = text.match(/(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?/)
