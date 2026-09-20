@@ -630,6 +630,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   app.post('/api/slack/options', handleSlackWebhook)
   app.post('/api/slack/commands', handleSlackWebhook)
   registerSlackLauncher(app, {
+    workflowSigningSecret: options.launcherWorkflowSigningSecret,
     allowedChannelIds: options.launcherAllowedChannelIds ?? [],
     allowedTeamIds: options.launcherAllowedTeamIds ?? [],
     allowedUserIds: options.launcherAllowedUserIds ?? [],

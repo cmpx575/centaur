@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { createHmac } from 'node:crypto'
 import type { Logger, StateAdapter } from 'chat'
 import { Hono } from 'hono'
 
@@ -16,6 +17,7 @@ import {
   collectBlockActionValues,
   filterValidRecentOptions,
   launcherMessagePayload,
+  launcherWorkflowToken,
   registerSlackLauncher,
   runCardPayload,
   slackSignature,
@@ -1332,3 +1334,18 @@ function jsonResponse(body: unknown, status = 200): Response {
     headers: { 'Content-Type': 'application/json' }
   })
 }
+
+
+test('launcher workflow token expires quickly and grants no ingress or admin capabilities', () => {
+  const token = launcherWorkflowToken('fixture-workflow-signing-key', NOW_MS)
+  const [header, payload, signature] = token.split('.')
+  const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString())
+  expect(JSON.parse(Buffer.from(header!, 'base64url').toString())).toEqual({ alg: 'HS256', typ: 'JWT' })
+  expect(signature).toBe(createHmac('sha256', 'fixture-workflow-signing-key').update(`${header}.${payload}`).digest('base64url'))
+  expect(claims.capabilities).toEqual({ sessions_read: false, workflows_read: true, workflows_write: true })
+  expect(claims.token_use).toBeUndefined()
+  expect(claims.sub).toBe('centaur-slack-launcher')
+  expect(claims.exp - claims.iat).toBe(60)
+  expect(claims.iss).toBe('centaur-console')
+  expect(claims.aud).toBe('centaur-api')
+})

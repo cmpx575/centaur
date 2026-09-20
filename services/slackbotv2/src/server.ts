@@ -47,6 +47,7 @@ const consoleLogger = {
 const options: SlackbotV2Options = {
   apiUrl,
   agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
+  launcherWorkflowSigningSecret: optionalEnv('SLACK_LAUNCHER_WORKFLOW_SIGNING_SECRET'),
   fabricIntakeUrl: optionalEnv('FABRIC_INTAKE_URL'),
   fabricTokenPath: optionalEnv('FABRIC_TOKEN_PATH'),
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
