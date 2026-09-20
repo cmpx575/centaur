@@ -19,6 +19,7 @@ spec:
 {{- end }}
   strategy:
     type: Recreate
+    rollingUpdate: null
 {{- end }}
   replicas: {{ .Values.slackbotv2.replicaCount }}
   selector:
