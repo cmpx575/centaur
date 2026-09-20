@@ -6,8 +6,11 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { verifySlackRequest } from './launcher'
 import type { SlackbotV2Options } from './types'
+import { handleRecipeWebhook } from './fabric-recipes'
 
 type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string; planeUrl?: string;
+  recipe?: { title: string; version: string; profileTitle: string; planDigest: string; roles: string[] };
+  context?: { sources: Array<{name: string}>; packetDigest: string; coverage: string };
   result?: { report?: string; error?: string; checker?: { reason?: string }; terminal?: {
     artifactVerified?: boolean; authorityClosed?: boolean; disposalVerified?: boolean; taskOutcome?: string } } }
 
@@ -28,6 +31,8 @@ export function fabricCommand(raw: string): { payload: Record<string, any>; comm
 export async function handleFabricWebhook(request: Request, raw: string, options: SlackbotV2Options,
   waitUntil: (promise: Promise<unknown>) => void): Promise<Response | undefined> {
   if (!options.fabricIntakeUrl) return
+  const recipeResponse = await handleRecipeWebhook(request, raw, options, waitUntil)
+  if (recipeResponse) return recipeResponse
   const parsed = fabricCommand(raw)
   if (!parsed) return
   const signed = verifySlackRequest({ nowMs: Date.now(), rawBody: raw, signingSecret: options.signingSecret,
@@ -65,7 +70,7 @@ export async function handleFabricWebhook(request: Request, raw: string, options
   return new Response('ok')
 }
 
-async function intake(options: SlackbotV2Options, path: string, body?: unknown) {
+export async function intake(options: SlackbotV2Options, path: string, body?: unknown) {
   const token = readFileSync(options.fabricTokenPath ?? '/fabric-identity/token', 'utf8').trim()
   const response = await (options.fetch ?? fetch)(options.fabricIntakeUrl! + path, {
     method: body ? 'POST' : 'GET', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -73,7 +78,7 @@ async function intake(options: SlackbotV2Options, path: string, body?: unknown) 
   return { ok: response.ok, status: response.status, value: await response.json() as Record<string, any> }
 }
 
-async function slack(options: SlackbotV2Options, method: string, body: unknown) {
+export async function slack(options: SlackbotV2Options, method: string, body: unknown) {
   const response = await (options.fetch ?? fetch)((options.slackApiUrl ?? 'https://slack.com/api') + '/' + method, {
     method: 'POST', headers: { Authorization: `Bearer ${options.botToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body), signal: AbortSignal.timeout(10000) })
@@ -85,6 +90,10 @@ async function slack(options: SlackbotV2Options, method: string, body: unknown) 
 export function formatRun(run: Run): string {
   const lines = [`*Hermes fabric review — ${run.state}*`, `Request: \`${run.requestId}\` · Run: \`${run.runId}\``]
   if (run.planeUrl) lines.push(`Plane: ${run.planeUrl}`)
+  if (run.recipe) lines.push(`Recipe: *${run.recipe.title}* ${run.recipe.version} · *${run.recipe.profileTitle}*`,
+    `Team: ${run.recipe.roles.join(' → ')}`, `Plan: \`${run.recipe.planDigest.slice(0,12)}\``)
+  if (run.context) lines.push(`Prior work: ${run.context.sources.map(s => s.name).join(', ')}`,
+    `Context: \`${run.context.packetDigest.slice(0,12)}\` · ${run.context.coverage}`)
   if (run.result?.terminal) {
     const t = run.result.terminal
     lines.push(`Task: ${t.taskOutcome}. Checked artifact: ${t.artifactVerified === true}. Access closed: ${t.authorityClosed === true}. Resources disposed: ${t.disposalVerified === true}.`)
