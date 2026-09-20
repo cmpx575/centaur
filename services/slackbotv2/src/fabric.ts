@@ -16,10 +16,10 @@ export function fabricCommand(raw: string): { payload: Record<string, any>; comm
   const event = payload.event
   if (payload.type !== 'event_callback' || event?.type !== 'app_mention' || event.bot_id || event.subtype) return
   // The connector appends an attribution footer. Only the first line is a
-  // typed command; subsequent text never becomes a task prompt or authority.
-  const text = String(event.text ?? '').trim().split('\n')[0]!.replace(/^<@[A-Z0-9]+(?:\|[^>]+)?>\s*/, '').trim()
+  // typed verb and identifier; subsequent text never becomes a task prompt or authority.
+  const text = String(event.text ?? '').replace(/[\u200B-\u200D\u2060\u2063\uFEFF]/g, '').trim().split('\n')[0]!.replace(/^<@[A-Z0-9]+(?:\|[^>]+)?>\s*/, '').trim()
   if (!/^fabric(?:\s|$)/i.test(text)) return
-  const m = /^fabric\s+(review|status)\s+([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})\s*$/i.exec(text)
+  const m = /^fabric\s+(review|status)\s+([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})(?![a-zA-Z0-9._-])/i.exec(text)
   return { payload, command: m?.[1]?.toLowerCase() ?? 'unsupported', requestId: m?.[2] }
 }
 

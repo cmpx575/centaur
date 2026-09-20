@@ -9,10 +9,16 @@ describe('typed fabric transport', () => {
   })
   test('typed request and unsupported task separation', () => {
     expect(fabricCommand(JSON.stringify(payload))?.requestId).toBe('first')
+    expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric review first *Sent using* ChatGPT' } }))?.requestId).toBe('first')
+    expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric review first\u2063' } }))?.requestId).toBe('first')
+    expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric review ' + 'x'.repeat(65) } }))?.command).toBe('unsupported')
     expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric deploy production' } }))?.command).toBe('unsupported')
   })
   test('connector attribution cannot turn into task instructions', () => {
     expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT|centaur> fabric review first\n\n*Sent using* <@UCHATGPT>' } }))?.requestId).toBe('first')
+    expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric review first *Sent using* ChatGPT' } }))?.requestId).toBe('first')
+    expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric review first\u2063' } }))?.requestId).toBe('first')
+    expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric review ' + 'x'.repeat(65) } }))?.command).toBe('unsupported')
     expect(fabricCommand(JSON.stringify({ ...payload, event: { ...payload.event, text: '<@UBOT> fabric deploy prod\n\nfabric review first' } }))?.command).toBe('unsupported')
   })
   test('unsigned callback never reaches intake', async () => {
