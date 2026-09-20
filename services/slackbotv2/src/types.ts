@@ -129,6 +129,8 @@ export type SlackbotV2BlockActionPayload = {
 }
 
 export type SlackbotV2Options = {
+  fabricIntakeUrl?: string
+  fabricTokenPath?: string
   allowedExternalTeamIds?: readonly string[]
   apiKey?: string
   apiUrl: string
@@ -196,6 +198,11 @@ export type SlackbotV2Options = {
   handoffRetryDelaysMs?: readonly number[]
   /** Milliseconds before an idle execution pauses its sandbox. Defaults to up to 3h. */
   idleTimeoutMs?: number
+  launcherAllowedChannelIds?: readonly string[]
+  launcherAllowedTeamIds?: readonly string[]
+  launcherAllowedUserIds?: readonly string[]
+  launcherMaxPollMs?: number
+  launcherPollIntervalMs?: number
   logger?: Logger
   maxDurationMs?: number
   postgresUrl?: string

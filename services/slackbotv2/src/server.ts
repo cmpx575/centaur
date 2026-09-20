@@ -47,6 +47,8 @@ const consoleLogger = {
 const options: SlackbotV2Options = {
   apiUrl,
   agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
+  fabricIntakeUrl: optionalEnv('FABRIC_INTAKE_URL'),
+  fabricTokenPath: optionalEnv('FABRIC_TOKEN_PATH'),
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
@@ -80,6 +82,11 @@ const options: SlackbotV2Options = {
       }
     : {},
   idleTimeoutMs: optionalNumberEnv('SESSION_IDLE_TIMEOUT_MS'),
+  launcherAllowedChannelIds: csvEnv('SLACK_LAUNCHER_ALLOWED_CHANNEL_IDS'),
+  launcherAllowedTeamIds: csvEnv('SLACK_LAUNCHER_ALLOWED_TEAM_IDS'),
+  launcherAllowedUserIds: csvEnv('SLACK_LAUNCHER_ALLOWED_USER_IDS'),
+  launcherMaxPollMs: optionalNumberEnv('SLACK_LAUNCHER_MAX_POLL_MS'),
+  launcherPollIntervalMs: optionalNumberEnv('SLACK_LAUNCHER_POLL_INTERVAL_MS'),
   maxDurationMs: optionalNumberEnv('SESSION_MAX_DURATION_MS'),
   messageOverridesStrategy: createMessageOverridesStrategy(),
   postgresUrl:
@@ -126,6 +133,11 @@ console.log(
     response_service_tier_enabled: options.responseServiceTierEnabled,
     steering_reaction_enabled: options.steeringReactionEnabled,
     steering_reaction_name: options.steeringReactionName,
+    launcher_allowlist_counts: {
+      channels: options.launcherAllowedChannelIds?.length ?? 0,
+      teams: options.launcherAllowedTeamIds?.length ?? 0,
+      users: options.launcherAllowedUserIds?.length ?? 0
+    },
     port: server.port,
     api_url: apiUrl
   })
@@ -146,6 +158,13 @@ function requiredEnv(name: string): string {
 
 function stringEnv(name: string, fallback: string): string {
   return optionalEnv(name) ?? fallback
+}
+
+function csvEnv(name: string): string[] {
+  return (optionalEnv(name) ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
 }
 
 function numberEnv(name: string, fallback: number): number {

@@ -31,6 +31,8 @@ import {
 } from '@centaur/rendering'
 import { conflateChatSdkStream } from './conflate'
 import { resolveHarnessRollout } from './harness-rollout'
+import { registerSlackLauncher } from './launcher'
+import { handleFabricWebhook } from './fabric'
 import { observeSeconds, slackbotMetrics } from './metrics'
 import {
   renderSlackDisplayText,
@@ -526,6 +528,8 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     const webhookStartedAtMs = nowMs()
     const route = c.req.path
     const rawBody = await c.req.raw.clone().text()
+    const fabricResponse = await handleFabricWebhook(c.req.raw, rawBody, options, promise => waitUntil(c, promise))
+    if (fabricResponse) return fabricResponse
     const eventType = slackWebhookEventType(rawBody)
     const webhookFields = {
       ...slackWebhookLogFields(rawBody),
@@ -625,6 +629,21 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   app.post('/api/slack/actions', handleSlackWebhook)
   app.post('/api/slack/options', handleSlackWebhook)
   app.post('/api/slack/commands', handleSlackWebhook)
+  registerSlackLauncher(app, {
+    allowedChannelIds: options.launcherAllowedChannelIds ?? [],
+    allowedTeamIds: options.launcherAllowedTeamIds ?? [],
+    allowedUserIds: options.launcherAllowedUserIds ?? [],
+    apiKey: options.apiKey,
+    apiUrl: options.apiUrl,
+    botToken: options.botToken,
+    fetch: options.fetch,
+    logger,
+    maxPollMs: options.launcherMaxPollMs,
+    pollIntervalMs: options.launcherPollIntervalMs,
+    signingSecret: options.signingSecret,
+    slackApiUrl: options.slackApiUrl,
+    state
+  })
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options, stateConnected)
