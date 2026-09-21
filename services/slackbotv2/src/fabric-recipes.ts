@@ -334,15 +334,8 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     if ((!pasted && !selected) || (pasted && selected)) return Response.json({ response_action:'errors', errors:{plane:'Choose one item or paste one link, then start.'} })
     const planeUrl = pasted || selected
     if (saved.setup?.editing) return Response.json({ response_action: 'errors', errors: { profile: 'Review the chosen setup before starting.' } })
-    if (saved.setup) {
-      const catalog = await intake(options, '/v1/recipe-catalog?' + query)
-      if (!catalog.ok) return new Response('retry', { status: 503 })
-      try {
-        const recipe = parseWorkCatalog(catalog.value).recipes.find(r => r.id === saved.recipe.id)
-        if (!recipe || recipe.digest !== saved.recipe.digest || recipe.version !== saved.recipe.version) throw new Error('work_setup_changed')
-        resolveSetup(recipe, saved.setup.selected, saved.setup.catalogDigest)
-      } catch { return Response.json({ response_action: 'errors', errors: { profile: 'The recipe or work setup changed. Close this form and open the current recipe again.' } }) }
-    }
+    // Send the sealed choice unchanged. The backend resolves an existing request
+    // before checking current definitions, so a lost reply remains replayable.
     const result = await intake(options, '/v1/runs', recipeRequest(saved.recipe, profile, planeUrl, origin, payload.view.id, saved.setup?.selected))
     if (!result.ok) {
       if (result.status >= 500) return new Response('retry', { status: 503 })

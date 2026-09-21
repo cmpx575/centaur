@@ -102,11 +102,24 @@ test('setup picker rejects changed catalogs, invented options and unsupported ca
     .find((b: any) => b.block_id === 'work_setup')).toMatchObject({ element: { options: [expect.objectContaining({ value: setupOptionValue(human) })] } })
 }))
 
-test('stale selected setup or recipe refuses at Start with no silent default', () => fixture(async (send, calls, current) => {
-  await send(opening); const view = lastView(calls)
+test('a newly stale signed Start sends its frozen tuple and surfaces backend 409 without substituting the default', () => fixture(async (send, calls, current, options) => {
+  await send(opening); const view = lastView(calls), original = options.fetch
   current[0]!.workSetups![0]!.digest = 'd'.repeat(64); current[0]!.defaultWorkSetup = setupRef(current[0]!.workSetups![0]!)
-  expect(await (await send(submission(view))).json()).toMatchObject({ response_action: 'errors', errors: { profile: expect.stringContaining('changed') } })
-  expect(calls.filter(c => c.path === '/v1/runs')).toHaveLength(0)
+  let posts = 0
+  options.fetch = async (input: any, init: any) => {
+    const path = new URL(String(input)).pathname
+    if (path === '/v1/runs' && init.method === 'POST') {
+      posts++
+      expect(JSON.parse(init.body)).toMatchObject({ recipeDigest: 'c'.repeat(64), workSetupId: human.id,
+        workSetupVersion: human.version, workSetupDigest: human.digest })
+      return Response.json({ error: 'WORK_SETUP_CHANGED_REFRESH_MENU' }, { status: 409 })
+    }
+    return original(input, init)
+  }
+  expect(await (await send(submission(view))).json()).toEqual({ response_action: 'errors', errors: {
+    profile: 'This work setup changed. Close this form and open the menu again. (WORK_SETUP_CHANGED_REFRESH_MENU)' } })
+  expect(posts).toBe(1)
+  expect(calls.filter(c => c.path === '/v1/recipe-catalog')).toHaveLength(0)
 }))
 
 test('signed setup interactions bind user, team, channel and sealed selection', () => fixture(async (send, calls) => {
@@ -172,7 +185,7 @@ test('durable final delivery and run details display the actual frozen setup and
 }))
 
 
-test('repeated signed Start reaches the immutable run after a committed response is lost and capacity disappears', () => fixture(async (send, calls, _current, options) => {
+test('repeated signed Start reaches the immutable run after a lost response, consumed capacity and changed catalog', () => fixture(async (send, calls, current, options) => {
   await send(opening); const view = lastView(calls), original = options.fetch
   let committed: Record<string, string> | undefined, commits = 0, posts = 0
   options.fetch = async (input: any, init: any) => {
@@ -187,9 +200,13 @@ test('repeated signed Start reaches the immutable run after a committed response
     return original(input, init)
   }
   expect((await send(submission(view))).status).toBe(503)
-  // The ordinary launch menu now has no capacity; catalog identity remains readable.
+  // The menu loses capacity and the catalog changes after the first durable commit.
+  current[0]!.digest = 'f'.repeat(64)
+  current[0]!.workSetups![0]!.digest = 'e'.repeat(64)
+  current[0]!.defaultWorkSetup = setupRef(current[0]!.workSetups![0]!)
   expect(await (await options.fetch('http://intake/v1/recipes', { method: 'GET' })).json()).toEqual({ recipes: [] })
   expect(await (await send(submission(view))).json()).toEqual({ response_action: 'clear' })
   expect(commits).toBe(1); expect(posts).toBe(2)
-  expect(calls.filter(c => c.path === '/v1/recipe-catalog')).toHaveLength(2)
+  expect(calls.filter(c => c.path === '/v1/recipe-catalog')).toHaveLength(0)
+  expect(committed).toMatchObject({ recipeDigest: 'c'.repeat(64), workSetupDigest: human.digest })
 }))
