@@ -1,7 +1,9 @@
 /** Read-only views over the fabric's receipt-derived work history. */
 import { createHash } from 'node:crypto'
 
-export type ArtifactRef = { runId: string; requestId: string; generation: string; kind: 'report' | 'gpuResult';
+export const ARTIFACT_KINDS = ['report', 'gpuResult', 'softwareSource', 'softwareHtml', 'softwareResult'] as const
+type ArtifactKind = typeof ARTIFACT_KINDS[number]
+export type ArtifactRef = { runId: string; requestId: string; generation: string; kind: ArtifactKind;
   sha256: string; byteLength: number; mediaType: string }
 export type ResumeAttempt = { runId: string; requestId: string; generation: string; created: number; state: string;
   recipe: { id: string; title: string; profile: string } | null;
@@ -33,9 +35,17 @@ const nullableString = (value: unknown) => value === null || string(value)
 const nullableBool = (value: unknown) => value === null || typeof value === 'boolean'
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0
 const sha = (value: unknown) => string(value) && /^[a-f0-9]{64}$/.test(value)
+const softwareArtifacts = {
+  softwareSource: { label: 'Source', mediaType: 'text/x-python; charset=utf-8' },
+  softwareHtml: { label: 'HTML', mediaType: 'text/html; charset=utf-8' },
+  softwareResult: { label: 'Execution receipt', mediaType: 'application/json' },
+} as const
+const softwareArtifact = (kind: ArtifactKind) => kind in softwareArtifacts
+  ? softwareArtifacts[kind as keyof typeof softwareArtifacts] : undefined
 const validRef = (r: ArtifactRef) => r && string(r.runId) && string(r.requestId) && string(r.generation)
-  && ['report', 'gpuResult'].includes(r.kind) && sha(r.sha256)
+  && ARTIFACT_KINDS.includes(r.kind) && sha(r.sha256)
   && Number.isInteger(r.byteLength) && r.byteLength >= 0 && r.byteLength <= 128 * 1024 && string(r.mediaType)
+  && (!softwareArtifact(r.kind) || r.mediaType === softwareArtifact(r.kind)!.mediaType)
 const chunks = (text: string, limit: number) => {
   const result: string[] = []
   let part = ''
@@ -67,7 +77,7 @@ export function parseResumeBrief(value: unknown, planeUrl: string): ResumeBrief 
       || (a.recipe !== null && (!a.recipe || !string(a.recipe.id) || !string(a.recipe.title) || !string(a.recipe.profile)))
       || !a.closure || !nullableBool(a.closure.authorityClosed) || !nullableBool(a.closure.disposalVerified) || !string(a.closure.label)
       || (a.checker !== null && (!a.checker || typeof a.checker.accepted !== 'boolean' || !string(a.checker.reason)))
-      || (a.archiveSha256 !== null && !sha(a.archiveSha256)) || !Array.isArray(a.evidence) || a.evidence.length > 2
+      || (a.archiveSha256 !== null && !sha(a.archiveSha256)) || !Array.isArray(a.evidence) || a.evidence.length > ARTIFACT_KINDS.length
       || (a.status === 'ACCEPTED' && (a.checker?.accepted !== true || a.closure.authorityClosed !== true
         || a.closure.disposalVerified !== true || a.taskOutcome !== 'COMPLETED' || !sha(a.archiveSha256)))
       || new Set(a.evidence.map(r => r.kind)).size !== a.evidence.length
@@ -141,7 +151,8 @@ export function resumeHistoryView(b: ResumeBrief, requestedPage: number, valueFo
       a.checker ? `Checker ${a.checker.accepted ? 'accepted' : 'rejected'}: ${clip(a.checker.reason, 1400)}` : 'No checker verdict recorded.',
       a.archiveSha256 ? `Recorded archive: ${a.archiveSha256}` : 'No verified archive reference recorded.'].join('\n')))
     const actions = a.evidence.map(r => button(
-      r.kind === 'report' ? (a.status === 'ACCEPTED' ? 'Read checked report' : 'Read unaccepted draft') : 'Inspect CUDA receipt',
+      r.kind === 'report' ? (a.status === 'ACCEPTED' ? 'Read checked report' : 'Read unaccepted draft')
+        : softwareArtifact(r.kind)?.label ?? 'Inspect CUDA receipt',
       { kind: 'artifact', planeUrl: b.planeUrl, page: 0, reference: r }, valueFor, '_' + r.kind))
     if (a.checker) actions.push(button('Read checker feedback', {
       kind: 'feedback', planeUrl: b.planeUrl, page: 0, runId: a.runId, generation: a.generation }, valueFor))
@@ -161,8 +172,11 @@ export function resumeHistoryView(b: ResumeBrief, requestedPage: number, valueFo
 export function resumeArtifactView(a: ResumeArtifact, s: Extract<ResumeSelection, { kind: 'artifact' }>, valueFor: ValueFor) {
   const textPages = chunks(a.content, TEXT_PAGE_SIZE), pages = Math.max(1, textPages.length), page = Math.min(s.page, pages - 1)
   const content = textPages[page] ?? ''
-  const label = s.reference.kind === 'report' ? (a.accepted ? 'Checked report' : 'Unaccepted draft') : (a.accepted ? 'Checked CUDA receipt' : 'Unaccepted CUDA receipt')
-  const blocks: Block[] = [section(`${label}\nRun: ${s.reference.runId}\nPage ${page + 1} of ${pages}\n${clip(a.basis, 600)}`)]
+  const software = softwareArtifact(s.reference.kind)
+  const label = software?.label ?? (s.reference.kind === 'report' ? (a.accepted ? 'Checked report' : 'Unaccepted draft') : (a.accepted ? 'Checked CUDA receipt' : 'Unaccepted CUDA receipt'))
+  const acceptance = software ? `\n${a.accepted ? 'Checked result.' : 'Acceptance is not established.'}` : ''
+  const display = s.reference.kind === 'softwareHtml' ? '\nHTML is shown as plain text.' : ''
+  const blocks: Block[] = [section(`${label}${acceptance}${display}\nRun: ${s.reference.runId}\nPage ${page + 1} of ${pages}\n${clip(a.basis, 600)}`)]
   for (const part of chunks(content, 2800)) blocks.push(section(part))
   if (!content.length) blocks.push(section('This retained artifact is empty.'))
   blocks.push(section(`Exact content verified: ${s.reference.byteLength} UTF-8 bytes\nSHA-256: ${s.reference.sha256}`))
@@ -190,5 +204,5 @@ export function resumeFeedbackView(b: ResumeBrief, s: Extract<ResumeSelection, {
 }
 
 export function isResumeAction(value: unknown): boolean {
-  return string(value) && /^(fabric_resume_history(?:_newer|_older)?|fabric_resume_artifact(?:_report|_gpuResult|_previous|_next)?|fabric_resume_feedback(?:_previous|_next)?|fabric_resume_plane)$/.test(value)
+  return string(value) && /^(fabric_resume_history(?:_newer|_older)?|fabric_resume_artifact(?:_report|_gpuResult|_softwareSource|_softwareHtml|_softwareResult|_previous|_next)?|fabric_resume_feedback(?:_previous|_next)?|fabric_resume_plane)$/.test(value)
 }
