@@ -4,6 +4,8 @@ import { verifySlackRequest } from './launcher'
 import { intake, slack, formatRun, fabricMessageText, recentRuns, runView, slackText, type Run } from './fabric'
 import type { SlackbotV2Options } from './types'
 import { capabilityMessage, capabilityView, parseCapabilityOverview } from './fabric-capabilities'
+import { exactResumeUrl, isResumeAction, parseResumeArtifact, parseResumeBrief, parseResumeSelection,
+  resumeArtifactView, resumeFeedbackView, resumeHistoryView, resumeMessage, type ResumeSelection } from './fabric-resume'
 
 export type Recipe = { id: string; version: string; digest: string; title: string; description: string;
   aliases: string[]; taskType: string; defaultProfile: string; roles: string[];
@@ -24,7 +26,7 @@ export function recipeMenu(recipes: Recipe[], availability?: Availability) {
       { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'open', text: plain('Choose how to run'), value: r.id }] }]),
     { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'recent', text: plain('Recent work') },
       { type: 'button', action_id: prefix + 'capabilities', text: plain('Capabilities') }] },
-    section('You can also mention `fabric run review focused <Plane-item-link>` or `fabric runs` to return to recent work.')
+    section('You can also mention `fabric run review focused <Plane-item-link>`, `fabric runs`, or `fabric resume <Plane-item-link>` for a read-only work history.')
   ] }
 }
 
@@ -74,11 +76,12 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const event = payload.event, action = payload.actions?.[0]
   const text = fabricMessageText(event?.text)
   const mention = payload.type === 'event_callback' && event?.type === 'app_mention' && !event.bot_id && !event.subtype
-    && /^fabric\s+(recipes|run|runs|capabilities)(?:\s|$)/i.test(text)
+    && /^fabric\s+(recipes|run|runs|capabilities|resume)(?:\s|$)/i.test(text)
   const opening = payload.type === 'block_actions' && action?.action_id === prefix + 'open'
+  const resumeNavigation = payload.type === 'block_actions' && isResumeAction(action?.action_id)
   const navigation = payload.type === 'block_actions' && [prefix+'recent', prefix+'menu', prefix+'details', prefix+'plane', prefix+'capabilities'].includes(action?.action_id)
   const submission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'submit'
-  if (!mention && !opening && !submission && !navigation) return
+  if (!mention && !opening && !submission && !navigation && !resumeNavigation) return
   const signed = verifySlackRequest({ nowMs: Date.now(), rawBody: raw, signingSecret: options.signingSecret,
     signature: request.headers.get('x-slack-signature') ?? undefined, timestamp: request.headers.get('x-slack-request-timestamp') ?? undefined })
   if (!signed.ok) return new Response('invalid request', { status: 401 })
@@ -86,16 +89,70 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   if (submission) {
     try { saved = unseal(payload.view.private_metadata, options.signingSecret) } catch { return new Response('invalid view', { status: 403 }) }
   }
+  let resumeSelection: ResumeSelection | undefined
+  if (resumeNavigation) {
+    try {
+      saved = unseal(action.value, options.signingSecret)
+      resumeSelection = parseResumeSelection(saved.resume)
+      if (!saved.origin || !['teamId', 'channelId', 'userId', 'threadTs'].every(k => typeof saved.origin[k] === 'string')
+        || !action.action_id.startsWith('fabric_resume_' + resumeSelection.kind)) throw new Error('invalid_resume_origin')
+    } catch { return new Response('invalid view', { status: 403 }) }
+  }
   const origin: Origin = { teamId: payload.team_id ?? payload.team?.id, userId: event?.user ?? payload.user?.id,
     channelId: event?.channel ?? payload.channel?.id ?? saved?.origin.channelId,
     threadTs: event?.thread_ts ?? event?.ts ?? payload.message?.thread_ts ?? payload.message?.ts ?? saved?.origin.threadTs }
   if (!options.launcherAllowedTeamIds?.includes(origin.teamId) || !options.launcherAllowedChannelIds?.includes(origin.channelId)
-      || !options.launcherAllowedUserIds?.includes(origin.userId) || (saved && (saved.origin.userId !== origin.userId || saved.origin.teamId !== origin.teamId))) {
+      || !options.launcherAllowedUserIds?.includes(origin.userId) || (saved && (saved.origin.userId !== origin.userId || saved.origin.teamId !== origin.teamId))
+      || (resumeNavigation && saved.origin.channelId !== origin.channelId)) {
     return new Response('not allowed', { status: 403 })
   }
   const query = new URLSearchParams({ teamId: origin.teamId, channelId: origin.channelId, userId: origin.userId })
   const reply = (body: Record<string, unknown>) => slack(options, 'chat.postMessage', { ...body,
     channel: origin.channelId, thread_ts: origin.threadTs, unfurl_links: false, unfurl_media: false })
+  if ((mention && /^fabric\s+resume(?:\s|$)/i.test(text)) || resumeNavigation) {
+    const match = /^fabric\s+resume\s+(?:<(https:\/\/[^\s<>|]+)(?:\|[^>]+)?>|(https:\/\/[^\s<>|]+))\s*$/i.exec(text)
+    let planeUrl: string
+    try { planeUrl = exactResumeUrl(resumeSelection?.planeUrl ?? match?.[1] ?? match?.[2]) }
+    catch {
+      waitUntil(reply({ text: 'Use `fabric resume <exact Plane work-item link>` to read its history. Nothing is started.' }))
+      return new Response('ok')
+    }
+    if (resumeSelection?.kind === 'plane') return new Response('ok')
+    query.set('planeUrl', planeUrl)
+    const valueFor = (selection: ResumeSelection) => {
+      const value = seal({ origin, resume: selection }, options.signingSecret)
+      if (value.length > 2000) throw new Error('resume_selection_too_large')
+      return value
+    }
+    try {
+      let view
+      if (resumeSelection?.kind === 'artifact') {
+        const reference = resumeSelection.reference
+        for (const key of ['runId', 'generation', 'kind', 'sha256'] as const) query.set(key, reference[key])
+        const result = await intake(options, '/v1/resume-artifact?' + query)
+        if (!result.ok) return new Response('unavailable', { status: result.status >= 500 ? 503 : 403 })
+        view = resumeArtifactView(parseResumeArtifact(result.value, reference), resumeSelection, valueFor)
+      } else {
+        const result = await intake(options, '/v1/resume-brief?' + query)
+        if (!result.ok) {
+          if (result.status >= 500) return new Response('retry', { status: 503 })
+          if (resumeNavigation) return new Response('not allowed', { status: 403 })
+          waitUntil(reply({ text: 'This work history is unavailable here. Use the exact Plane item link in an enabled channel. Nothing was started.' }))
+          return new Response('ok')
+        }
+        const brief = parseResumeBrief(result.value, planeUrl)
+        if (!resumeNavigation) {
+          waitUntil(reply(resumeMessage(brief, valueFor)))
+          return new Response('ok')
+        }
+        view = resumeSelection?.kind === 'feedback' ? resumeFeedbackView(brief, resumeSelection, valueFor)
+          : resumeHistoryView(brief, resumeSelection?.page ?? 0, valueFor)
+      }
+      if (payload.view?.id) await slack(options, 'views.update', { view_id: payload.view.id, hash: payload.view.hash, view })
+      else await slack(options, 'views.open', { trigger_id: payload.trigger_id, view })
+      return new Response('ok')
+    } catch { return new Response('retry', { status: 503 }) }
+  }
   if (navigation && action.action_id === prefix+'plane') return new Response('ok')
   if ((mention && /^fabric\s+capabilities\s*$/i.test(text)) || (navigation && action.action_id === prefix+'capabilities')) {
     const result = await intake(options, '/v1/capabilities?' + query)
