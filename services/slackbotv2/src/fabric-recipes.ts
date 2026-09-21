@@ -6,6 +6,9 @@ import type { SlackbotV2Options } from './types'
 import { capabilityMessage, capabilityView, parseCapabilityOverview } from './fabric-capabilities'
 import { exactResumeUrl, isResumeAction, parseResumeArtifact, parseResumeBrief, parseResumeSelection,
   resumeArtifactView, resumeFeedbackView, resumeHistoryView, resumeMessage, type ResumeSelection } from './fabric-resume'
+import { isWorkAction, parseWorkCatalog, parseWorkMenu, parseWorkSelection, selectedWorkUrl, workActionMatches,
+  workMenuDigest, workMessage, workNavigation, workOverviewView, workPickerView, workRecipesView, workRecipeView,
+  workUnavailableView, type WorkSelection } from './fabric-work'
 
 export type Recipe = { id: string; version: string; digest: string; title: string; description: string;
   aliases: string[]; taskType: string; defaultProfile: string; roles: string[];
@@ -76,18 +79,32 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const event = payload.event, action = payload.actions?.[0]
   const text = fabricMessageText(event?.text)
   const mention = payload.type === 'event_callback' && event?.type === 'app_mention' && !event.bot_id && !event.subtype
-    && /^fabric\s+(recipes|run|runs|capabilities|resume)(?:\s|$)/i.test(text)
+    && /^fabric\s+(recipes|run|runs|capabilities|resume|work)(?:\s|$)/i.test(text)
   const opening = payload.type === 'block_actions' && action?.action_id === prefix + 'open'
   const resumeNavigation = payload.type === 'block_actions' && isResumeAction(action?.action_id)
+  const workNavigationAction = payload.type === 'block_actions' && isWorkAction(action?.action_id)
+  const workSubmission = payload.type === 'view_submission' && payload.view?.callback_id === 'fabric_work_submit'
   const navigation = payload.type === 'block_actions' && [prefix+'recent', prefix+'menu', prefix+'details', prefix+'plane', prefix+'capabilities'].includes(action?.action_id)
   const submission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'submit'
-  if (!mention && !opening && !submission && !navigation && !resumeNavigation) return
+  if (!mention && !opening && !submission && !navigation && !resumeNavigation && !workNavigationAction && !workSubmission) return
   const signed = verifySlackRequest({ nowMs: Date.now(), rawBody: raw, signingSecret: options.signingSecret,
     signature: request.headers.get('x-slack-signature') ?? undefined, timestamp: request.headers.get('x-slack-request-timestamp') ?? undefined })
   if (!signed.ok) return new Response('invalid request', { status: 401 })
   let saved: any
   if (submission) {
     try { saved = unseal(payload.view.private_metadata, options.signingSecret) } catch { return new Response('invalid view', { status: 403 }) }
+  }
+  let workSelection: WorkSelection | undefined
+  if (workNavigationAction || workSubmission) {
+    try {
+      saved = unseal(workSubmission ? payload.view.private_metadata : action.value, options.signingSecret)
+      workSelection = parseWorkSelection(saved.work)
+      if (!saved.origin || !['teamId', 'channelId', 'userId', 'threadTs'].every(k => typeof saved.origin[k] === 'string' && saved.origin[k])
+        || (workNavigationAction && !workActionMatches(action.action_id, workSelection))
+        || (workSubmission && (workSelection.kind !== 'pick' || !(saved.menuDigest === null || /^[a-f0-9]{64}$/.test(saved.menuDigest))))) {
+        throw new Error('invalid_work_origin')
+      }
+    } catch { return new Response('invalid view', { status: 403 }) }
   }
   let resumeSelection: ResumeSelection | undefined
   if (resumeNavigation) {
@@ -103,12 +120,85 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     threadTs: event?.thread_ts ?? event?.ts ?? payload.message?.thread_ts ?? payload.message?.ts ?? saved?.origin.threadTs }
   if (!options.launcherAllowedTeamIds?.includes(origin.teamId) || !options.launcherAllowedChannelIds?.includes(origin.channelId)
       || !options.launcherAllowedUserIds?.includes(origin.userId) || (saved && (saved.origin.userId !== origin.userId || saved.origin.teamId !== origin.teamId))
-      || (resumeNavigation && saved.origin.channelId !== origin.channelId)) {
+      || ((resumeNavigation || workNavigationAction || workSubmission) && saved.origin.channelId !== origin.channelId)) {
     return new Response('not allowed', { status: 403 })
   }
   const query = new URLSearchParams({ teamId: origin.teamId, channelId: origin.channelId, userId: origin.userId })
   const reply = (body: Record<string, unknown>) => slack(options, 'chat.postMessage', { ...body,
     channel: origin.channelId, thread_ts: origin.threadTs, unfurl_links: false, unfurl_media: false })
+  const workValueFor = (selection: WorkSelection) => {
+    const value = seal({ origin, work: selection }, options.signingSecret)
+    if (value.length > 2000) throw new Error('work_selection_too_large')
+    return value
+  }
+  const resumeValueFor = (selection: ResumeSelection) => {
+    const value = seal({ origin, resume: selection }, options.signingSecret)
+    if (value.length > 2000) throw new Error('resume_selection_too_large')
+    return value
+  }
+  if ((mention && /^fabric\s+work(?:\s|$)/i.test(text)) || workNavigationAction || workSubmission) {
+    if (mention) {
+      waitUntil(reply(/^fabric\s+work\s*$/i.test(text) ? workMessage(workValueFor)
+        : { text: 'Use `fabric work` to choose an existing Plane item. Browsing starts no work.' }))
+      return new Response('ok')
+    }
+    const formError = (message: string) => Response.json({ response_action: 'errors', errors: { plane: message } })
+    const show = async (view: unknown) => {
+      if (payload.view?.id) await slack(options, 'views.update', { view_id: payload.view.id, hash: payload.view.hash, view })
+      else await slack(options, 'views.open', { trigger_id: payload.trigger_id, view })
+    }
+    let planeUrl: string | undefined
+    try {
+      if (workSubmission) {
+        const values = payload.view.state?.values ?? {}
+        const pasted = values.plane?.url?.value ?? '', selected = values.work?.item?.selected_option?.value ?? ''
+        if (typeof pasted !== 'string' || typeof selected !== 'string' || (!pasted.trim() && !selected) || (pasted.trim() && selected)) {
+          return formError('Choose one item or paste one exact Plane link.')
+        }
+        if (selected) {
+          const result = await intake(options, '/v1/work-items?' + query)
+          if (!result.ok) return formError('The item list is unavailable. Refresh it or paste the exact Plane link.')
+          const menu = parseWorkMenu(result.value)
+          if (menu.stale || saved.menuDigest !== workMenuDigest(menu)) return formError('The item list is stale or changed. Refresh it, then choose again, or paste the exact Plane link.')
+          planeUrl = selectedWorkUrl(menu, selected)
+          if (!planeUrl) return formError('This choice is no longer in the list. Refresh it or paste the exact Plane link.')
+        } else {
+          try { planeUrl = exactResumeUrl(pasted.trim()) } catch { return formError('Paste one exact HTTPS Plane work-item link without a query or fragment.') }
+        }
+      } else if (workSelection?.kind === 'pick') {
+        const result = await intake(options, '/v1/work-items?' + query)
+        const menu = result.ok ? parseWorkMenu(result.value) : null
+        await show(workPickerView(menu, seal({ origin, work: { kind: 'pick' }, menuDigest: menu ? workMenuDigest(menu) : null }, options.signingSecret), workValueFor))
+        return new Response('ok')
+      } else if (workSelection) planeUrl = workSelection.planeUrl
+      if (!planeUrl) throw new Error('missing_work_item')
+      query.set('planeUrl', planeUrl)
+      const result = await intake(options, '/v1/resume-brief?' + query)
+      if (!result.ok) {
+        if (workSubmission) return formError('History is unavailable. Check the exact Plane item link and enabled channel, then try again.')
+        await show(workUnavailableView(planeUrl, workValueFor))
+        return new Response('ok')
+      }
+      const brief = parseResumeBrief(result.value, planeUrl)
+      let view: unknown = workOverviewView(brief, resumeValueFor, workValueFor)
+      if (workSelection?.kind === 'recipes' || workSelection?.kind === 'recipe') {
+        // Catalog is discovery only. No allocation or eligibility query is performed.
+        query.delete('planeUrl')
+        const result = await intake(options, '/v1/recipe-catalog?' + query)
+        if (!result.ok) throw new Error('work_catalog_unavailable')
+        const catalog = parseWorkCatalog(result.value)
+        view = workSelection.kind === 'recipes' ? workRecipesView(catalog, brief, workSelection.page, workValueFor)
+          : workRecipeView(catalog.recipes.find(r => r.id === workSelection.recipeId), brief, workSelection, workValueFor)
+      }
+      if (workSubmission) return Response.json({ response_action: 'update', view })
+      await show(view)
+      return new Response('ok')
+    } catch {
+      if (workSubmission) return formError('This view is temporarily unavailable. Try again; nothing was started.')
+      try { await show(workUnavailableView(planeUrl, workValueFor)); return new Response('ok') }
+      catch { return new Response('retry', { status: 503 }) }
+    }
+  }
   if ((mention && /^fabric\s+resume(?:\s|$)/i.test(text)) || resumeNavigation) {
     const match = /^fabric\s+resume\s+(?:<(https:\/\/[^\s<>|]+)(?:\|[^>]+)?>|(https:\/\/[^\s<>|]+))\s*$/i.exec(text)
     let planeUrl: string
@@ -145,8 +235,11 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
           waitUntil(reply(resumeMessage(brief, valueFor)))
           return new Response('ok')
         }
-        view = resumeSelection?.kind === 'feedback' ? resumeFeedbackView(brief, resumeSelection, valueFor)
-          : resumeHistoryView(brief, resumeSelection?.page ?? 0, valueFor)
+        if (resumeSelection?.kind === 'feedback') view = resumeFeedbackView(brief, resumeSelection, valueFor)
+        else {
+          const history = resumeHistoryView(brief, resumeSelection?.page ?? 0, valueFor)
+          view = { ...history, blocks: [...history.blocks, workNavigation(planeUrl, workValueFor, true)] }
+        }
       }
       if (payload.view?.id) await slack(options, 'views.update', { view_id: payload.view.id, hash: payload.view.hash, view })
       else await slack(options, 'views.open', { trigger_id: payload.trigger_id, view })
