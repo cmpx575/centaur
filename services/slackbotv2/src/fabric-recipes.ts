@@ -3,6 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { verifySlackRequest } from './launcher'
 import { intake, slack, formatRun, fabricMessageText, recentRuns, runView, slackText, type Run } from './fabric'
 import type { SlackbotV2Options } from './types'
+import { capabilityMessage, capabilityView, parseCapabilityOverview } from './fabric-capabilities'
 
 export type Recipe = { id: string; version: string; digest: string; title: string; description: string;
   aliases: string[]; taskType: string; defaultProfile: string; roles: string[];
@@ -21,7 +22,8 @@ export function recipeMenu(recipes: Recipe[], availability?: Availability) {
     ...(availability ? [section(availability.open ? `${availability.remaining} runs available in this batch.` : 'This batch cannot start another run. An operator needs to renew its capacity or admission window.')] : []),
     ...recipes.flatMap(r => [section(`*${slackText(r.title)}*\n${slackText(r.description)}\n${r.roles.map(slackText).join(' → ')}`),
       { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'open', text: plain('Choose how to run'), value: r.id }] }]),
-    { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'recent', text: plain('Recent work') }] },
+    { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'recent', text: plain('Recent work') },
+      { type: 'button', action_id: prefix + 'capabilities', text: plain('Capabilities') }] },
     section('You can also mention `fabric run review focused <Plane-item-link>` or `fabric runs` to return to recent work.')
   ] }
 }
@@ -72,9 +74,9 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const event = payload.event, action = payload.actions?.[0]
   const text = fabricMessageText(event?.text)
   const mention = payload.type === 'event_callback' && event?.type === 'app_mention' && !event.bot_id && !event.subtype
-    && /^fabric\s+(recipes|run|runs)(?:\s|$)/i.test(text)
+    && /^fabric\s+(recipes|run|runs|capabilities)(?:\s|$)/i.test(text)
   const opening = payload.type === 'block_actions' && action?.action_id === prefix + 'open'
-  const navigation = payload.type === 'block_actions' && [prefix+'recent', prefix+'menu', prefix+'details', prefix+'plane'].includes(action?.action_id)
+  const navigation = payload.type === 'block_actions' && [prefix+'recent', prefix+'menu', prefix+'details', prefix+'plane', prefix+'capabilities'].includes(action?.action_id)
   const submission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'submit'
   if (!mention && !opening && !submission && !navigation) return
   const signed = verifySlackRequest({ nowMs: Date.now(), rawBody: raw, signingSecret: options.signingSecret,
@@ -95,6 +97,15 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const reply = (body: Record<string, unknown>) => slack(options, 'chat.postMessage', { ...body,
     channel: origin.channelId, thread_ts: origin.threadTs, unfurl_links: false, unfurl_media: false })
   if (navigation && action.action_id === prefix+'plane') return new Response('ok')
+  if ((mention && /^fabric\s+capabilities\s*$/i.test(text)) || (navigation && action.action_id === prefix+'capabilities')) {
+    const result = await intake(options, '/v1/capabilities?' + query)
+    if (!result.ok) return new Response('retry', { status: result.status >= 500 ? 503 : 403 })
+    let overview
+    try { overview = parseCapabilityOverview(result.value) } catch { return new Response('retry', { status: 503 }) }
+    if (navigation) await slack(options, 'views.open', { trigger_id: payload.trigger_id, view: capabilityView(overview) })
+    else waitUntil(reply(capabilityMessage(overview)))
+    return new Response('ok')
+  }
   if ((mention && /^fabric\s+runs\s*$/i.test(text)) || (navigation && [prefix+'recent',prefix+'details'].includes(action.action_id))) {
     const result = await intake(options, '/v1/runs?' + query)
     if (!result.ok) return new Response('retry', { status: result.status >= 500 ? 503 : 403 })
