@@ -25,6 +25,13 @@ const section = (text: string) => ({ type: 'section', text: plain(text) })
 const header = (text: string) => ({ type: 'header', text: plain(text) })
 const clipped = (value: string, length: number) => value.length > length ? value.slice(0, length - 1) + '…' : value
 const capacityNote = 'Qualification records what has been tested. Free machines, GPUs, access and approval are checked separately when work is requested.'
+const compactTeamNote = 'Teams currently have a fixed Hermes coordinator, worker and independent checker. Provider choice is not enabled yet.'
+const compactCapacityNote = 'Qualified workflows have been tested; machines and access are checked for each request.'
+const nextStep = 'Open Details for prerequisites, then use fabric recipes to choose an enabled workflow.'
+const providerNames: Record<string, string> = {
+  codex: 'Codex', claude: 'Claude', grok: 'Grok', agy: 'AGY', antigravity: 'AGY', minimax: 'MiniMax',
+}
+const providerName = (id: string) => providerNames[id.toLowerCase().replace(/^native-/, '')] ?? clipped(id, 40)
 
 export function parseCapabilityOverview(value: unknown): CapabilityOverview {
   const data = value as CapabilityOverview | undefined
@@ -51,6 +58,29 @@ function card(profile: Capability): string {
 }
 
 export function capabilityMessage(overview: CapabilityOverview) {
+  const groups = (Object.keys(labels) as CapabilityStatus[]).flatMap(status => {
+    const group = overview.profiles.filter(profile => profile.status === status)
+    if (!group.length) return []
+    const titles = group.slice(0, 6).map(profile => clipped(profile.title.replace(/\s+/g, ' ').trim(), 60))
+    if (group.length > titles.length) titles.push(`and ${group.length - titles.length} more`)
+    return [`${labels[status]} (${group.length})\n${titles.join(' · ')}`]
+  })
+  const providers = [...new Set(overview.requestedProviders?.map(provider => providerName(provider.id)) ?? [])]
+  const providerText = providers.length
+    ? 'Agent options to qualify: ' + providers.slice(0, 6).join(' · ') + (providers.length > 6 ? ` · and ${providers.length - 6} more` : '')
+    : undefined
+  const sections = [compactCapacityNote, ...groups,
+    !groups.length && 'No capability descriptions have been published yet.', compactTeamNote, providerText, nextStep]
+    .filter((text): text is string => Boolean(text))
+  return {
+    text: ['Capabilities', ...sections].join('\n\n').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+    blocks: [header('Capabilities'), ...sections.map(section), { type: 'actions', elements: [
+      { type: 'button', text: plain('Details'), action_id: 'fabric_recipe_capabilities' },
+    ] }],
+  }
+}
+
+export function capabilityView(overview: CapabilityOverview) {
   const profiles = overview.profiles.slice(0, 40)
   const blocks = [header('Capabilities'), section(capacityNote)]
   if (overview.capacityNote) blocks.push(section(clipped(overview.capacityNote, 1000)))
@@ -65,18 +95,5 @@ export function capabilityMessage(overview: CapabilityOverview) {
   if (!profiles.length) blocks.push(section('No capability descriptions have been published yet.'))
   if (profiles.length < overview.profiles.length) blocks.push(section(`Showing ${profiles.length} of ${overview.profiles.length} capabilities.`))
   blocks.push(section('This overview does not start work. Use the recipe menu for workflows currently enabled to run.'))
-  // Explicit fallback includes the same status/prerequisites as the visible cards.
-  const text = ['Capabilities', capacityNote, overview.capacityNote && clipped(overview.capacityNote, 1000),
-    overview.teamSummary && clipped(overview.teamSummary, 1000),
-    ...profiles.map(profile => `${labels[profile.status]}: ${card(profile)}`),
-    !profiles.length && 'No capability descriptions have been published yet.',
-    providers && 'Agent options under research\n' + providers,
-    profiles.length < overview.profiles.length ? `Showing ${profiles.length} of ${overview.profiles.length} capabilities.` : '',
-    'This overview does not start work. Use fabric recipes for workflows currently enabled to run.']
-    .filter(Boolean).join('\n\n')
-  return { text: clipped(text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'), 39000), blocks }
-}
-
-export function capabilityView(overview: CapabilityOverview) {
-  return { type: 'modal', title: plain('Capabilities'), close: plain('Close'), blocks: capabilityMessage(overview).blocks }
+  return { type: 'modal', title: plain('Capabilities'), close: plain('Close'), blocks }
 }

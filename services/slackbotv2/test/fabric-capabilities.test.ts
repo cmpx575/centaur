@@ -19,7 +19,8 @@ export const overview: CapabilityOverview = {
   ],
   teamSummary: 'Hermes coordinates a separate worker and checker. Additional agent providers need qualification.',
   capacityNote: 'Availability is checked when you request work.',
-  requestedProviders: [{ id: 'Additional provider', status: 'research-only', summary: 'Not yet connected to the run workflow.' }],
+  requestedProviders: ['native-codex', 'native-claude', 'native-grok', 'native-agy', 'minimax'].map(id =>
+    ({ id, status: 'research-only', summary: 'Not yet connected to the run workflow.' })),
 }
 
 type Call = { path: string; method: string; body?: any; query: URLSearchParams; authorization?: string | null }
@@ -64,30 +65,67 @@ const mention = { type: 'event_callback', team_id: 'T1', event_id: 'ECAP1', even
 const button = { type: 'block_actions', team: { id: 'T1' }, user: { id: 'U1' }, channel: { id: 'C1' },
   message: { ts: '1789980000.000001' }, trigger_id: 'trigger', actions: [{ action_id: 'fabric_recipe_capabilities' }] }
 
-test('capability overview distinguishes proof, prerequisites and capacity without launch controls', () => {
+test('compact overview groups titles and counts with only a read-only Details action', () => {
   const message = capabilityMessage(overview)
-  expect(message.text).toContain('Qualified: Windows inventory')
-  expect(message.text).toContain('Needs qualification: iOS build and simulator')
-  expect(message.text).toContain('Research only: Private Linux desktop')
-  expect(message.text).toContain('A compatible Mac image.')
-  expect(message.text).toContain('Free machines, GPUs, access and approval are checked separately')
-  expect(message.text).toContain('Agent options under research')
-  expect(message.blocks.every(block => ['section', 'header'].includes(block.type))).toBe(true)
-  expect(capabilityView(overview)).not.toHaveProperty('submit')
+  expect(message.text).toContain('Qualified (1)\nWindows inventory')
+  expect(message.text).toContain('Needs qualification (1)\niOS build and simulator')
+  expect(message.text).toContain('Research only (1)\nPrivate Linux desktop')
+  expect(message.text).not.toContain('A compatible Mac image.')
+  expect(message.text).not.toContain('Reuse the earlier app build')
+  expect(message.text).toContain('machines and access are checked for each request')
+  expect(message.text).toContain('fixed Hermes coordinator, worker and independent checker')
+  expect(message.text).toContain('Provider choice is not enabled yet.')
+  expect(message.text).toContain('Agent options to qualify: Codex · Claude · Grok · AGY · MiniMax')
+  expect(message.text).not.toContain('native-')
+  expect(message.text).not.toContain('Not yet connected to the run workflow.')
+  expect(message.blocks.filter(block => block.type === 'actions')).toEqual([{ type: 'actions', elements: [
+    { type: 'button', text: { type: 'plain_text', text: 'Details' }, action_id: 'fabric_recipe_capabilities' },
+  ] }])
+  expect(message.text).toContain('Open Details for prerequisites')
   expect(recipeMenu([]).blocks.some((block: any) => block.elements?.some((element: any) =>
     element.action_id === 'fabric_recipe_capabilities' && element.text.text === 'Capabilities'))).toBe(true)
 })
 
-test('bounded layouts keep all three groups below message limits with plain text cards', () => {
+test('read-only modal retains profile summaries and prerequisites without launch controls', () => {
+  const view = capabilityView(overview)
+  const text = view.blocks.map(block => block.text.text).join('\n')
+  expect(text).toContain('A compatible Mac image.')
+  expect(text).toContain('Connect artifact checks and cleanup.')
+  expect(text).toContain('Verify the network and desktop profile before use.')
+  expect(text).toContain('Reuse the earlier app build and simulator work.')
+  expect(text).toContain(overview.teamSummary!)
+  expect(text).toContain(overview.capacityNote!)
+  expect(text).toContain('Not yet connected to the run workflow.')
+  expect(view.blocks.every(block => ['section', 'header'].includes(block.type))).toBe(true)
+  expect(view).not.toHaveProperty('submit')
+})
+
+test('large catalogs have a bounded human-sized overview while details retain bounded cards', () => {
   const large = { ...overview, profiles: Array.from({ length: 100 }, (_, index) => ({ ...overview.profiles[index % 3]!,
     id: String(index), title: '<@U1> ' + 't'.repeat(400), summary: 's'.repeat(5000), prerequisites: Array(12).fill('p'.repeat(2000)) })) }
   const message = capabilityMessage(large)
-  expect(message.blocks.length).toBeLessThanOrEqual(50)
-  expect(message.blocks.every(block => block.text.type === 'plain_text' && block.text.text.length <= 3000)).toBe(true)
-  expect(message.text.length).toBeLessThan(40000)
+  expect(message.blocks.length).toBeLessThanOrEqual(10)
+  expect(message.blocks.every(block => !('text' in block) || block.text.type === 'plain_text' && block.text.text.length <= 3000)).toBe(true)
+  expect(message.text.length).toBeLessThan(2500)
   expect(message.text).not.toContain('<@U1>')
   expect(message.text).toContain('&lt;@U1&gt;')
-  expect(message.blocks.some(block => block.text.text === 'Showing 40 of 100 capabilities.')).toBe(true)
+  expect(message.text).toContain('Qualified (34)')
+  expect(message.text).toContain('Needs qualification (33)')
+  expect(message.text).toContain('Research only (33)')
+  expect(message.text).toContain('and 28 more')
+  expect(message.text).toContain('and 27 more')
+  expect(message.text).not.toContain('p'.repeat(100))
+  const view = capabilityView(large)
+  expect(view.blocks.length).toBeLessThanOrEqual(100)
+  expect(view.blocks.every(block => block.text.type === 'plain_text' && block.text.text.length <= 3000)).toBe(true)
+  expect(view.blocks.some(block => block.text.text === 'Showing 40 of 100 capabilities.')).toBe(true)
+})
+
+test('empty overview remains read-only and does not imply an enabled capability', () => {
+  const empty = { schemaVersion: 1 as const, profiles: [] }
+  expect(capabilityMessage(empty).text).toContain('No capability descriptions have been published yet.')
+  expect(capabilityMessage(empty).text).not.toContain('Qualified (')
+  expect(capabilityView(empty).blocks.some(block => block.text.text === 'No capability descriptions have been published yet.')).toBe(true)
 })
 
 test('invalid or unknown qualification and provider state cannot be rendered as qualified', () => {
