@@ -7,10 +7,11 @@ import { readFileSync } from 'node:fs'
 import { verifySlackRequest } from './launcher'
 import type { SlackbotV2Options } from './types'
 import { handleRecipeWebhook } from './fabric-recipes'
+import { parseWorkSetup, setupRuntimeTitle, workSetupBlocks, type WorkSetup } from './fabric-work-setup'
 
 export type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string; planeUrl?: string;
   view?: { title: string; status: string; nextAction: string; closure: string; checked: boolean; closed: boolean };
-  recipe?: { title: string; version: string; profileTitle: string; planDigest: string; roles: string[] };
+  recipe?: { title: string; version: string; profileTitle: string; planDigest: string; roles: string[]; workSetup?: WorkSetup };
   context?: { sources: Array<{name: string}>; packetDigest: string; coverage: string };
   result?: { report?: string; error?: string; checker?: { reason?: string }; terminal?: {
     artifactVerified?: boolean; authorityClosed?: boolean; disposalVerified?: boolean; taskOutcome?: string } } }
@@ -100,6 +101,10 @@ export function formatRun(run: Run): string {
   if (run.planeUrl) lines.push(`Plane: ${run.planeUrl}`)
   if (run.recipe) lines.push(`Recipe: *${run.recipe.title}* ${run.recipe.version} · *${run.recipe.profileTitle}*`,
     `Team: ${run.recipe.roles.join(' → ')}`, `Plan: \`${run.recipe.planDigest.slice(0,12)}\``)
+  if (run.recipe?.workSetup) {
+    const setup = parseWorkSetup(run.recipe.workSetup)
+    lines.push(`Work setup: ${setup.title}`, `Method: ${setup.method}`, `Runtime: ${setupRuntimeTitle(setup.runtime)}`)
+  }
   if (run.context) lines.push(`Prior work: ${run.context.sources.map(s => s.name).join(', ')}`,
     `Context: \`${run.context.packetDigest.slice(0,12)}\` · ${run.context.coverage}`)
   if (run.result?.terminal) {
@@ -117,7 +122,8 @@ const section = (text: string) => ({ type: 'section', text: { type: 'mrkdwn', te
 
 export function runSummary(run: Run): string {
   if (!run.view) return formatRun(run)
-  return `*${slackText(run.view.title)}* · *${run.view.status}*\n${run.view.nextAction}\n${run.view.closure}`
+  const setup = run.recipe?.workSetup ? parseWorkSetup(run.recipe.workSetup) : undefined
+  return `*${slackText(run.view.title)}* · *${run.view.status}*\n${run.view.nextAction}\n${run.view.closure}${setup ? '\nWork setup: ' + slackText(setup.title) : ''}`
 }
 
 export function runActions(run: Run) {
@@ -141,7 +147,8 @@ export function recentRuns(runs: Run[]) {
 
 export function runView(run: Run) {
   const report = run.result?.report
-  const blocks = [section(runSummary(run)), section(slackText(formatRun(run)).slice(0, 2900))]
+  const blocks: Record<string, unknown>[] = [section(runSummary(run)), section(slackText(formatRun(run)).slice(0, 2900)),
+    ...(run.recipe?.workSetup ? workSetupBlocks(run.recipe.workSetup) : [])]
   if (report) {
     blocks.push(section(run.view?.checked && run.view?.closed ? '*Checked result*' : '*Worker draft — review the verification above*'))
     for (let i = 0; i < Math.min(report.length, 24000); i += 2400) blocks.push(section(slackText(report.slice(i, i + 2400)).slice(0, 2900)))
@@ -164,6 +171,7 @@ export async function drainFabricDeliveries(options: SlackbotV2Options): Promise
     const text = runSummary(run) + (report ? `\n\n${run.state === 'COMPLETED' ? 'Checked result' : 'Unaccepted worker draft'}:\n${slackText(report.slice(0, 600))}` : '')
     const blocks = [section(runSummary(run)),
       ...(run.recipe ? [section(`*${slackText(run.recipe.title)}* · ${slackText(run.recipe.profileTitle)}\n${run.recipe.roles.map(slackText).join(' → ')}`)] : []),
+      ...(run.recipe?.workSetup ? [{ type: 'section', text: plain(`Method: ${parseWorkSetup(run.recipe.workSetup).method}\nRuntime: ${setupRuntimeTitle(run.recipe.workSetup.runtime)}`) }] : []),
       ...(run.result?.checker?.reason ? [section('*Checker:* ' + slackText(run.result.checker.reason).slice(0, 1700))] : []),
       ...(report ? [section(`*${run.state === 'COMPLETED' ? 'Result preview' : 'Unaccepted draft preview'}*\n${slackText(report.slice(0, 600))}`)] : []), runActions(run)]
     const hash = createHash('sha256').update(delivery.id).digest('hex')

@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto'
 import { exactResumeUrl, resumeMessage, type ResumeBrief, type ResumeSelection } from './fabric-resume'
 import type { Recipe } from './fabric-recipes'
+import { recipeSetups, workSetupBlocks } from './fabric-work-setup'
 
 export type WorkMenu = { capturedAt: number | null; stale: boolean; projects: Array<{ name: string; limited?: boolean;
   items: Array<{ name: string; identifier: string; url: string }> }> }
@@ -110,6 +111,7 @@ export function parseWorkCatalog(value: unknown): WorkCatalog {
         || !string(p.description) || !p.maxCalls || Object.keys(p.maxCalls).sort().join(',') !== 'checker,coordinator,worker'
         || Object.values(p.maxCalls).some(n => !Number.isInteger(n) || n < 1 || n > 100)))) throw new Error('invalid_work_catalog')
   if (new Set(c.recipes.map(r => r.id)).size !== c.recipes.length) throw new Error('duplicate_work_recipe')
+  c.recipes.forEach(recipeSetups)
   return c
 }
 
@@ -133,9 +135,11 @@ export function workRecipesView(catalog: WorkCatalog, brief: ResumeBrief, reques
 }
 
 export function workRecipeView(recipe: WorkRecipe | undefined, brief: ResumeBrief, selection: Extract<WorkSelection, { kind: 'recipe' }>, valueFor: ValueFor) {
+  const setup = recipe ? recipeSetups(recipe)?.selected : undefined
   const blocks: Block[] = recipe && recipe.digest === selection.digest ? [
     section(`${clip(recipe.title, 180)} · ${clip(recipe.version, 40)}\n${clip(recipe.description, 1200)}`),
     section(`For: ${clip(brief.title, 250)}\nTeam: ${recipe.roles.map(r => clip(r, 100)).join(' → ')}`),
+    ...(setup ? workSetupBlocks(setup) : []),
     ...Object.values(recipe.profiles).map(p => section(`${clip(p.title, 100)}\n${clip(p.description, 700)}\nCall limits: ${Object.entries(p.maxCalls).map(([role, n]) => `${role} ${n}`).join(' · ')}`)),
     section(recipe.requiresCheckedResearch ? `Requires accepted research for this exact item and channel.\n${clip(brief.research.message, 700)}` : 'This recipe does not declare a checked-research prerequisite. Fresh run setup is still required.'),
     ...(recipe.adapter ? [section('This recipe needs a compatible prepared resource. Current resource readiness and capacity are not verified by this view.')] : []),

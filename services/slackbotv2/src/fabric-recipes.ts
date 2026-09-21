@@ -9,8 +9,10 @@ import { exactResumeUrl, isResumeAction, parseResumeArtifact, parseResumeBrief, 
 import { isWorkAction, parseWorkCatalog, parseWorkMenu, parseWorkSelection, selectedWorkUrl, workActionMatches,
   workMenuDigest, workMessage, workNavigation, workOverviewView, workPickerView, workRecipesView, workRecipeView,
   workUnavailableView, type WorkSelection } from './fabric-work'
+import { recipeSetups, resolveSetup, setupChoiceFor, setupOptionValue, setupPickerBlock, setupRequestFields,
+  workSetupBlocks, type RecipeSetups, type SetupChoice, type WorkSetupRef } from './fabric-work-setup'
 
-export type Recipe = { id: string; version: string; digest: string; title: string; description: string;
+export type Recipe = RecipeSetups & { id: string; version: string; digest: string; title: string; description: string;
   aliases: string[]; taskType: string; defaultProfile: string; roles: string[];
   profiles: Record<string, { title: string; description: string; maxCalls: Record<string, number> }> }
 type Origin = { teamId: string; channelId: string; userId: string; threadTs: string }
@@ -25,7 +27,7 @@ export function recipeMenu(recipes: Recipe[], availability?: Availability) {
   return { text: 'Choose a recipe for this work. Each recipe includes its team, context and checks.', blocks: [
     section('*Start work*\nChoose a recipe, pick the work item, and review how the team will run it.'),
     ...(availability ? [section(availability.open ? `${availability.remaining} runs available in this batch.` : 'This batch cannot start another run. An operator needs to renew its capacity or admission window.')] : []),
-    ...recipes.flatMap(r => [section(`*${slackText(r.title)}*\n${slackText(r.description)}\n${r.roles.map(slackText).join(' → ')}`),
+    ...recipes.flatMap(r => [section(`*${slackText(r.title)}*\n${slackText(r.description)}\n${r.roles.map(slackText).join(' → ')}${recipeSetups(r) ? '\nDefault setup: ' + slackText(recipeSetups(r)!.selected.title) : ''}`),
       { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'open', text: plain('Choose how to run'), value: r.id }] }]),
     { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'recent', text: plain('Recent work') },
       { type: 'button', action_id: prefix + 'capabilities', text: plain('Capabilities') }] },
@@ -33,25 +35,49 @@ export function recipeMenu(recipes: Recipe[], availability?: Availability) {
   ] }
 }
 
-export function recipeView(recipe: Recipe, metadata: string, work?: WorkMenu) {
+type FormValues = { plane?: string; work?: string; profile?: string }
+export function recipeView(recipe: Recipe, metadata: string, work?: WorkMenu, setup?: SetupChoice, values: FormValues = {}) {
   const options = Object.entries(recipe.profiles).map(([value, p]) => ({ text: plain(p.title), value, description: plain(p.description.slice(0,75)) }))
   const groups = work?.projects.filter(p => p.items.length).slice(0, 10).map(p => ({ label: plain(p.name.slice(0,75)),
     options: p.items.slice(0,30).map(i => ({ text: plain(`${i.identifier} · ${i.name}`.slice(0,75)), value: i.url })) })) ?? []
-  return { type: 'modal', callback_id: prefix + 'submit', title: plain('Start work'), submit: plain('Start'), close: plain('Back'),
-    private_metadata: metadata, blocks: [section(`*${recipe.title}* · ${recipe.version}\n${recipe.description}\n*Team:* ${recipe.roles.join(' → ')}`),
+  const selectedWork = groups.flatMap(g => g.options).find(o => o.value === values.work)
+  const pasted = values.plane || (!selectedWork ? values.work : '')
+  const selectedSetup = resolveSetup(recipe, setup?.selected, setup?.catalogDigest)
+  return { type: 'modal', callback_id: prefix + (setup?.editing ? 'setup_submit' : 'submit'), title: plain(setup?.editing ? 'Change setup' : 'Start work'),
+    submit: plain(setup?.editing ? 'Use setup' : 'Start'), close: plain('Back'),
+    private_metadata: metadata, blocks: [section(`*${slackText(recipe.title)}* · ${slackText(recipe.version)}\n${slackText(recipe.description)}\n*Team:* ${recipe.roles.map(slackText).join(' → ')}`),
       ...(groups.length ? [{ type: 'input', block_id: 'work', optional: true, label: plain('Project and work item'),
         hint: plain('Recent items from enabled projects. The latest objective is read when the work starts.'),
-        element: { type: 'static_select', action_id: 'item', placeholder: plain('Choose work from Plane'), option_groups: groups } }] : []),
+        element: { type: 'static_select', action_id: 'item', placeholder: plain('Choose work from Plane'), option_groups: groups,
+          ...(selectedWork ? { initial_option: selectedWork } : {}) } }] : []),
       ...(work?.stale ? [section('The item list could not be refreshed. You can paste the current Plane link below.')] : []),
       { type: 'input', block_id: 'plane', optional: groups.length > 0, label: plain(groups.length ? 'Or paste a Plane work-item link' : 'Plane work item'),
         hint: plain('Choose one item above or paste one link. Only enabled projects can run.'),
-        element: { type: 'plain_text_input', action_id: 'url', max_length: 500 } },
+        element: { type: 'plain_text_input', action_id: 'url', max_length: 500, ...(pasted ? { initial_value: pasted } : {}) } },
       { type: 'input', block_id: 'profile', label: plain('How to run'),
         element: { type: 'static_select', action_id: 'choice', options,
-          initial_option: options.find(o => o.value === recipe.defaultProfile) } },
-      ...Object.values(recipe.profiles).map(p => section(`*${p.title}:* ${p.description}`)),
+          initial_option: options.find(o => o.value === (values.profile || recipe.defaultProfile)) } },
+      ...Object.values(recipe.profiles).map(p => section(`*${slackText(p.title)}:* ${slackText(p.description)}`)),
+      ...(selectedSetup ? [...workSetupBlocks(selectedSetup),
+        ...(setup?.editing ? [setupPickerBlock(recipe, selectedSetup)] : [{ type: 'actions', elements: [
+          { type: 'button', action_id: prefix + 'setup_change', text: plain('Change setup'), value: 'change' }] }]),
+        { type: 'section', text: plain('A setup describes the method and available tools for this workflow. It does not add capacity or grant new permissions.') }] : []),
       section('Starting creates one run. Hermes coordinates a separate worker and checker. The outcome returns to this thread and the Plane item; temporary access and resources close afterward.')
     ] }
+}
+
+function formValues(payload: any): FormValues {
+  const values = payload.view?.state?.values ?? {}
+  const result = { plane: values.plane?.url?.value ?? '', work: values.work?.item?.selected_option?.value ?? '',
+    profile: values.profile?.choice?.selected_option?.value ?? '' }
+  if (Object.values(result).some(v => typeof v !== 'string')) throw new Error('invalid_form')
+  return result
+}
+function recipeMetadata(origin: Origin, recipe: Recipe, secret: string, setup?: SetupChoice) {
+  const value = seal({ origin, recipe: { id: recipe.id, version: recipe.version, digest: recipe.digest, taskType: recipe.taskType },
+    ...(setup ? { setup } : {}) }, secret)
+  if (value.length > 3000) throw new Error('recipe_metadata_too_large')
+  return value
 }
 
 function seal(value: unknown, secret: string) {
@@ -66,9 +92,11 @@ function unseal(raw: string, secret: string): any {
   return JSON.parse(body)
 }
 
-export function recipeRequest(recipe: Recipe, profile: string, planeUrl: string, origin: Origin, eventKey: string) {
+export function recipeRequest(recipe: Recipe, profile: string, planeUrl: string, origin: Origin, eventKey: string, setup?: WorkSetupRef) {
+  const chosen = setup ?? recipeSetups(recipe)?.selected
   return { ...origin, requestId: 'recipe-' + createHash('sha256').update(origin.teamId + ':' + eventKey).digest('hex').slice(0, 24),
-    taskType: recipe.taskType, planeUrl, recipeId: recipe.id, recipeVersion: recipe.version, recipeDigest: recipe.digest, profile }
+    taskType: recipe.taskType, planeUrl, recipeId: recipe.id, recipeVersion: recipe.version, recipeDigest: recipe.digest, profile,
+    ...setupRequestFields(chosen) }
 }
 
 export async function handleRecipeWebhook(request: Request, raw: string, options: SlackbotV2Options,
@@ -86,13 +114,19 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const workSubmission = payload.type === 'view_submission' && payload.view?.callback_id === 'fabric_work_submit'
   const navigation = payload.type === 'block_actions' && [prefix+'recent', prefix+'menu', prefix+'details', prefix+'plane', prefix+'capabilities'].includes(action?.action_id)
   const submission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'submit'
-  if (!mention && !opening && !submission && !navigation && !resumeNavigation && !workNavigationAction && !workSubmission) return
+  const setupChange = payload.type === 'block_actions' && action?.action_id === prefix + 'setup_change'
+  const setupSubmission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'setup_submit'
+  if (!mention && !opening && !submission && !navigation && !resumeNavigation && !workNavigationAction && !workSubmission && !setupChange && !setupSubmission) return
   const signed = verifySlackRequest({ nowMs: Date.now(), rawBody: raw, signingSecret: options.signingSecret,
     signature: request.headers.get('x-slack-signature') ?? undefined, timestamp: request.headers.get('x-slack-request-timestamp') ?? undefined })
   if (!signed.ok) return new Response('invalid request', { status: 401 })
   let saved: any
-  if (submission) {
-    try { saved = unseal(payload.view.private_metadata, options.signingSecret) } catch { return new Response('invalid view', { status: 403 }) }
+  if (submission || setupChange || setupSubmission) {
+    try {
+      saved = unseal(payload.view.private_metadata, options.signingSecret)
+      if (!saved.origin || !['teamId', 'channelId', 'userId', 'threadTs'].every(k => typeof saved.origin[k] === 'string' && saved.origin[k])
+        || ((setupChange || setupSubmission) && (!saved.setup || (setupSubmission && saved.setup.editing !== true)))) throw new Error('invalid_view')
+    } catch { return new Response('invalid view', { status: 403 }) }
   }
   let workSelection: WorkSelection | undefined
   if (workNavigationAction || workSubmission) {
@@ -120,12 +154,38 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     threadTs: event?.thread_ts ?? event?.ts ?? payload.message?.thread_ts ?? payload.message?.ts ?? saved?.origin.threadTs }
   if (!options.launcherAllowedTeamIds?.includes(origin.teamId) || !options.launcherAllowedChannelIds?.includes(origin.channelId)
       || !options.launcherAllowedUserIds?.includes(origin.userId) || (saved && (saved.origin.userId !== origin.userId || saved.origin.teamId !== origin.teamId))
-      || ((resumeNavigation || workNavigationAction || workSubmission) && saved.origin.channelId !== origin.channelId)) {
+      || ((submission || setupChange || setupSubmission || resumeNavigation || workNavigationAction || workSubmission) && saved.origin.channelId !== origin.channelId)) {
     return new Response('not allowed', { status: 403 })
   }
   const query = new URLSearchParams({ teamId: origin.teamId, channelId: origin.channelId, userId: origin.userId })
   const reply = (body: Record<string, unknown>) => slack(options, 'chat.postMessage', { ...body,
     channel: origin.channelId, thread_ts: origin.threadTs, unfurl_links: false, unfurl_media: false })
+  if (setupChange || setupSubmission) {
+    try {
+      const [catalog, menu] = await Promise.all([intake(options, '/v1/recipe-catalog?' + query), intake(options, '/v1/work-items?' + query)])
+      if (!catalog.ok || !menu.ok) return new Response('retry', { status: 503 })
+      const recipe = parseWorkCatalog(catalog.value).recipes.find(r => r.id === saved.recipe.id)
+      if (!recipe || recipe.digest !== saved.recipe.digest || recipe.version !== saved.recipe.version) throw new Error('work_setup_changed')
+      const old = resolveSetup(recipe, saved.setup.selected, saved.setup.catalogDigest)
+      if (!old) throw new Error('work_setup_unavailable')
+      let selected = old
+      if (setupSubmission) {
+        const choice = payload.view.state?.values?.work_setup?.choice?.selected_option?.value
+        selected = recipeSetups(recipe)!.setups.find(s => s.status === 'qualified' && setupOptionValue(s) === choice)!
+        if (!selected) throw new Error('work_setup_unavailable')
+      }
+      const setup = { ...setupChoiceFor(recipe, selected)!, ...(setupChange ? { editing: true } : {}) }
+      const view = recipeView(recipe, recipeMetadata(origin, recipe, options.signingSecret, setup), menu.value as WorkMenu, setup, formValues(payload))
+      if (setupSubmission) return Response.json({ response_action: 'update', view })
+      await slack(options, 'views.update', { view_id: payload.view.id, hash: payload.view.hash, view })
+      return new Response('ok')
+    } catch {
+      if (setupSubmission) return Response.json({ response_action: 'errors', errors: { work_setup: 'This setup changed or is unavailable. Close this form and open the current recipe again.' } })
+      await slack(options, 'views.update', { view_id: payload.view.id, hash: payload.view.hash, view: {
+        type: 'modal', title: plain('Setup unavailable'), close: plain('Close'), blocks: [section('This setup changed or is unavailable. Open the current recipe again. Nothing was started.')] } })
+      return new Response('ok')
+    }
+  }
   const workValueFor = (selection: WorkSelection) => {
     const value = seal({ origin, work: selection }, options.signingSecret)
     if (value.length > 2000) throw new Error('work_selection_too_large')
@@ -273,10 +333,20 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     const selected = values.work?.item?.selected_option?.value ?? ''
     if ((!pasted && !selected) || (pasted && selected)) return Response.json({ response_action:'errors', errors:{plane:'Choose one item or paste one link, then start.'} })
     const planeUrl = pasted || selected
-    const result = await intake(options, '/v1/runs', recipeRequest(saved.recipe, profile, planeUrl, origin, payload.view.id))
+    if (saved.setup?.editing) return Response.json({ response_action: 'errors', errors: { profile: 'Review the chosen setup before starting.' } })
+    if (saved.setup) {
+      const catalog = await intake(options, '/v1/recipe-catalog?' + query)
+      if (!catalog.ok) return new Response('retry', { status: 503 })
+      try {
+        const recipe = parseWorkCatalog(catalog.value).recipes.find(r => r.id === saved.recipe.id)
+        if (!recipe || recipe.digest !== saved.recipe.digest || recipe.version !== saved.recipe.version) throw new Error('work_setup_changed')
+        resolveSetup(recipe, saved.setup.selected, saved.setup.catalogDigest)
+      } catch { return Response.json({ response_action: 'errors', errors: { profile: 'The recipe or work setup changed. Close this form and open the current recipe again.' } }) }
+    }
+    const result = await intake(options, '/v1/runs', recipeRequest(saved.recipe, profile, planeUrl, origin, payload.view.id, saved.setup?.selected))
     if (!result.ok) {
       if (result.status >= 500) return new Response('retry', { status: 503 })
-      const key = /PROFILE|RECIPE/.test(result.value.error ?? '') ? 'profile' : 'plane'
+      const key = /PROFILE|RECIPE|WORK_SETUP/.test(result.value.error ?? '') ? 'profile' : 'plane'
       return Response.json({ response_action: 'errors', errors: { [key]: refusalText(result.value.error) } })
     }
     return Response.json({ response_action: 'clear' })
@@ -288,8 +358,9 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     const recipe = recipes.find(r => r.id === action.value)
     if (!recipe) return new Response('unknown recipe', { status: 409 })
     const work = await intake(options, '/v1/work-items?' + query)
+    const setup = setupChoiceFor(recipe)
     await slack(options, 'views.open', { trigger_id: payload.trigger_id,
-      view: recipeView(recipe, seal({ origin, recipe: { id: recipe.id, version: recipe.version, digest: recipe.digest, taskType: recipe.taskType } }, options.signingSecret), work.ok ? work.value as WorkMenu : undefined) })
+      view: recipeView(recipe, recipeMetadata(origin, recipe, options.signingSecret, setup), work.ok ? work.value as WorkMenu : undefined, setup) })
     return new Response('ok')
   }
   if (/^fabric\s+recipes\s*$/i.test(text) || (navigation && action.action_id === prefix+'menu')) {
@@ -316,6 +387,7 @@ export function refusalText(error: unknown) {
     WAITING_CAPACITY:'This batch has no runs left. An operator needs to add a fresh batch.',
     ADMISSION_EXPIRED:'This batch has expired. An operator needs to renew it before work can start.',
     RECIPE_CHANGED_REFRESH_MENU:'This recipe changed. Close this form and open the menu again.',
+    WORK_SETUP_CHANGED_REFRESH_MENU:'This work setup changed. Close this form and open the menu again.',
     PLANE_PROJECT_OUTSIDE_ALLOWLIST:'This project is not enabled. Choose an item from an enabled project.',
     INVALID_PLANE_URL:'Paste a work-item link from the connected Plane workspace.',
     INVALID_PLANE_ITEM_PATH:'Paste a link to a specific Plane work item.',

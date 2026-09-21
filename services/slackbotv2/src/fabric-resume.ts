@@ -1,7 +1,7 @@
 /** Read-only views over the fabric's receipt-derived work history. */
 import { createHash } from 'node:crypto'
 
-export const ARTIFACT_KINDS = ['report', 'gpuResult', 'softwareSource', 'softwareHtml', 'softwareResult'] as const
+export const ARTIFACT_KINDS = ['report', 'gpuResult', 'softwareSource', 'softwareHtml', 'softwareResult', 'workflowResult'] as const
 type ArtifactKind = typeof ARTIFACT_KINDS[number]
 export type ArtifactRef = { runId: string; requestId: string; generation: string; kind: ArtifactKind;
   sha256: string; byteLength: number; mediaType: string }
@@ -39,6 +39,7 @@ const softwareArtifacts = {
   softwareSource: { label: 'Source', mediaType: 'text/x-python; charset=utf-8' },
   softwareHtml: { label: 'HTML', mediaType: 'text/html; charset=utf-8' },
   softwareResult: { label: 'Execution receipt', mediaType: 'application/json' },
+  workflowResult: { label: 'Workflow receipt', mediaType: 'application/json' },
 } as const
 const softwareArtifact = (kind: ArtifactKind) => kind in softwareArtifacts
   ? softwareArtifacts[kind as keyof typeof softwareArtifacts] : undefined
@@ -204,5 +205,5 @@ export function resumeFeedbackView(b: ResumeBrief, s: Extract<ResumeSelection, {
 }
 
 export function isResumeAction(value: unknown): boolean {
-  return string(value) && /^(fabric_resume_history(?:_newer|_older)?|fabric_resume_artifact(?:_report|_gpuResult|_softwareSource|_softwareHtml|_softwareResult|_previous|_next)?|fabric_resume_feedback(?:_previous|_next)?|fabric_resume_plane)$/.test(value)
+  return string(value) && /^(fabric_resume_history(?:_newer|_older)?|fabric_resume_artifact(?:_report|_gpuResult|_softwareSource|_softwareHtml|_softwareResult|_workflowResult|_previous|_next)?|fabric_resume_feedback(?:_previous|_next)?|fabric_resume_plane)$/.test(value)
 }

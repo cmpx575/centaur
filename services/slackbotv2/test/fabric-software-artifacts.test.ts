@@ -10,6 +10,7 @@ const url = 'https://plane.example.test/workspace/projects/project/issues/item/'
 const items = [
   { kind: 'softwareSource', content: 'print("<@USER> & 雪")\n', mediaType: 'text/x-python; charset=utf-8', label: 'Source' },
   { kind: 'softwareHtml', content: '<!doctype html>\n<html><body>&lt;script&gt; &amp; café</body></html>\n', mediaType: 'text/html; charset=utf-8', label: 'HTML' },
+  { kind: 'workflowResult', content: '{"status":"COMPLETED","stages":["plan","review","implement","verify"]}', mediaType: 'application/json', label: 'Workflow receipt' },
   { kind: 'softwareResult', content: '{"status":"COMPLETED","childAbsent":true}\n', mediaType: 'application/json', label: 'Execution receipt' },
 ] as const
 const reference = (kind: ArtifactRef['kind'], content: string, mediaType: string): ArtifactRef => ({
@@ -32,12 +33,12 @@ const brief = (): ResumeBrief => ({ schemaVersion: 1, observedAt: 1790000000, pl
 const buttons = (view: any) => view.blocks.flatMap((b: any) => b.elements ?? []).filter((e: any) => e.type === 'button')
 const valueFor = (selection: ResumeSelection) => JSON.stringify(selection)
 
-test('one software attempt exposes the exact four artifacts with distinct read-only labels', () => {
+test('one software attempt exposes the exact five artifacts with distinct read-only labels', () => {
   const b = parseResumeBrief(brief(), url)
-  expect(b.attempts[0]!.evidence).toHaveLength(4)
-  expect(ARTIFACT_KINDS).toEqual(['report', 'gpuResult', 'softwareSource', 'softwareHtml', 'softwareResult'])
+  expect(b.attempts[0]!.evidence).toHaveLength(5)
+  expect(ARTIFACT_KINDS).toEqual(['report', 'gpuResult', 'softwareSource', 'softwareHtml', 'softwareResult', 'workflowResult'])
   const view = resumeHistoryView(b, 0, valueFor)
-  expect(buttons(view).slice(0, 4).map((b: any) => b.text.text)).toEqual(['Read checked report', 'Source', 'HTML', 'Execution receipt'])
+  expect(buttons(view).slice(0, 5).map((b: any) => b.text.text)).toEqual(['Read checked report', 'Source', 'HTML', 'Workflow receipt', 'Execution receipt'])
   for (const kind of ARTIFACT_KINDS) expect(isResumeAction('fabric_resume_artifact_' + kind)).toBe(true)
   expect(buttons(view).every((b: any) => !/start|retry|launch|share/i.test(b.text.text))).toBe(true)
 })
@@ -55,7 +56,7 @@ test('unknown duplicate crossed identity and wrong software media types fail clo
     const ref = reference(item.kind, item.content, item.mediaType)
     expect(parseResumeSelection({ kind: 'artifact', planeUrl: url, page: 0, reference: ref })).toMatchObject({ reference: ref })
     expect(() => parseResumeSelection({ kind: 'artifact', planeUrl: url, page: 0, reference: { ...ref, mediaType: 'text/plain' } })).toThrow()
-    if (item.kind !== 'softwareResult') expect(() => parseResumeSelection({ kind: 'artifact', planeUrl: url, page: 0,
+    if (item.mediaType !== 'application/json') expect(() => parseResumeSelection({ kind: 'artifact', planeUrl: url, page: 0,
       reference: { ...ref, mediaType: ref.mediaType.replace('; ', ';') } })).toThrow()
   }
 })
