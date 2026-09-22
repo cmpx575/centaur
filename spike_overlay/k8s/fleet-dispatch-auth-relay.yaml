@@ -1,0 +1,150 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-dispatch-auth-relay-nginx
+  namespace: spike-centaur
+data:
+  default.conf.template: |
+    server {
+      listen 8799;
+
+      location = /readyz {
+        default_type text/plain;
+        return 200 "ok\n";
+      }
+
+      location / {
+        proxy_pass http://fleet-dispatch-lan.spike-centaur.svc.cluster.local:8799;
+        proxy_set_header Authorization "Bearer ${FLEET_DISPATCH_TOKEN}";
+        proxy_set_header Host macbook-pro-nipun.tail0b8caf.ts.net:8799;
+        proxy_pass_request_headers on;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-dispatch-auth-relay
+  namespace: spike-centaur
+  labels:
+    app.kubernetes.io/name: fleet-dispatch-auth-relay
+    app.kubernetes.io/part-of: centaur-slack-launcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fleet-dispatch-auth-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fleet-dispatch-auth-relay
+        app.kubernetes.io/part-of: centaur-slack-launcher
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          env:
+            - name: FLEET_DISPATCH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: centaur-infra-env
+                  key: FLEET_DISPATCH_TOKEN
+          ports:
+            - name: http
+              containerPort: 8799
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/templates/default.conf.template
+              subPath: default.conf.template
+      volumes:
+        - name: config
+          configMap:
+            name: fleet-dispatch-auth-relay-nginx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleet-dispatch-auth-relay
+  namespace: spike-centaur
+  labels:
+    app.kubernetes.io/name: fleet-dispatch-auth-relay
+spec:
+  selector:
+    app.kubernetes.io/name: fleet-dispatch-auth-relay
+  ports:
+    - name: http
+      port: 8799
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-dispatch-auth-relay
+  namespace: spike-centaur
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: fleet-dispatch-auth-relay
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              centaur.ai/component: workflow-run
+      ports:
+        - protocol: TCP
+          port: 8799
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: fleet-dispatch-lan
+      ports:
+        - protocol: TCP
+          port: 8799
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workflow-run-to-fleet-dispatch-auth-relay
+  namespace: spike-centaur
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/component: workflow-run
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: fleet-dispatch-auth-relay
+      ports:
+        - protocol: TCP
+          port: 8799

@@ -1,0 +1,22 @@
+{
+  "type": "block_actions",
+  "team": { "id": "T_ALLOWED", "domain": "cmpx575-test" },
+  "user": { "id": "U_ALLOWED", "username": "noor" },
+  "api_app_id": "A0BE6AFS4RM",
+  "trigger_id": "trigger-test-001",
+  "channel": { "id": "C_ALLOWED", "name": "centaur-test" },
+  "container": {
+    "type": "message",
+    "channel_id": "C_ALLOWED",
+    "message_ts": "1783700000.000100"
+  },
+  "actions": [
+    {
+      "action_id": "centaur.launch.experiment.v1",
+      "block_id": "centaur_launcher_actions",
+      "type": "button",
+      "value": "experiment",
+      "action_ts": "1783700001.000200"
+    }
+  ]
+}
