@@ -16,6 +16,7 @@ async function fixture(work: (send: (payload:any, signed?:boolean)=>Promise<Resp
     const path=new URL(String(url)).pathname,body=init.body?JSON.parse(init.body):undefined;calls.push({path,body})
     if(path==='/v1/runs' && init.method==='GET')return Response.json({runs:[]})
     if(path==='/v1/recipes')return Response.json({recipes:[recipe]})
+    if(path==='/v1/recipe-catalog')return Response.json({recipes:[recipe],launchEnabled:false,scope:'Read-only catalog; admission and capacity are not verified.'})
     if(path==='/v1/work-items')return Response.json({projects:[{name:'Research',items:[{name:'Review prior work',identifier:'RES-1',url:'https://plane.example.test/work'}]}],stale:false})
     if(path==='/v1/runs' && init.method==='POST')return failure?Response.json({error:failure},{status:failure==='TEMPORARY'?503:409}):Response.json({created:true},{status:202})
     if(path==='/api/chat.postMessage')return Response.json({ok:true,ts:'2'})

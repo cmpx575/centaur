@@ -344,11 +344,14 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     }
     return Response.json({ response_action: 'clear' })
   }
-  const result = await intake(options, '/v1/recipes?' + query)
-  if (!result.ok) return new Response('retry', { status: result.status >= 500 ? 503 : 403 })
-  const recipes = result.value.recipes as Recipe[]
   if (opening) {
-    const recipe = recipes.find(r => r.id === action.value)
+    // Opening and editing are previews. Consumed capacity must not hide their
+    // catalog; admission is checked only by the unchanged Start submission.
+    const catalog = await intake(options, '/v1/recipe-catalog?' + query)
+    if (!catalog.ok) return new Response('retry', { status: catalog.status >= 500 ? 503 : 403 })
+    let recipe: Recipe | undefined
+    try { recipe = parseWorkCatalog(catalog.value).recipes.find(r => r.id === action.value) }
+    catch { return new Response('catalog unavailable', { status: 503 }) }
     if (!recipe) return new Response('unknown recipe', { status: 409 })
     const work = await intake(options, '/v1/work-items?' + query)
     const setup = setupChoiceFor(recipe)
@@ -356,6 +359,9 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
       view: recipeView(recipe, recipeMetadata(origin, recipe, options.signingSecret, setup), work.ok ? work.value as WorkMenu : undefined, setup) })
     return new Response('ok')
   }
+  const result = await intake(options, '/v1/recipes?' + query)
+  if (!result.ok) return new Response('retry', { status: result.status >= 500 ? 503 : 403 })
+  const recipes = result.value.recipes as Recipe[]
   if (/^fabric\s+recipes\s*$/i.test(text) || (navigation && action.action_id === prefix+'menu')) {
     waitUntil(reply(recipeMenu(recipes, result.value.availability)))
     return new Response('ok')

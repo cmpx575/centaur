@@ -91,6 +91,46 @@ test('searchable Change setup is read-only and preserves item/profile into exact
   expect(calls.find(c => c.path === '/v1/runs').body).toMatchObject({ workSetupId: bounded.id, workSetupVersion: bounded.version, workSetupDigest: bounded.digest, planeUrl: url, profile: 'full' })
 }))
 
+test('the setup preview opens and restores its default with no remaining recipe capacity', () => fixture(async (send, calls, _current, options) => {
+  const original = options.fetch
+  let capacityReads = 0
+  options.fetch = async (input: any, init: any) => {
+    if (new URL(String(input)).pathname === '/v1/recipes') {
+      capacityReads++
+      return Response.json({ recipes: [], availability: { remaining: 0, open: false, admitUntil: 0 } })
+    }
+    return original(input, init)
+  }
+  expect((await send(opening)).status).toBe(200)
+  let preview = lastView(calls)
+  for (const chosen of [bounded, human]) {
+    expect((await send(change(preview))).status).toBe(200)
+    const picker = lastView(calls)
+    expect(picker.submit.text).toBe('Use setup')
+    const result = await (await send(submission(picker, { ...values(),
+      work_setup: { choice: { selected_option: { value: setupOptionValue(chosen) } } } }))).json()
+    expect(result.response_action).toBe('update')
+    preview = result.view
+    expect(JSON.stringify(preview.blocks)).toContain('Work setup: ' + chosen.title)
+    expect(preview.blocks.find((b: any) => b.block_id === 'work').element.initial_option.value).toBe(url)
+    expect(preview.blocks.find((b: any) => b.block_id === 'profile').element.initial_option.value).toBe('full')
+  }
+  expect(capacityReads).toBe(0)
+  const reads = calls.filter(c => c.path.startsWith('/v1/'))
+  expect(reads.every(c => c.method === 'GET' && ['/v1/recipe-catalog', '/v1/work-items'].includes(c.path))).toBe(true)
+  expect(reads.filter(c => c.path === '/v1/recipe-catalog')).toHaveLength(5)
+  expect(reads.every(c => JSON.stringify(c.query) === JSON.stringify({ teamId: 'T1', channelId: 'C1', userId: 'U1' }))).toBe(true)
+}))
+
+test('opening a setup rejects an invalid discovery contract and never falls back to launch eligibility', () => fixture(async (send, calls, current, options) => {
+  const original = options.fetch
+  options.fetch = async (input: any, init: any) => new URL(String(input)).pathname === '/v1/recipe-catalog'
+    ? Response.json({ recipes: current, launchEnabled: true, scope: 'Not a read-only catalog.' }) : original(input, init)
+  expect((await send(opening)).status).toBe(503)
+  expect(lastView(calls)).toBeUndefined()
+  expect(calls.filter(c => c.path.startsWith('/v1/'))).toHaveLength(0)
+}))
+
 test('setup picker rejects changed catalogs, invented options and unsupported candidates without starting', () => fixture(async (send, calls, current) => {
   await send(opening); await send(change(lastView(calls))); const picker = lastView(calls)
   const select = (value: string) => submission(picker, { ...values(), work_setup: { choice: { selected_option: { value } } } })
@@ -104,6 +144,7 @@ test('setup picker rejects changed catalogs, invented options and unsupported ca
 
 test('a newly stale signed Start sends its frozen tuple and surfaces backend 409 without substituting the default', () => fixture(async (send, calls, current, options) => {
   await send(opening); const view = lastView(calls), original = options.fetch
+  calls.length = 0
   current[0]!.workSetups![0]!.digest = 'd'.repeat(64); current[0]!.defaultWorkSetup = setupRef(current[0]!.workSetups![0]!)
   let posts = 0
   options.fetch = async (input: any, init: any) => {
@@ -187,6 +228,7 @@ test('durable final delivery and run details display the actual frozen setup and
 
 test('repeated signed Start reaches the immutable run after a lost response, consumed capacity and changed catalog', () => fixture(async (send, calls, current, options) => {
   await send(opening); const view = lastView(calls), original = options.fetch
+  calls.length = 0
   let committed: Record<string, string> | undefined, commits = 0, posts = 0
   options.fetch = async (input: any, init: any) => {
     const path = new URL(String(input)).pathname
