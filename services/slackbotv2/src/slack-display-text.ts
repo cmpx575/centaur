@@ -1,3 +1,5 @@
+import { escapeRegExp } from './utils'
+
 export type SlackDisplayTextSource = 'text' | 'raw_blocks' | 'raw_attachments' | 'empty'
 
 export type SlackDisplayText = {
@@ -5,6 +7,18 @@ export type SlackDisplayText = {
   rawBlockCount: number
   source: SlackDisplayTextSource
   text: string
+}
+
+export function slackRichTextMentionsUser(raw: unknown, userId: string | undefined): boolean {
+  if (!userId) return false
+  const mention = new RegExp(`<@${escapeRegExp(userId)}(?:\\|[^>]*)?>`, 'i')
+  for (const record of slackMessageRecords(raw)) {
+    for (const key of ['blocks', 'attachments']) {
+      const value = record[key]
+      if (Array.isArray(value) && richValueMentionsUser(value, userId, mention)) return true
+    }
+  }
+  return false
 }
 
 const MAX_RAW_DISPLAY_TEXT_CHARS = 24_000
@@ -165,6 +179,18 @@ function collectRawAttachmentLines(records: UnknownRecord[]): string[] {
     for (const attachment of attachments) collectSlackAttachmentText(attachment, lines)
   }
   return lines
+}
+
+function richValueMentionsUser(value: unknown, userId: string, mention: RegExp): boolean {
+  if (typeof value === 'string') return mention.test(value)
+  if (Array.isArray(value)) {
+    return value.some(item => richValueMentionsUser(item, userId, mention))
+  }
+  if (!isRecord(value)) return false
+  if (value.type === 'user' && stringField(value.user_id).toUpperCase() === userId.toUpperCase()) {
+    return true
+  }
+  return Object.values(value).some(item => richValueMentionsUser(item, userId, mention))
 }
 
 function collectSlackAttachmentText(value: unknown, lines: string[]): void {

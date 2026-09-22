@@ -109,6 +109,7 @@ export type SlackLauncherOptions = {
   allowedTeamIds: readonly string[]
   allowedUserIds: readonly string[]
   apiKey?: string
+  workflowSigningSecret?: string
   apiUrl: string
   botToken: string
   fetch?: SlackbotV2Fetch
@@ -1653,7 +1654,10 @@ async function centaurApi(
 ): Promise<JsonRecord> {
   const fetcher = options.fetch ?? globalThis.fetch
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (options.apiKey) headers.Authorization = `Bearer ${options.apiKey}`
+  const token = options.workflowSigningSecret
+    ? launcherWorkflowToken(options.workflowSigningSecret, options.now?.() ?? Date.now())
+    : options.apiKey
+  if (token) headers.Authorization = `Bearer ${token}`
   const response = await fetcher(`${options.apiUrl.replace(/\/+$/, '')}${path}`, {
     method: request.method ?? 'GET',
     headers,
@@ -1663,6 +1667,21 @@ async function centaurApi(
     throw new LauncherRequestError(`centaur_api_http_${response.status}`, response.status)
   }
   return asRecord(await response.json().catch(() => ({})))
+}
+
+/** Short-lived workflow-only identity for the separately allowlisted launcher.
+ * Normal Slack session traffic continues to use the ingress API key. Never
+ * issue console_service or sandbox/session/admin capabilities from this path.
+ */
+export function launcherWorkflowToken(signingSecret: string, nowMs: number): string {
+  const now = Math.floor(nowMs / 1000)
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
+  const input = `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode({
+    iss: 'centaur-console', aud: 'centaur-api', sub: 'centaur-slack-launcher',
+    iat: now, nbf: now - 5, exp: now + 60,
+    capabilities: { sessions_read: false, workflows_read: true, workflows_write: true }
+  })}`
+  return `${input}.${createHmac('sha256', signingSecret).update(input).digest('base64url')}`
 }
 
 function parseInteractionPayload(

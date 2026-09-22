@@ -1,6 +1,7 @@
 import { createHmac } from 'node:crypto'
 import {
   createServer,
+  request as httpRequest,
   type IncomingMessage,
   type Server as HttpServer,
   type ServerResponse
@@ -17,12 +18,14 @@ import {
   type SlackbotV2,
   type SlackbotV2AppendMessagesRequest,
   type SlackbotV2ApiMessage,
+  type SlackbotV2BlockActionPayload,
   type SlackbotV2CreateSessionRequest,
   type SlackbotV2ExecuteSessionRequest,
   type SlackbotV2SessionMessage
 } from '../src/index'
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
 import { slackbotMetrics } from '../src/metrics'
+import { createOpenAiMessageOverridesStrategy } from '../src/message-overrides-strategy'
 import claudeSettings from '../../../harness/claude/settings.json'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
@@ -36,6 +39,7 @@ const TEAM_ID = 'T000000001'
 const CHANNEL_ID = 'C000000001'
 /** How real Slack renders a streamed message whose stream broke or was never stopped. */
 const BROKEN_STREAM_TEXT = ':warning: Something went wrong'
+const SLACK_MARKDOWN_TEXT_MAX_CHARS = 12_000
 
 function contentTextWithHeading(
   content: Array<{ text?: string; type: string }>,
@@ -58,6 +62,7 @@ let slackApi: PatchedSlackApi
 let codexApi: MockSessionApi
 let slack: WebClient
 let slackB: WebClient
+let slackBot: WebClient
 let slackApiUrl: string
 let bot: SlackbotV2
 
@@ -69,7 +74,16 @@ beforeAll(async () => {
       tokens: {
         [BOT_TOKEN]: {
           login: BOT_USER_ID,
-          scopes: ['assistant:write', 'chat:write', 'channels:read', 'users:read']
+          scopes: [
+            'assistant:write',
+            'channels:join',
+            'channels:read',
+            'chat:write',
+            'im:read',
+            'im:write',
+            'im:history',
+            'users:read'
+          ]
         },
         [USER_TOKEN]: {
           login: USER_ID,
@@ -97,6 +111,7 @@ beforeAll(async () => {
   slackApiUrl = `${slackApi.url}/api/`
   slack = new WebClient(USER_TOKEN, { slackApiUrl })
   slackB = new WebClient(USER_B_TOKEN, { slackApiUrl })
+  slackBot = new WebClient(BOT_TOKEN, { slackApiUrl })
 })
 
 beforeEach(() => {
@@ -114,6 +129,61 @@ afterAll(async () => {
 })
 
 describe('slackbotv2', () => {
+  for (const agentViewEnabled of [false, true]) {
+    it(`routes DM roots and replies with agent view ${agentViewEnabled}`, async () => {
+      bot = createTestBot({ agentViewEnabled })
+      const members = await slackBot.users.list({})
+      const userId = members.members?.find(member => member.name === 'tester')?.id
+      expect(userId).toBeDefined()
+      const dm = await slackBot.conversations.open({ users: userId! })
+      expect(dm.channel?.id).toBeDefined()
+      const channel = dm.channel!.id!
+      // A prior legacy DM leaves this subscription behind when the toggle is
+      // enabled. Agent mode must still use the new user message as its root.
+      if (agentViewEnabled) await bot.chat.getState().subscribe(`slack:${channel}:`)
+      const roots: string[] = []
+      for (let turn = 0; turn < 2; turn++) {
+        const posted = await slackBot.chat.postMessage({ channel, text: `DM request ${turn}` })
+        expect(posted.ts).toBeDefined()
+        roots.push(posted.ts!)
+        const waits: Promise<unknown>[] = []
+        const response = await bot.app.request('/api/webhooks/slack', signedSlackEvent({
+          event_id: `Ev-agent-dm-${turn}`,
+          event: {
+            type: 'message', channel_type: 'im', channel, user: USER_ID,
+            ts: posted.ts, text: `DM request ${turn}`
+          }
+        }), {}, waitUntilContext(waits))
+        expect(response.status).toBe(200)
+        await Promise.all(waits)
+        const delivered = agentViewEnabled
+          ? await slackBot.conversations.replies({ channel, ts: posted.ts! })
+          : await slackBot.conversations.history({ channel })
+        const answerText = (delivered.messages ?? [])
+          .map(message => [message.text ?? '', blocksText(message.blocks)].join('\n'))
+          .join('\n')
+        expect(answerText).toContain(`Executed request ${turn + 1}.`)
+      }
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual(
+        roots.map(ts => `slack:${channel}:${agentViewEnabled ? ts : ''}`)
+      )
+      const reply = await slackBot.chat.postMessage({ channel, thread_ts: roots[0], text: 'Follow up' })
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request('/api/webhooks/slack', signedSlackEvent({
+        event_id: 'Ev-agent-dm-reply',
+        event: {
+          type: 'message', channel_type: 'im', channel, user: USER_ID,
+          ts: reply.ts, thread_ts: roots[0], text: 'Follow up'
+        }
+      }), {}, waitUntilContext(waits))
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+      expect(codexApi.executes.at(-1)?.threadKey).toBe(`slack:${channel}:${roots[0]}`)
+      expect(slackApi.calls.some(call => call.method === 'chat.stopStream')).toBe(true)
+      expect(slackApi.calls.some(call => call.method === 'agents.sessions.rename')).toBe(agentViewEnabled)
+    })
+  }
+
   it('accepts Slack events on the legacy route', async () => {
     const parent = await postUserMessage('Legacy route context.')
     const mention = await postUserMessage(`<@${BOT_USER_ID}> use the legacy route`, parent.ts)
@@ -142,13 +212,406 @@ describe('slackbotv2', () => {
     expect(codexApi.executes[0]?.threadKey).toBe(threadKey(parent.ts))
   })
 
-  it('syncs thread context, forwards subscribed messages, and renders execute streams', async () => {
+  it('joins newly-created public channels', async () => {
+    bot = createTestBot({ autoJoinCreatedChannels: true })
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-created',
+        event: {
+          type: 'channel_created',
+          channel: {
+            id: 'CNEWCHANNEL',
+            name: 'new-channel',
+            created: 1700000000,
+            creator: USER_ID
+          },
+          team: TEAM_ID
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(slackApi.calls).toContainEqual({
+      method: 'conversations.join',
+      body: { channel: 'CNEWCHANNEL' }
+    })
+    expect(codexApi.creates).toHaveLength(0)
+    expect(codexApi.appends).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
+  })
+
+  it('does not join newly-created public channels when auto-join is disabled', async () => {
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-created-disabled',
+        event: {
+          type: 'channel_created',
+          channel: {
+            id: 'CDISABLEDCHANNEL',
+            name: 'disabled-channel',
+            created: 1700000000,
+            creator: USER_ID
+          },
+          team: TEAM_ID
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(slackApi.calls.filter(call => call.method === 'conversations.join')).toEqual([])
+  })
+
+  it('logs conversations.join failures without failing the webhook', async () => {
+    const logs: CapturedLog[] = []
+    bot = createTestBot({ autoJoinCreatedChannels: true, logger: captureLogger(logs) })
+    slackApi.respondToNextConversationsJoin(500, { ok: false, error: 'server_error' })
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-created-failure',
+        event: {
+          type: 'channel_created',
+          channel: {
+            id: 'CFAILEDCHANNEL',
+            name: 'failed-channel',
+            created: 1700000000,
+            creator: USER_ID
+          },
+          team: TEAM_ID
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(slackApi.calls).toContainEqual({
+      method: 'conversations.join',
+      body: { channel: 'CFAILEDCHANNEL' }
+    })
+    expect(hasLog(logs, 'slackbotv2_channel_created_join_failed')).toBe(true)
+  })
+
+  it('logs already joined from Slack warning responses', async () => {
+    for (const [suffix, slackResponse] of [
+      ['top-level', { ok: true, warning: 'already_in_channel' }],
+      [
+        'metadata',
+        { ok: true, response_metadata: { warnings: ['already_in_channel'] } }
+      ]
+    ] as const) {
+      const logs: CapturedLog[] = []
+      bot = createTestBot({
+        allowedExternalTeamIds: ['TEVENTTEAM'],
+        autoJoinCreatedChannels: true,
+        logger: captureLogger(logs)
+      })
+      slackApi.respondToNextConversationsJoin(200, slackResponse)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: `Ev-slackbotv2-channel-created-already-joined-${suffix}`,
+          event: {
+            type: 'channel_created',
+            channel: {
+              id: `CALREADYJOINED${suffix.toUpperCase().replace('-', '')}`,
+              name: `already-joined-${suffix}`,
+              created: 1700000000,
+              creator: USER_ID
+            },
+            team: 'TEVENTTEAM'
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+      expect(
+        logData(logs, 'slackbotv2_channel_created_join_complete')?.already_joined
+      ).toBe(true)
+      expect(
+        logData(logs, 'slackbotv2_channel_created_join_complete')?.team_id
+      ).toBe('TEVENTTEAM')
+      expect(hasLog(logs, 'slackbotv2_channel_created_join_failed')).toBe(false)
+    }
+  })
+
+  it('dispatches signed Slack button and select actions to durable workflow events', async () => {
+    for (const [index, route] of ['/api/webhooks/slack', '/api/slack/actions'].entries()) {
+      const waits: Promise<unknown>[] = []
+      const action = index === 0
+        ? {
+            action_id: 'deploy.approve',
+            action_ts: '1700000002.000300',
+            block_id: 'deploy-confirmation',
+            type: 'button',
+            value: 'release-42'
+          }
+        : {
+            action_id: 'deploy.environment',
+            action_ts: '1700000002.000301',
+            block_id: 'deploy-environment',
+            selected_option: { text: { type: 'plain_text', text: 'Staging' }, value: 'staging' },
+            type: 'static_select'
+          }
+      const response = await bot.app.request(
+        route,
+        signedSlackInteraction({
+          type: 'block_actions',
+          team: { id: TEAM_ID },
+          user: {
+            id: USER_ID,
+            username: 'tester',
+            name: 'Test User',
+            team_id: TEAM_ID
+          },
+          channel: { id: CHANNEL_ID },
+          message: { ts: `1700000001.00020${index}`, thread_ts: '1700000001.000100' },
+          ...(index === 1
+            ? {
+                container: {
+                  type: 'message',
+                  channel_id: CHANNEL_ID,
+                  message_ts: '1700000001.000201',
+                  thread_ts: '1700000001.000100',
+                  is_ephemeral: true
+                }
+              }
+            : {}),
+          response_url: 'https://hooks.slack.com/actions/sensitive-response-token',
+          actions: [action]
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+
+    expect(codexApi.workflowEvents).toHaveLength(2)
+    expect(codexApi.workflowEvents[0]).toEqual({
+      event_name: 'slack.block_action.deploy.approve',
+      payload: {
+        action_id: 'deploy.approve',
+        action_ts: '1700000002.000300',
+        block_id: 'deploy-confirmation',
+        channel_id: CHANNEL_ID,
+        message_id: '1700000001.000200',
+        message_ts: '1700000001.000200',
+        team_id: TEAM_ID,
+        thread_id: `slack:${CHANNEL_ID}:1700000001.000100`,
+        thread_ts: '1700000001.000100',
+        type: 'block_actions',
+        user_id: USER_ID,
+        user_name: 'tester',
+        value: 'release-42'
+      }
+    })
+    expect(codexApi.workflowEvents[1]).toEqual(
+      expect.objectContaining({
+        event_name: 'slack.block_action.deploy.environment',
+        payload: expect.objectContaining({
+          action_id: 'deploy.environment',
+          message_id: '1700000001.000201',
+          value: 'staging'
+        })
+      })
+    )
+    expect(JSON.stringify(codexApi.workflowEvents)).not.toContain('response_url')
+    expect(JSON.stringify(codexApi.workflowEvents)).not.toContain('sensitive-response-token')
+  })
+
+  it('durably hands off workflow buttons before acknowledging and retries failed acceptance', async () => {
+    const requests: Record<string, unknown>[] = []
+    const feedback: unknown[] = []
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    let fail = true
+    let created = true
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/workflows/actions/invoke')) {
+          requests.push(JSON.parse(String(init?.body)))
+          await held
+          return fail
+            ? Response.json({ error: 'temporarily unavailable' }, { status: 503 })
+            : Response.json({ ok: true, run_id: 'run-click-1', task_id: 'task-click-1', created, status: 'queued' })
+        }
+        if (String(input).endsWith('/chat.postEphemeral')) {
+          feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const payload = {
+      type: 'block_actions', team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID }, message: {
+        ts: '1700000003.000200', text: 'Approve this release?',
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: 'Approve this release?' } },
+          { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Approve' },
+            action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+            value: 'v1.opaque-signed-payload.signature' }] }
+        ]
+      },
+      actions: [{
+        action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+        action_ts: '1700000004.000200', type: 'button',
+        value: 'v1.opaque-signed-payload.signature'
+      }]
+    }
+    const waits: Promise<unknown>[] = []
+    let acknowledged = false
+    const first = Promise.resolve(bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits)))
+      .then(response => { acknowledged = true; return response })
+    await waitFor(() => requests.length === 1)
+    expect(acknowledged).toBe(false)
+    release?.()
+    expect((await first).status).toBe(503)
+    fail = false
+    const retry = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+    expect(retry.status).toBe(200)
+    expect(await retry.text()).toBe('')
+    created = false
+    const duplicate = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+    expect(duplicate.status).toBe(200)
+    expect(await duplicate.text()).toBe('')
+    await Promise.all(waits)
+    expect(feedback).toEqual([])
+    expect(requests).toHaveLength(3)
+    expect(requests[0]).toEqual({
+      button: payload.actions[0]?.value,
+      message: { text: payload.message.text, blocks: payload.message.blocks },
+      idempotency_key: expect.stringMatching(/^slack\.button:[0-9a-f]{64}$/),
+      click: {
+          id: '00000000-0000-0000-0000-000000000001', action: 'approve',
+          action_ts: payload.actions[0]?.action_ts, channel_id: CHANNEL_ID,
+          message_ts: payload.message.ts, team_id: TEAM_ID, user_id: USER_ID
+      }
+    })
+    expect(requests[1]).toEqual(requests[0])
+    expect(requests[2]).toEqual(requests[0])
+    expect(codexApi.workflowEvents).toHaveLength(0)
+  })
+
+  it('acknowledges a permanently rejected workflow button without retrying it', async () => {
+    let starts = 0
+    const feedback: unknown[] = []
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/workflows/actions/invoke')) {
+          starts += 1
+          expect(JSON.parse(String(init?.body)).button).toBe('unsigned')
+          return Response.json({ error: 'invalid or untrusted workflow button' }, { status: 403 })
+        }
+        if (String(input).endsWith('/chat.postEphemeral')) {
+          feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
+          return Response.json({ ok: true })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const payload = {
+      type: 'block_actions', team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID }, message: { ts: '1700000003.000200', thread_ts: '1700000003.000100' },
+      actions: [{ type: 'button', action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+        action_ts: '1700000004.000200', value: 'unsigned' }]
+    }
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(starts).toBe(1)
+    expect(feedback).toEqual([{
+      channel: CHANNEL_ID, user: USER_ID, thread_ts: '1700000003.000100',
+      text: 'This request is no longer available.'
+    }])
+  })
+
+  it('applies the external-org allowlist to Slack block actions', async () => {
+    const interaction = signedSlackInteraction({
+      type: 'block_actions',
+      team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: 'TEXTERNAL' },
+      channel: { id: CHANNEL_ID },
+      message: { ts: '1700000003.000200', thread_ts: '1700000003.000100' },
+      actions: [{ action_id: 'deploy.approve', type: 'button', value: 'release-42' }]
+    })
+
+    const denied = await bot.app.request('/api/webhooks/slack', interaction)
+    expect(denied.status).toBe(200)
+    expect(codexApi.workflowEvents).toHaveLength(0)
+
+    bot = createTestBot({ allowedExternalTeamIds: ['TEXTERNAL'] })
+    const waits: Promise<unknown>[] = []
+    const allowed = await bot.app.request(
+      '/api/webhooks/slack',
+      interaction,
+      {},
+      waitUntilContext(waits)
+    )
+    expect(allowed.status).toBe(200)
+    await Promise.all(waits)
+    expect(codexApi.workflowEvents).toHaveLength(1)
+  })
+
+  it('deduplicates Slack block action retries by action timestamp', async () => {
+    const interaction = signedSlackInteraction({
+      type: 'block_actions',
+      team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID },
+      message: { ts: '1700000004.000200', thread_ts: '1700000004.000100' },
+      actions: [
+        {
+          action_id: 'deploy.approve',
+          action_ts: '1700000005.000300',
+          type: 'button',
+          value: 'release-42'
+        }
+      ]
+    })
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        interaction,
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+
+    expect(codexApi.workflowEvents).toHaveLength(1)
+  })
+
+  it('collects ignored subscribed messages when the bot is next mentioned', async () => {
     const parent = await postUserMessage('The deploy context is above.')
     const firstMention = await postUserMessage(
       `<@${BOT_USER_ID}> run with this screenshot`,
       parent.ts
     )
-    const fileUrl = `${slackApi.url}/files/captured.png`
+    const fileUrl = 'https://files.slack.com/files/captured.png'
     const waits: Promise<unknown>[] = []
     const response = await bot.app.request(
       '/api/webhooks/slack',
@@ -204,6 +667,8 @@ describe('slackbotv2', () => {
 
     expect(followUpResponse.status).toBe(200)
     await Promise.all(followUpWaits)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
 
     const secondMention = await postUserMessage(`<@${BOT_USER_ID}> now execute with the latest`, parent.ts)
     const secondMentionWaits: Promise<unknown>[] = []
@@ -228,9 +693,8 @@ describe('slackbotv2', () => {
     expect(secondMentionResponse.status).toBe(200)
     await Promise.all(secondMentionWaits)
 
-    expect(codexApi.appends).toHaveLength(3)
+    expect(codexApi.appends).toHaveLength(2)
     expect(codexApi.creates.map(create => create.threadKey)).toEqual([
-      threadKey(parent.ts),
       threadKey(parent.ts),
       threadKey(parent.ts)
     ])
@@ -287,15 +751,16 @@ describe('slackbotv2', () => {
     )
     expect(JSON.stringify(firstInputLine)).not.toContain('data:image/png;base64')
 
-    const followUpAppend = codexApi.appends[1]!
-    expect(followUpAppend.threadKey).toBe(threadKey(parent.ts))
-    expect(followUpAppend.body.messages[0]?.client_message_id).toBe(followUp.ts)
-    expect(sessionMessageTexts(followUpAppend.body.messages)).toEqual([
-      'Additional detail for the subscribed thread.'
+    const secondMentionAppend = codexApi.appends[1]!
+    expect(secondMentionAppend.threadKey).toBe(threadKey(parent.ts))
+    expect(secondMentionAppend.body.messages.map(message => message.client_message_id)).toEqual([
+      followUp.ts,
+      secondMention.ts
     ])
-
-    const secondMentionAppend = codexApi.appends[2]!
-    expect(sessionMessageTexts(secondMentionAppend.body.messages)[0]).toContain(
+    expect(sessionMessageTexts(secondMentionAppend.body.messages)[0]).toBe(
+      'Additional detail for the subscribed thread.'
+    )
+    expect(sessionMessageTexts(secondMentionAppend.body.messages)[1]).toContain(
       'now execute with the latest'
     )
     const secondExecute = codexApi.executes[1]!
@@ -349,14 +814,14 @@ describe('slackbotv2', () => {
   // The paragraph break (`\n\n`) after the model value is deliberate: the
   // unpatched chat SDK dropped it, gluing the value to the next word
   // (`fablefirst`); this exercises the patched extractPlainText end to end.
-  it('keeps harness and model flags sticky within a Slack thread', async () => {
+  it('keeps persona, harness, and model flags sticky within a Slack thread', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
     bot = createTestBot({ state: sharedState })
 
     const parent = await postUserMessage('Thread default context.')
     const firstMention = await postUserMessage(
-      `<@${BOT_USER_ID}> --claude --model=fable\n\nfirst pass`,
+      `<@${BOT_USER_ID}> --persona=invest --claude --model=fable\n\nfirst pass`,
       parent.ts
     )
     const firstWaits: Promise<unknown>[] = []
@@ -371,7 +836,7 @@ describe('slackbotv2', () => {
           team: TEAM_ID,
           ts: firstMention.ts,
           thread_ts: parent.ts,
-          text: `<@${BOT_USER_ID}> --claude --model=fable\n\nfirst pass`
+          text: `<@${BOT_USER_ID}> --persona=invest --claude --model=fable\n\nfirst pass`
         }
       }),
       {},
@@ -409,6 +874,10 @@ describe('slackbotv2', () => {
       'claudecode',
       'claudecode'
     ])
+    expect(codexApi.creates.map(create => create.body.persona_id)).toEqual([
+      'invest',
+      'invest'
+    ])
     expect(codexApi.executes).toHaveLength(2)
     const firstInput = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!) as Record<
       string,
@@ -422,6 +891,7 @@ describe('slackbotv2', () => {
     expect(secondInput.model).toBe('claude-fable-5')
     expect(JSON.stringify(firstInput)).not.toContain('--claude')
     expect(JSON.stringify(firstInput)).not.toContain('--model')
+    expect(JSON.stringify(firstInput)).not.toContain('--persona=invest')
     expect(JSON.stringify(firstInput)).toContain('first pass')
     expect(JSON.stringify(secondInput)).toContain('continue without flags')
 
@@ -431,9 +901,290 @@ describe('slackbotv2', () => {
     expect(state).toEqual(
       expect.objectContaining({
         harnessType: 'claudecode',
-        model: 'claude-fable-5'
+        model: 'claude-fable-5',
+        personaId: 'invest'
       })
     )
+  })
+
+  it('pins sticky persona state without labeling a pinned mismatch as unavailable', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.queueCreateResponse({
+      harness_switched: false,
+      harness_type: 'claudecode',
+      persona_id: 'old'
+    })
+
+    const parent = await postUserMessage('Thread default context.')
+    const runMention = async (eventId: string, text: string) => {
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${text}`, parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: eventId,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> ${text}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+
+    await runMention(
+      'Ev-slackbotv2-persona-reconcile-first',
+      '--claude --persona=eng first pass'
+    )
+    await runMention(
+      'Ev-slackbotv2-persona-reconcile-second',
+      '--persona=eng continue with a later selector'
+    )
+
+    expect(codexApi.creates.map(create => create.body.persona_id)).toEqual(['eng', 'old'])
+    expect(stopStreamBlocksText(slackApi.calls)).not.toContain("isn't available")
+    const state = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${threadKey(parent.ts)}`
+    )
+    expect(state).toEqual(expect.objectContaining({ personaId: 'old' }))
+  })
+
+  it('reports a fallback for a stale sticky persona on a plain message', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.queueCreateResponse({
+      harness_switched: false,
+      harness_type: 'codex',
+      persona_id: 'eng',
+      unavailable_requested_persona_id: 'honk'
+    })
+
+    const parent = await postUserMessage('Thread default context.')
+    await sharedState.set(`thread-state:${threadKey(parent.ts)}`, { personaId: 'honk' })
+    const mention = await postUserMessage(
+      `<@${BOT_USER_ID}> start with the fallback`,
+      parent.ts
+    )
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-persona-reconcile-default',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> start with the fallback`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    expect(codexApi.creates[0]?.body.persona_id).toBe('honk')
+    expect(stopStreamBlocksText(slackApi.calls)).toContain(
+      `Persona "honk" isn't available. Using "eng" instead.`
+    )
+  })
+
+  it('clears a sticky model rejected by the harness and accepts a later override', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Thread default context.')
+    const runTurn = async (eventId: string, text: string, terminalEvent: string, data: unknown) => {
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${text}`, parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: eventId,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> ${text}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await waitFor(() => codexApi.eventRequests.length === codexApi.executes.length, 3000)
+      codexApi.emitSessionEvent(threadKey(parent.ts), terminalEvent, data)
+      await Promise.all(waits)
+    }
+
+    await runTurn('Ev-invalid-sticky-model', '--model 5.6-sol first', 'session.execution_failed', {
+      error: JSON.stringify({
+        type: 'invalid_request_error',
+        code: 'model_not_found',
+        message: "The requested model '5.6-sol' does not exist.",
+        param: 'model'
+      })
+    })
+    expect(
+      await sharedState.get<Record<string, unknown>>(`thread-state:${threadKey(parent.ts)}`)
+    ).toEqual(expect.objectContaining({ model: null }))
+    expect(await threadText(parent.ts)).toContain("The requested model '5.6-sol' does not exist.")
+
+    await runTurn(
+      'Ev-after-invalid-sticky-model',
+      'continue without flags',
+      'session.execution_completed',
+      { result_text: 'Recovered on the default model.' }
+    )
+    await runTurn(
+      'Ev-replace-invalid-sticky-model',
+      '--model gpt-5.4 use this model',
+      'session.execution_completed',
+      { result_text: 'Accepted the replacement model.' }
+    )
+
+    const models = codexApi.executes.map(execute => {
+      const input = JSON.parse(execute.body.input_lines.at(-1) ?? '{}') as Record<string, unknown>
+      return input.model
+    })
+    expect(models).toEqual(['5.6-sol', undefined, 'gpt-5.4'])
+    expect(
+      await sharedState.get<Record<string, unknown>>(`thread-state:${threadKey(parent.ts)}`)
+    ).toEqual(expect.objectContaining({ model: 'gpt-5.4' }))
+  })
+
+  it('keeps a top-level harness flag pinned when the LLM strategy guesses another harness', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let strategyRequestCount = 0
+    bot = createTestBot({
+      defaultHarnessType: 'claudecode',
+      messageOverridesStrategy: createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key',
+        fetch: (async () => {
+          strategyRequestCount += 1
+          return Response.json({
+            output: [
+              {
+                content: [
+                  {
+                    text: JSON.stringify({
+                      // Model the production false positive: an ordinary
+                      // follow-up is classified as a different harness.
+                      harness: strategyRequestCount === 1 ? 'codex' : null,
+                      model: strategyRequestCount === 1 ? 'gpt-5.6-sol' : null,
+                      provider: strategyRequestCount === 1 ? 'responses' : null,
+                      reasoning: 'max'
+                    })
+                  }
+                ]
+              }
+            ]
+          })
+        }) as unknown as typeof fetch,
+        model: 'gpt-5.4-nano'
+      }),
+      state: sharedState
+    })
+
+    const sendMention = async (threadTs: string | undefined, text: string, eventId: string) => {
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${text}`, threadTs)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: eventId,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: threadTs,
+            text: `<@${BOT_USER_ID}> ${text}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+      return mention
+    }
+
+    const nanocodexRoot = await sendMention(
+      undefined,
+      '--nanocodex --subagents start with the native harness',
+      'Ev-slackbotv2-nanocodex-opt-in'
+    )
+    await sendMention(
+      nanocodexRoot.ts,
+      'continue without another flag',
+      'Ev-slackbotv2-nanocodex-sticky'
+    )
+
+    const defaultRoot = await sendMention(
+      undefined,
+      'use the configured default',
+      'Ev-slackbotv2-default-after-nanocodex'
+    )
+
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual([
+      'nanocodex',
+      'nanocodex',
+      'claudecode'
+    ])
+    expect(codexApi.creates[0]!.body.on_harness_conflict).toBe('restart')
+    expect(codexApi.creates[2]!.body.on_harness_conflict).toBeUndefined()
+    // The explicit flag bypasses the deployed LLM strategy. Only the two
+    // unflagged messages consult it.
+    expect(strategyRequestCount).toBe(2)
+    expect(JSON.stringify(codexApi.executes[0]!.body)).not.toContain('--nanocodex')
+    expect(JSON.stringify(codexApi.executes[0]!.body)).toContain('--subagents')
+    expect(JSON.stringify(codexApi.executes[0]!.body)).toContain(
+      'start with the native harness'
+    )
+    const followUpInput = JSON.parse(
+      codexApi.executes[1]!.body.input_lines.at(-1)!
+    ) as Record<string, unknown>
+    expect(followUpInput.model).toBeUndefined()
+    expect(followUpInput.provider).toBeUndefined()
+    // Nanocodex supports Max on its default GPT-5.6 Sol model.
+    expect(followUpInput.reasoning).toBe('max')
+    const defaultInput = JSON.parse(
+      codexApi.executes[2]!.body.input_lines.at(-1)!
+    ) as Record<string, unknown>
+    // The same inferred effort is incompatible with the currently selected
+    // Claude model and is therefore dropped.
+    expect(defaultInput.reasoning).toBeUndefined()
+
+    const nanocodexState = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${threadKey(nanocodexRoot.ts)}`
+    )
+    const defaultState = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${threadKey(defaultRoot.ts)}`
+    )
+    expect(nanocodexState?.harnessType).toBe('nanocodex')
+    expect(defaultState?.harnessType).toBeUndefined()
   })
 
   it('appends an Open-session-in-Console context block to the first assistant message only', async () => {
@@ -518,6 +1269,237 @@ describe('slackbotv2', () => {
     expect(consoleBlockTexts(slackApi.calls)).toHaveLength(0)
   })
 
+  it('keeps the first Console link but omits metadata in never mode', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      consolePublicUrl: 'https://console.example.dev',
+      responseMetadataMode: 'never',
+      state: sharedState
+    })
+
+    const parent = await postUserMessage('Console link without response metadata.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> start`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-response-metadata-never',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> start`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    const footer = slackApi.calls
+      .filter(call => call.method === 'chat.stopStream')
+      .flatMap(call => (Array.isArray(call.body.blocks) ? (call.body.blocks as unknown[]) : []))
+      .map(block => JSON.stringify(block))
+      .find(text => text.includes('Open chat in Console'))
+    expect(footer).toContain('Open chat in Console')
+    expect(footer).not.toContain('GPT-5.6-SOL')
+    expect(footer).not.toContain('Codex')
+  })
+
+  it('appends response metadata to every assistant message without a Console URL', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ responseMetadataMode: 'always', state: sharedState })
+
+    const metadataBlockTexts = (calls: StreamCall[]): string[] =>
+      calls
+        .filter(call => call.method === 'chat.stopStream')
+        .flatMap(call => (Array.isArray(call.body.blocks) ? (call.body.blocks as unknown[]) : []))
+        .map(block => JSON.stringify(block))
+        .filter(text => text.includes('GPT-5.6-SOL'))
+
+    const parent = await postUserMessage('Response metadata thread context.')
+    const firstMention = await postUserMessage(`<@${BOT_USER_ID}> start`, parent.ts)
+    const firstWaits: Promise<unknown>[] = []
+    const firstResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-response-metadata-first',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: firstMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> start`
+        }
+      }),
+      {},
+      waitUntilContext(firstWaits)
+    )
+    expect(firstResponse.status).toBe(200)
+    await Promise.all(firstWaits)
+    expect(metadataBlockTexts(slackApi.calls)).toHaveLength(1)
+    expect(metadataBlockTexts(slackApi.calls)[0]).toContain('Codex')
+    expect(metadataBlockTexts(slackApi.calls)[0]).toContain('Medium')
+    expect(metadataBlockTexts(slackApi.calls)[0]).not.toContain('Fast')
+    expect(metadataBlockTexts(slackApi.calls)[0]).not.toContain('Open chat in Console')
+
+    slackApi.reset()
+    const secondMention = await postUserMessage(`<@${BOT_USER_ID}> continue`, parent.ts)
+    const secondWaits: Promise<unknown>[] = []
+    const secondResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-response-metadata-second',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: secondMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> continue`
+        }
+      }),
+      {},
+      waitUntilContext(secondWaits)
+    )
+    expect(secondResponse.status).toBe(200)
+    await Promise.all(secondWaits)
+    expect(metadataBlockTexts(slackApi.calls)).toHaveLength(1)
+  })
+
+  it('adds the service tier without showing metadata on every response', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      consolePublicUrl: 'https://console.example.dev',
+      responseServiceTierEnabled: true,
+      state: sharedState
+    })
+
+    const metadataBlockTexts = (calls: StreamCall[]): string[] =>
+      calls
+        .filter(call => call.method === 'chat.stopStream')
+        .flatMap(call => (Array.isArray(call.body.blocks) ? (call.body.blocks as unknown[]) : []))
+        .map(block => JSON.stringify(block))
+        .filter(text => text.includes('GPT-5.6-SOL'))
+
+    const parent = await postUserMessage('Service tier thread context.')
+    const firstMention = await postUserMessage(`<@${BOT_USER_ID}> start`, parent.ts)
+    const firstWaits: Promise<unknown>[] = []
+    const firstResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-service-tier-first',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: firstMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> start`
+        }
+      }),
+      {},
+      waitUntilContext(firstWaits)
+    )
+    expect(firstResponse.status).toBe(200)
+    await Promise.all(firstWaits)
+    expect(metadataBlockTexts(slackApi.calls)).toHaveLength(1)
+    expect(metadataBlockTexts(slackApi.calls)[0]).toContain('Fast')
+    expect(metadataBlockTexts(slackApi.calls)[0]).toContain('Open chat in Console')
+
+    slackApi.reset()
+    const secondMention = await postUserMessage(`<@${BOT_USER_ID}> continue`, parent.ts)
+    const secondWaits: Promise<unknown>[] = []
+    const secondResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-service-tier-second',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: secondMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> continue`
+        }
+      }),
+      {},
+      waitUntilContext(secondWaits)
+    )
+    expect(secondResponse.status).toBe(200)
+    await Promise.all(secondWaits)
+    expect(metadataBlockTexts(slackApi.calls)).toHaveLength(0)
+  })
+
+  it('shows the Slack-assigned harness and retains rollout metadata', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    const harnessAssignment = {
+      experiment: 'codex_nanocodex_ab',
+      requested_harness: 'codex',
+      cohort: 'nanocodex',
+      rollout_percent: 100
+    }
+    bot = createTestBot({
+      codexNanocodexRolloutPercent: 100,
+      consolePublicUrl: 'https://console.example.dev',
+      state: sharedState
+    })
+
+    const parent = await postUserMessage('A/B test thread context.')
+    const mention = await postUserMessage(
+      `<@${BOT_USER_ID}> inspect the repository and report what you find`,
+      parent.ts
+    )
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-api-ab-nanocodex',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> inspect the repository and report what you find`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    const footer = slackApi.calls
+      .filter(call => call.method === 'chat.stopStream')
+      .flatMap(call => (Array.isArray(call.body.blocks) ? (call.body.blocks as unknown[]) : []))
+      .map(block => JSON.stringify(block))
+      .find(text => text.includes('Open chat in Console'))
+    expect(footer).toContain('Nanocodex')
+    expect(footer).toContain('Medium')
+    expect(footer).not.toContain('Codex*')
+    expect(codexApi.creates[0]?.body.harness_type).toBe('nanocodex')
+    expect(codexApi.creates[0]?.body.metadata.harness_assignment).toEqual(harnessAssignment)
+    expect(codexApi.executes[0]?.body.metadata).toMatchObject({
+      harness_type: 'nanocodex',
+      harness_assignment: harnessAssignment
+    })
+  })
+
   it('shows the harness default model in the Console context block when no --model is set', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -570,6 +1552,168 @@ describe('slackbotv2', () => {
     expect(JSON.parse(executeBody.input_lines.at(-1)!).model).toBeUndefined()
   })
 
+  it('drops a per-channel reasoning default incompatible with its selected model', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      // The channel pins Claude and also carries an incompatible Codex effort.
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
+    })
+
+    const parent = await postUserMessage('Channel default thread context.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> investigate this`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-default',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> investigate this`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    // No explicit flags, but the channel default selects the harness and rides
+    // the model/reasoning onto the input line (unlike the deployment/baked
+    // default) and is recorded for the Console.
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['claudecode'])
+    expect(codexApi.executes).toHaveLength(1)
+    const executeBody = codexApi.executes[0]!.body
+    const inputLine = JSON.parse(executeBody.input_lines.at(-1)!) as Record<string, unknown>
+    expect(inputLine.model).toBe('claude-opus-4-8')
+    expect(inputLine.reasoning).toBeUndefined()
+    expect(executeBody.metadata.model).toBe('claude-opus-4-8')
+  })
+
+  it('lets an explicit per-thread flag override the per-channel default harness + model', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      codexNanocodexRolloutPercent: 100,
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
+    })
+
+    const parent = await postUserMessage('Channel default override thread context.')
+    const mention = await postUserMessage(
+      `<@${BOT_USER_ID}> --codex --model gpt-5.4 -rsn low go`,
+      parent.ts
+    )
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-default-override',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> --codex --model gpt-5.4 -rsn low go`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+
+    // Explicit --codex/--model/-rsn beat every field of the channel default.
+    expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['codex'])
+    expect(codexApi.creates[0]!.body.metadata.harness_assignment).toBeUndefined()
+    expect(codexApi.executes).toHaveLength(1)
+    const inputLine = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!) as Record<
+      string,
+      unknown
+    >
+    expect(inputLine.model).toBe('gpt-5.4')
+    expect(inputLine.reasoning).toBe('low')
+  })
+
+  it('a harness-only override does not drag the channel default model onto the new harness', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      channelDefaults: {
+        [CHANNEL_ID]: { harnessType: 'claudecode', model: 'claude-opus-4-8', reasoning: 'high' }
+      }
+    })
+
+    const parent = await postUserMessage('Harness-switch thread context.')
+    // Switch to codex with no model. The channel's Claude model must NOT ride
+    // onto codex; switching harness clears the previous harness's model.
+    const first = await postUserMessage(`<@${BOT_USER_ID}> --codex look into this`, parent.ts)
+    const firstWaits: Promise<unknown>[] = []
+    await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-harness-switch-1',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: first.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> --codex look into this`
+        }
+      }),
+      {},
+      waitUntilContext(firstWaits)
+    )
+    await Promise.all(firstWaits)
+
+    // A follow-up with no flags: the cleared model must stay cleared (the sticky
+    // tombstone persists), not resurface from the channel default.
+    const second = await postUserMessage(`<@${BOT_USER_ID}> keep going`, parent.ts)
+    const secondWaits: Promise<unknown>[] = []
+    await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-channel-harness-switch-2',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: second.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> keep going`
+        }
+      }),
+      {},
+      waitUntilContext(secondWaits)
+    )
+    await Promise.all(secondWaits)
+
+    // Both turns run on codex (the second inherits the sticky harness); neither
+    // forwards a model — the channel's Claude model never leaks onto codex.
+    expect(codexApi.creates.map(c => c.body.harness_type)).toEqual(['codex', 'codex'])
+    expect(codexApi.executes).toHaveLength(2)
+    for (const execute of codexApi.executes) {
+      const line = JSON.parse(execute.body.input_lines.at(-1)!) as Record<string, unknown>
+      expect(line.model).toBeUndefined()
+    }
+  })
+
   it('includes all preceding Slack thread messages for a first mid-thread mention', async () => {
     const parent = await postUserMessage('Root context for the thread.')
     const firstReply = await postUserMessage('First preceding reply.', parent.ts)
@@ -608,7 +1752,7 @@ describe('slackbotv2', () => {
       'Root context for the thread.',
       'First preceding reply.',
       'Second preceding reply.',
-      `@${BOT_USER_ID} summarize the thread so far`
+      '@centaur summarize the thread so far'
     ])
     expect(codexApi.executes).toHaveLength(1)
     expect(codexApi.executes[0]!.body.idempotency_key).toBe(mention.ts)
@@ -621,7 +1765,7 @@ describe('slackbotv2', () => {
 
   it('materializes Slack event files on root mentions without fetching thread replies', async () => {
     const mention = await postUserMessage(`<@${BOT_USER_ID}> inspect this root screenshot`)
-    const fileUrl = `${slackApi.url}/files/captured.png`
+    const fileUrl = 'https://files.slack.com/files/captured.png'
     const waits: Promise<unknown>[] = []
     const response = await bot.app.request(
       '/api/webhooks/slack',
@@ -1013,7 +2157,7 @@ describe('slackbotv2', () => {
     expect(requesterContext).toContain('Slack username: akshaan')
     expect(requesterContext).toContain('GitHub handle from Slack profile: @decofe')
     expect(requesterContext).toContain('Prompted by: @decofe')
-    expect(input.message.content.at(-1)?.text).toBe(`@${BOT_USER_ID} what is my name?`)
+    expect(input.message.content.at(-1)?.text).toBe('@centaur what is my name?')
   })
 
   it('caches Slack requester identity across mentions from the same user', async () => {
@@ -1261,6 +2405,11 @@ describe('slackbotv2', () => {
     expect(rootResponse.status).toBe(200)
     await Promise.all(rootWaits)
 
+    await slackBot.chat.postMessage({
+      channel: CHANNEL_ID,
+      text: 'Prior assistant reply that must not be imported.',
+      thread_ts: rootMention.ts
+    })
     await postUserMessage('Important reply between mentions.', rootMention.ts)
     const replyMention = await postUserMessage(
       `<@${BOT_USER_ID}> now use the full thread`,
@@ -1290,11 +2439,15 @@ describe('slackbotv2', () => {
 
     expect(codexApi.appends).toHaveLength(2)
     expect(sessionMessageTexts(codexApi.appends[0]!.body.messages)).toEqual([
-      `@${BOT_USER_ID} start from this root mention`
+      '@centaur start from this root mention'
     ])
     expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual([
       'Important reply between mentions.',
-      `@${BOT_USER_ID} now use the full thread`
+      '@centaur now use the full thread'
+    ])
+    expect(codexApi.appends[1]!.body.messages.map(message => message.role)).toEqual([
+      'user',
+      'user'
     ])
     expect(codexApi.executes.map(execute => execute.body.idempotency_key)).toEqual([
       rootMention.ts,
@@ -1311,7 +2464,7 @@ describe('slackbotv2', () => {
   it('stages large Slack file attachments without exceeding session input line limits', async () => {
     const parent = await postUserMessage('Context before the video upload.')
     const mention = await postUserMessage(`<@${BOT_USER_ID}> inspect this mp4`, parent.ts)
-    const fileUrl = `${slackApi.url}/files/large-upload.mp4`
+    const fileUrl = 'https://files.slack.com/files/large-upload.mp4'
     const waits: Promise<unknown>[] = []
     const response = await bot.app.request(
       '/api/webhooks/slack',
@@ -1401,7 +2554,7 @@ describe('slackbotv2', () => {
     expect(codexApi.creates.map(create => create.threadKey)).toEqual([threadKey(mention.ts)])
     expect(codexApi.appends).toHaveLength(1)
     expect(sessionMessageTexts(codexApi.appends[0]!.body.messages)).toEqual([
-      `@${BOT_USER_ID} answer from a new root message`
+      '@centaur answer from a new root message'
     ])
     expect(codexApi.executes).toHaveLength(1)
     expect(JSON.stringify(JSON.parse(codexApi.executes[0]!.body.input_lines[0]!))).toContain(
@@ -1449,7 +2602,7 @@ describe('slackbotv2', () => {
     )
   })
 
-  it('forwards subscribed messages to /messages without executing during a stream', async () => {
+  it('ignores unmentioned subscribed messages during a stream, including stop', async () => {
     codexApi.autoRespond = false
 
     const parent = await postUserMessage('Context before the long run.')
@@ -1499,17 +2652,39 @@ describe('slackbotv2', () => {
 
     expect(followUpResponse.status).toBe(200)
     await Promise.all(followUpWaits)
-    expect(codexApi.appends).toHaveLength(2)
+
+    const stop = await postUserMessage('stop', parent.ts)
+    const stopWaits: Promise<unknown>[] = []
+    const stopResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-unmentioned-stop-during-stream',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: stop.ts,
+          thread_ts: parent.ts,
+          text: 'stop'
+        }
+      }),
+      {},
+      waitUntilContext(stopWaits)
+    )
+
+    expect(stopResponse.status).toBe(200)
+    await Promise.all(stopWaits)
+    expect(codexApi.creates).toHaveLength(1)
+    expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.executes).toHaveLength(1)
-    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual([
-      'Actually queue this extra constraint.'
-    ])
 
     codexApi.closeStreams()
     await Promise.all(firstWaits)
   })
 
-  it('does not execute a second mention while a stream is already active', async () => {
+  it('keeps reactions on every follow-up until the active execution posts a response', async () => {
+    bot = createTestBot({ steeringReactionEnabled: true })
     codexApi.autoRespond = false
 
     const parent = await postUserMessage('Context before the long mention run.')
@@ -1537,35 +2712,156 @@ describe('slackbotv2', () => {
     await waitFor(() => codexApi.eventRequests.length === 1)
     await waitFor(() => codexApi.streamCount === 1)
 
-    const secondMentionText = `<@${BOT_USER_ID}> add this while still running`
-    const secondMention = await postUserMessage(secondMentionText, parent.ts)
-    const secondWaits: Promise<unknown>[] = []
-    const secondResponse = await bot.app.request(
+    const followUps: Array<{ mention: { ts: string }; waits: Promise<unknown>[] }> = []
+    for (const [index, text] of ['add this while still running', 'and handle this too'].entries()) {
+      const mentionText = `<@${BOT_USER_ID}> ${text}`
+      const mention = await postUserMessage(mentionText, parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: `Ev-slackbotv2-follow-up-during-stream-${index}`,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: mentionText
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+      followUps.push({ mention, waits })
+    }
+
+    await waitFor(() => codexApi.appends.length === 3)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(codexApi.streamCount).toBe(1)
+    const firstFollowUpTexts = sessionMessageTexts(codexApi.appends[1]!.body.messages)
+    expect(firstFollowUpTexts[0]).toContain('# Requester Context')
+    expect(firstFollowUpTexts.at(-1)).toBe('@centaur add this while still running')
+    expect(
+      slackApi.calls
+        .filter(call => call.method === 'reactions.add' || call.method === 'reactions.remove')
+        .map(call => ({
+          channel: stringField(call.body.channel),
+          method: call.method,
+          name: stringField(call.body.name),
+          timestamp: stringField(call.body.timestamp)
+        }))
+    ).toEqual([
+      {
+        channel: CHANNEL_ID,
+        method: 'reactions.add',
+        name: 'hourglass_flowing_sand',
+        timestamp: followUps[0]!.mention.ts
+      },
+      {
+        channel: CHANNEL_ID,
+        method: 'reactions.add',
+        name: 'hourglass_flowing_sand',
+        timestamp: followUps[1]!.mention.ts
+      }
+    ])
+    expect(
+      slackApi.calls
+        .filter(call => call.method === 'assistant.threads.setStatus')
+        .map(call => stringField(call.body.status))
+    ).toEqual(['Thinking...'])
+
+    codexApi.emitOutputLines(
+      threadKey(parent.ts),
+      sampleCodexOutputLines('Handled both follow-ups.')
+    )
+    await Promise.all(firstWaits)
+    await waitFor(
+      () => slackApi.calls.filter(call => call.method === 'reactions.remove').length === 2
+    )
+    expect(
+      slackApi.calls
+        .filter(call => call.method === 'reactions.remove')
+        .map(call => stringField(call.body.timestamp))
+        .sort()
+    ).toEqual(followUps.map(item => item.mention.ts).sort())
+  })
+
+  it('auto-disables steering reactions when reactions:write is missing', async () => {
+    const logs: CapturedLog[] = []
+    bot = createTestBot({
+      logger: captureLogger(logs),
+      steeringReactionEnabled: true
+    })
+    slackApi.respondToNextReaction(200, {
+      ok: false,
+      error: 'missing_scope',
+      needed: 'reactions:write'
+    })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before missing reaction scope.')
+    const firstMention = await postUserMessage(`<@${BOT_USER_ID}> start running`, parent.ts)
+    const firstWaits: Promise<unknown>[] = []
+    const firstResponse = await bot.app.request(
       '/api/webhooks/slack',
       signedSlackEvent({
-        event_id: 'Ev-slackbotv2-second-mention-during-stream',
+        event_id: 'Ev-slackbotv2-reaction-scope-first',
         event: {
           type: 'app_mention',
           user: USER_ID,
           channel: CHANNEL_ID,
           team: TEAM_ID,
-          ts: secondMention.ts,
+          ts: firstMention.ts,
           thread_ts: parent.ts,
-          text: secondMentionText
+          text: `<@${BOT_USER_ID}> start running`
         }
       }),
       {},
-      waitUntilContext(secondWaits)
+      waitUntilContext(firstWaits)
     )
+    expect(firstResponse.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
 
-    expect(secondResponse.status).toBe(200)
-    await Promise.all(secondWaits)
-    await waitFor(() => codexApi.appends.length === 2)
+    for (const [index, text] of ['first steer', 'second steer'].entries()) {
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${text}`, parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: `Ev-slackbotv2-reaction-scope-${index}`,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> ${text}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+
+    expect(slackApi.calls.filter(call => call.method === 'reactions.add')).toHaveLength(1)
+    expect(slackApi.calls.some(call => call.method === 'reactions.remove')).toBe(false)
+    expect(logData(logs, 'slackbotv2_steering_reaction_auto_disabled')).toEqual(
+      expect.objectContaining({
+        error: 'missing_scope',
+        needed: 'reactions:write',
+        operation: 'add'
+      })
+    )
+    expect(codexApi.appends).toHaveLength(3)
     expect(codexApi.executes).toHaveLength(1)
-    expect(codexApi.streamCount).toBe(1)
-    const secondAppendTexts = sessionMessageTexts(codexApi.appends[1]!.body.messages)
-    expect(secondAppendTexts[0]).toContain('# Requester Context')
-    expect(secondAppendTexts.at(-1)).toBe(`@${BOT_USER_ID} add this while still running`)
 
     codexApi.closeStreams()
     await Promise.all(firstWaits)
@@ -1935,6 +3231,77 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('finishes the render obligation without a duplicate reply when a failed stop succeeds on cleanup', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+    slackApi.failNextStreamStop()
+
+    const parent = await postUserMessage('Context before an transient stop failure.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> finish the answer`, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-transient-stop',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> finish the answer`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'cmd-stop',
+          type: 'commandExecution',
+          command: 'printf noisy',
+          status: 'completed',
+          aggregatedOutput: 'done'
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-transient-stop',
+      status: 'completed',
+      result_text: 'TRANSIENT_STOP_ANSWER_VISIBLE'
+    })
+
+    await Promise.all(waits)
+    expect(slackApi.calls.filter(call => call.method === 'chat.stopStream')).toHaveLength(2)
+    // Recovery was confined to stop(): durable fallback would open a second SSE request.
+    expect(codexApi.eventRequests).toHaveLength(1)
+    const texts = await threadTexts(parent.ts)
+    expect(texts.some(text => text.includes(BROKEN_STREAM_TEXT))).toBe(false)
+    expect(texts.filter(text =>
+      text.includes('TRANSIENT_STOP_ANSWER_VISIBLE')
+    )).toHaveLength(1)
+    const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+    expect(threadState).toEqual(
+      expect.objectContaining({
+        activeExecution: false,
+        renderObligation: null
+      })
+    )
+  })
+
   it('swaps the streamed message for the durable final answer when the live answer diverges', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -1968,7 +3335,7 @@ describe('slackbotv2', () => {
     await waitFor(() => codexApi.streamCount === 1)
 
     const draft = 'Draft answer from the live deltas.'
-    const finalAnswer = 'Final reconciled answer from the result.'
+    const finalAnswer = `**Final reconciled answer from the result.**\n${'@tester '.repeat(25)}${'x'.repeat(13_000)}`
     // Stream a plan + the draft answer (so the answer delta reaches Slack), then
     // seal the answer item with a DIFFERENT canonical text. The recomposed
     // answer no longer extends the already-streamed text, so the renderer
@@ -2009,9 +3376,19 @@ describe('slackbotv2', () => {
 
     const texts = await threadTexts(parent.ts)
     // The streamed message was replaced in place with the durable final answer...
-    expect(texts.filter(text => text.includes(finalAnswer))).toHaveLength(1)
+    expect(texts.filter(text => text.includes('Final reconciled answer from the result.'))).toHaveLength(1)
     // ...and the diverging live draft is gone (neither interleaved nor left behind).
     expect(texts.some(text => text.includes('Draft answer from the live deltas'))).toBe(false)
+    const replacementUpdate = slackApi.calls.find(call => call.method === 'chat.update')
+    expect(replacementUpdate).toBeDefined()
+    expect(replacementUpdate?.body.text).toBeUndefined()
+    expect(stringField(replacementUpdate?.body.markdown_text)).toStartWith(
+      '**Final reconciled answer from the result.**'
+    )
+    expect(stringField(replacementUpdate?.body.markdown_text).length).toBeLessThanOrEqual(
+      SLACK_MARKDOWN_TEXT_MAX_CHARS
+    )
+    expect(stringField(replacementUpdate?.body.markdown_text)).toContain('[truncated ')
   })
 
   it('reposts the durable final answer when the Slack stream expires mid-render', async () => {
@@ -2064,10 +3441,11 @@ describe('slackbotv2', () => {
         }
       })
     )
+    const finalAnswer = `**EXPIRED_STREAM_FALLBACK_VISIBLE**\n${'@tester '.repeat(25)}${'x'.repeat(13_000)}`
     codexApi.emitSessionEvent(key, 'session.execution_completed', {
       execution_id: 'exe-stream-expired',
       status: 'completed',
-      result_text: 'EXPIRED_STREAM_FALLBACK_VISIBLE'
+      result_text: finalAnswer
     })
 
     await Promise.all(waits)
@@ -2076,6 +3454,18 @@ describe('slackbotv2', () => {
       text.includes('EXPIRED_STREAM_FALLBACK_VISIBLE')
     )
     expect(visibleFinalReplies).toHaveLength(1)
+    const fallbackPost = slackApi.calls.find(call => call.method === 'chat.postMessage')
+    expect(fallbackPost).toBeDefined()
+    expect(fallbackPost?.body.text).toBeUndefined()
+    expect(stringField(fallbackPost?.body.markdown_text)).toStartWith(
+      '**EXPIRED_STREAM_FALLBACK_VISIBLE**'
+    )
+    // The fallback budget leaves room for the adapter to expand bare mentions
+    // without crossing Slack's 12,000-character markdown_text limit.
+    expect(stringField(fallbackPost?.body.markdown_text).length).toBeLessThanOrEqual(
+      SLACK_MARKDOWN_TEXT_MAX_CHARS
+    )
+    expect(stringField(fallbackPost?.body.markdown_text)).toContain('[truncated ')
     const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
     expect(threadState).toEqual(
       expect.objectContaining({
@@ -2087,6 +3477,7 @@ describe('slackbotv2', () => {
 
   it('rotates Slack stream segments before they reach the streaming age limit', async () => {
     process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS = '120'
+    bot = createTestBot()
     try {
       codexApi.autoRespond = false
 
@@ -2182,6 +3573,7 @@ describe('slackbotv2', () => {
 
   it('marks open tasks complete before rotating an aged progress segment', async () => {
     process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS = '120'
+    bot = createTestBot()
     try {
       codexApi.autoRespond = false
 
@@ -3040,7 +4432,7 @@ describe('slackbotv2', () => {
     ).toHaveLength(1)
   })
 
-  it('omits large structured task output so final markdown still delivers', async () => {
+  it('keeps each task on one bounded card as details grow and output expands', async () => {
     codexApi.autoRespond = false
 
     const parent = await postUserMessage('Context before large task output.')
@@ -3097,6 +4489,20 @@ describe('slackbotv2', () => {
         })
       )
     }
+    codexApi.emitOutputLine(threadKey(parent.ts), JSON.stringify({
+      type: 'item.started',
+      item: { id: 'edited-files', type: 'fileChange', status: 'inProgress', changes: [{ path: 'first.ts' }] }
+    }))
+    await waitFor(() => slackApi.calls.some(call =>
+      streamChunks(call.body.chunks).some(chunk => chunk.id === 'edited-files' && chunk.status === 'in_progress')
+    ))
+    codexApi.emitOutputLine(threadKey(parent.ts), JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'edited-files', type: 'fileChange', status: 'completed',
+        changes: Array.from({ length: 30 }, (_, index) => ({ path: `src/🙂-component-${index}.ts`, diff: largeOutput }))
+      }
+    }))
     codexApi.emitOutputLine(
       threadKey(parent.ts),
       JSON.stringify({
@@ -3127,17 +4533,22 @@ describe('slackbotv2', () => {
     expect(transcripts).toHaveLength(1)
     const taskChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'task_update')
     expect(taskChunks).not.toHaveLength(0)
+    const taskIds = [...Array.from({ length: 6 }, (_, index) => `cmd-large-${index}`), 'edited-files']
+    expect([...new Set(taskChunks.map(chunk => stringField(chunk.id)))].sort()).toEqual(taskIds)
+    for (const id of taskIds) {
+      expect(taskChunks.filter(chunk => chunk.id === id).at(-1)?.status).toBe('complete')
+    }
     expect(taskChunks.every(chunk => stringField(chunk.output) === '')).toBe(true)
     expect(taskChunks.every(chunk => !chunkText(chunk).includes('large-context-line'))).toBe(true)
     expect(taskChunks.some(chunk => chunkText(chunk).includes('slack thread --json --page 0'))).toBe(
       true
     )
-    expect(
-      taskChunks
-        .map(chunk => stringField(chunk.details))
-        .filter(Boolean)
-        .every(details => details.length <= 500)
-    ).toBe(true)
+    for (const chunk of taskChunks) {
+      const details = stringField(chunk.details)
+      expect(details.length).toBeLessThanOrEqual(256)
+      expect(Buffer.from(details).toString('utf8')).toBe(details)
+    }
+    expect(taskChunks.some(chunk => stringField(chunk.details).includes('[truncated'))).toBe(true)
     const markdownChunks = transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
     expect(markdownChunks).toEqual([
       {
@@ -3201,6 +4612,8 @@ describe('slackbotv2', () => {
         '/api/webhooks/slack',
         signedSlackEvent({
           event_id: 'Ev-slackbotv2-slow-execute',
+          retry_num: '1',
+          retry_reason: 'http_timeout',
           event: {
             type: 'app_mention',
             user: USER_ID,
@@ -3274,6 +4687,8 @@ describe('slackbotv2', () => {
         slack_event_id: 'Ev-slackbotv2-slow-execute',
         slack_event_type: 'app_mention',
         slack_message_ts: mention.ts,
+        slack_retry_num: '1',
+        slack_retry_reason: 'http_timeout',
         slack_thread_ts: parent.ts,
         task_count: expect.any(Number)
       })
@@ -3963,8 +5378,113 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(1)
   })
 
+  it('keeps a steering reaction when an append retry starts an execution', async () => {
+    let failNextAppend = false
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (failNextAppend && String(input).endsWith('/messages')) {
+          failNextAppend = false
+          return new Response('unavailable', {
+            status: 503,
+            statusText: 'Service Unavailable'
+          })
+        }
+        return globalThis.fetch(input, init)
+      },
+      handoffRetryDelaysMs: [300],
+      steeringReactionEnabled: true
+    })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('History before an upgraded steering retry.')
+    const firstMention = await postUserMessage(`<@${BOT_USER_ID}> start running`, parent.ts)
+    const firstWaits: Promise<unknown>[] = []
+    const firstResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-steering-upgrade-first',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: firstMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> start running`
+        }
+      }),
+      {},
+      waitUntilContext(firstWaits)
+    )
+    expect(firstResponse.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    failNextAppend = true
+    const steeringMention = await postUserMessage(
+      `<@${BOT_USER_ID}> retry me as the next turn`,
+      parent.ts
+    )
+    const steeringWaits: Promise<unknown>[] = []
+    const steeringResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-steering-upgrade-second',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: steeringMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> retry me as the next turn`
+        }
+      }),
+      {},
+      waitUntilContext(steeringWaits)
+    )
+    expect(steeringResponse.status).toBe(200)
+    await waitFor(() => slackApi.calls.some(call => call.method === 'reactions.add'))
+    expect(slackApi.calls.some(call => call.method === 'reactions.remove')).toBe(false)
+
+    const key = threadKey(parent.ts)
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('First execution complete.'))
+    await Promise.all(firstWaits)
+
+    await waitFor(() => codexApi.executes.length === 2, 3000)
+    expect(slackApi.calls.some(call => call.method === 'reactions.remove')).toBe(false)
+
+    await waitFor(() => codexApi.eventRequests.length === 2, 3000)
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Upgraded retry complete.'))
+    await Promise.all(steeringWaits)
+    await waitFor(() => slackApi.calls.some(call => call.method === 'reactions.remove'), 3000)
+    expect(
+      slackApi.calls
+        .filter(call => call.method === 'reactions.add' || call.method === 'reactions.remove')
+        .map(call => ({
+          method: call.method,
+          timestamp: stringField(call.body.timestamp)
+        }))
+    ).toEqual([
+      { method: 'reactions.add', timestamp: steeringMention.ts },
+      { method: 'reactions.remove', timestamp: steeringMention.ts }
+    ])
+    expect(await threadText(parent.ts)).toContain('Upgraded retry complete.')
+  })
+
   it('reuses an accepted execution when the local retry follows a lost execute response', async () => {
-    bot = createTestBot({ handoffRetryDelaysMs: [50] })
+    let overrideStrategyCalls = 0
+    bot = createTestBot({
+      handoffRetryDelaysMs: [50],
+      messageOverridesStrategy: async () => {
+        overrideStrategyCalls += 1
+        return {
+          overrides: {
+            harnessType: overrideStrategyCalls === 1 ? 'claudecode' : 'codex',
+            model: overrideStrategyCalls === 1 ? 'claude-opus-4-8' : 'gpt-5.6-sol'
+          }
+        }
+      }
+    })
     codexApi.failNextExecuteAfterAccept = true
 
     const parent = await postUserMessage('History before response loss.')
@@ -3999,6 +5519,15 @@ describe('slackbotv2', () => {
     expect(codexApi.executes.map(execute => execute.body.idempotency_key)).toEqual([
       mention.ts,
       mention.ts
+    ])
+    expect(overrideStrategyCalls).toBe(1)
+    expect(
+      codexApi.executes.map(execute =>
+        JSON.parse(execute.body.input_lines.at(-1) ?? '{}') as Record<string, unknown>
+      )
+    ).toEqual([
+      expect.objectContaining({ model: 'claude-opus-4-8' }),
+      expect.objectContaining({ model: 'claude-opus-4-8' })
     ])
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.eventRequests).toHaveLength(1)
@@ -4118,7 +5647,73 @@ describe('slackbotv2', () => {
     expect(threadState).toEqual(expect.objectContaining({ activeExecution: false }))
   })
 
-  it('keeps v1 external org and trigger-bot allowlist behavior', async () => {
+  it('silently ignores a session principal admission denial after clearing deferred status', async () => {
+    bot = createTestBot({ assistantStatus: 'Admission pending...' })
+    const releaseStatus = slackApi.holdAssistantStatus()
+    codexApi.queueCreateResponse(
+      {
+        ok: false,
+        error: 'session principal slack-channel-t123-c123 is not preapproved',
+        code: 'session_principal_not_preapproved'
+      },
+      403
+    )
+
+    const parent = await postUserMessage('History before admission denial.')
+    const mention = await postUserMessage(`<@${BOT_USER_ID}> denied`, parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-admission-denied',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> denied`
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    try {
+      expect(response.status).toBe(200)
+      await waitFor(() => codexApi.creates.length === 1)
+      const initialStatusIndex = slackApi.calls.findIndex(
+        call =>
+          call.method === 'assistant.threads.setStatus'
+          && stringField(call.body.status) === 'Admission pending...'
+      )
+      expect(initialStatusIndex).toBeGreaterThanOrEqual(0)
+      expect(
+        slackApi.calls
+          .slice(initialStatusIndex)
+          .filter(call => call.method === 'assistant.threads.setStatus')
+          .map(call => stringField(call.body.status))
+      ).toEqual(['Admission pending...'])
+
+      releaseStatus()
+      await Promise.all(waits)
+      expect(codexApi.creates).toHaveLength(1)
+      expect(codexApi.appends).toHaveLength(0)
+      expect(codexApi.executes).toHaveLength(0)
+      expect(
+        slackApi.calls
+          .slice(initialStatusIndex)
+          .filter(call => call.method === 'assistant.threads.setStatus')
+          .map(call => stringField(call.body.status))
+      ).toEqual(['Admission pending...', ''])
+      expect(await threadText(parent.ts)).not.toContain('Execution failed')
+    } finally {
+      releaseStatus()
+    }
+  })
+
+  it('enforces external org and trigger-bot member allowlists', async () => {
     const externalMention = await postUserMessage(`<@${BOT_USER_ID}> from external org`)
     const externalWaits: Promise<unknown>[] = []
     const externalResponse = await bot.app.request(
@@ -4201,7 +5796,7 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(0)
     expect(codexApi.executes).toHaveLength(0)
 
-    bot = createTestBot({ triggerBotAllowlist: ['app:AOTHERBOT'] })
+    bot = createTestBot({ triggerBotAllowlist: ['UOTHERBOT'] })
     const allowedBotMention = await postUserMessage(`<@${BOT_USER_ID}> from allowed bot`)
     const allowedBotWaits: Promise<unknown>[] = []
     const allowedBotResponse = await bot.app.request(
@@ -4233,7 +5828,7 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.executes).toHaveLength(1)
 
-    bot = createTestBot({ triggerBotAllowlist: ['bot:BOTHERBOT'] })
+    bot = createTestBot({ triggerBotAllowlist: ['UOTHERBOT'] })
     codexApi.reset()
     const labeledBotMention = `<@${BOT_USER_ID}|centaur> from allowed bot message`
     const allowedBotChannelMessage = await postUserMessage(labeledBotMention)
@@ -4275,6 +5870,78 @@ describe('slackbotv2', () => {
         recipient_user_id: 'UOTHERBOT'
       })
     )
+
+    bot = createTestBot({ triggerBotAllowlist: ['UOTHERBOT'] })
+    codexApi.reset()
+    slackApi.reset()
+    const richBotMessage = await postUserMessage('attachment-only event placeholder')
+    const richBotWaits: Promise<unknown>[] = []
+    const richBotResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-bot-attachment-mention-allowed',
+        event: {
+          type: 'message',
+          app_id: 'AOTHERBOT',
+          attachments: [
+            {
+              pretext: `<@${BOT_USER_ID}> investigate`,
+              title: ':red_circle: Validator stalled',
+              text: '*Cluster:* stg-na\n*Tenant:* luganodes'
+            }
+          ],
+          bot_id: 'BOTHERBOT',
+          bot_profile: {
+            app_id: 'AOTHERBOT',
+            id: 'BOTHERBOT',
+            user_id: 'UOTHERBOT'
+          },
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          text: '',
+          ts: richBotMessage.ts,
+          username: 'otherbot'
+        }
+      }),
+      {},
+      waitUntilContext(richBotWaits)
+    )
+    expect(richBotResponse.status).toBe(200)
+    await Promise.all(richBotWaits)
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(sessionMessageTexts(codexApi.appends[0]!.body.messages).join('\n')).toContain(
+      'Validator stalled'
+    )
+
+    bot = createTestBot()
+    codexApi.reset()
+    const deniedRichBotMessage = await postUserMessage('attachment-only event placeholder')
+    const deniedRichBotWaits: Promise<unknown>[] = []
+    const deniedRichBotResponse = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-bot-attachment-mention-denied',
+        event: {
+          type: 'message',
+          attachments: [{ pretext: `<@${BOT_USER_ID}> investigate` }],
+          bot_id: 'BOTHERBOT',
+          channel: CHANNEL_ID,
+          subtype: 'bot_message',
+          team: TEAM_ID,
+          text: '',
+          ts: deniedRichBotMessage.ts,
+          username: 'otherbot'
+        }
+      }),
+      {},
+      waitUntilContext(deniedRichBotWaits)
+    )
+    expect(deniedRichBotResponse.status).toBe(200)
+    await Promise.all(deniedRichBotWaits)
+    expect(codexApi.appends).toHaveLength(0)
+    expect(codexApi.executes).toHaveLength(0)
   })
 })
 
@@ -4291,7 +5958,7 @@ function createTestBot(
 function createProductionDefaultTestBot(
   overrides: Partial<Parameters<typeof createSlackbotV2>[0]> = {}
 ): SlackbotV2 {
-  return createSlackbotV2({
+  const instance = createSlackbotV2({
     apiKey: 'slackbotv2-api-key',
     apiUrl: codexApi.url,
     botToken: BOT_TOKEN,
@@ -4301,6 +5968,17 @@ function createProductionDefaultTestBot(
     state: createMemoryState(),
     ...overrides
   })
+  Object.assign(instance.chat.getAdapter('slack'), {
+    createFileTransport: () => (url: URL, signal: AbortSignal, headers: Record<string, string>) => {
+      if (url.hostname !== 'files.slack.com') throw new Error('Unexpected fixture download host')
+      return new Promise<IncomingMessage>((resolve, reject) => {
+        const request = httpRequest(new URL(url.pathname, slackApi.url), { signal, headers }, resolve)
+        request.on('error', reject)
+        request.end()
+      })
+    }
+  })
+  return instance
 }
 
 type CapturedLog = {
@@ -4597,6 +6275,8 @@ async function threadTexts(threadTs: string): Promise<string[]> {
 function signedSlackEvent(input: {
   event_id: string
   event: Record<string, unknown>
+  retry_num?: string
+  retry_reason?: string
 }): RequestInit {
   const timestamp = Math.floor(Date.now() / 1000)
   const body = JSON.stringify({
@@ -4611,10 +6291,30 @@ function signedSlackEvent(input: {
   const signature = createHmac('sha256', SIGNING_SECRET)
     .update(`v0:${timestamp}:${body}`)
     .digest('hex')
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-slack-request-timestamp': String(timestamp),
+    'x-slack-signature': `v0=${signature}`
+  }
+  if (input.retry_num) headers['x-slack-retry-num'] = input.retry_num
+  if (input.retry_reason) headers['x-slack-retry-reason'] = input.retry_reason
+  return {
+    method: 'POST',
+    headers,
+    body
+  }
+}
+
+function signedSlackInteraction(payload: Record<string, unknown>): RequestInit {
+  const timestamp = Math.floor(Date.now() / 1000)
+  const body = `payload=${encodeURIComponent(JSON.stringify(payload))}`
+  const signature = createHmac('sha256', SIGNING_SECRET)
+    .update(`v0:${timestamp}:${body}`)
+    .digest('hex')
   return {
     method: 'POST',
     headers: {
-      'content-type': 'application/json',
+      'content-type': 'application/x-www-form-urlencoded',
       'x-slack-request-timestamp': String(timestamp),
       'x-slack-signature': `v0=${signature}`
     },
@@ -4651,6 +6351,11 @@ type MockSessionEvent = {
   threadKey: string
 }
 
+type MockWorkflowEventRequest = {
+  event_name: string
+  payload: SlackbotV2BlockActionPayload
+}
+
 type MockSessionApi = {
   appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[]
   autoRespond: boolean
@@ -4666,19 +6371,23 @@ type MockSessionApi = {
   failNextExecute: boolean
   failNextExecuteAfterAccept: boolean
   holdNextExecute(): () => void
+  queueCreateResponse(body: Record<string, unknown>, status?: number): void
   reset(): void
   streamCount: number
   url: string
+  workflowEvents: MockWorkflowEventRequest[]
 }
 
 async function startMockCodexApi(): Promise<MockSessionApi> {
   const appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[] = []
+  const createResponses: Array<{ body: Record<string, unknown>; status: number }> = []
   const creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[] = []
   const eventRequests: MockSessionEventRequest[] = []
   const events: MockSessionEvent[] = []
   const executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[] = []
   const idempotentExecutions = new Map<string, string>()
   const streams = new Set<ServerResponse>()
+  const workflowEvents: MockWorkflowEventRequest[] = []
   let autoRespond = true
   let executeHold: Promise<void> | null = null
   let executeHoldRelease: (() => void) | null = null
@@ -4694,6 +6403,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   const server = createServer((req, res) => {
     void handleMockCodexRequest(req, res, {
       appends,
+      createResponses,
       creates,
       events,
       eventRequests,
@@ -4728,7 +6438,8 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       setFailNextExecuteAfterAccept(value) {
         failNextExecuteAfterAccept = value
       },
-      streams
+      streams,
+      workflowEvents
     }).catch(error => {
       res.writeHead(500, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: String(error) }))
@@ -4743,6 +6454,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     executes,
     reset() {
       appends.length = 0
+      createResponses.length = 0
       creates.length = 0
       eventRequests.length = 0
       events.length = 0
@@ -4757,8 +6469,13 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       failNextEvents = false
       failNextExecute = false
       failNextExecuteAfterAccept = false
+      workflowEvents.length = 0
+    },
+    queueCreateResponse(body: Record<string, unknown>, status = 200) {
+      createResponses.push({ body, status })
     },
     url: `http://127.0.0.1:${port}`,
+    workflowEvents,
     closeStreams,
     get autoRespond() {
       return autoRespond
@@ -4838,6 +6555,7 @@ async function handleMockCodexRequest(
   input: {
     appends: MockSessionRequest<SlackbotV2AppendMessagesRequest>[]
     autoRespond: boolean
+    createResponses: Array<{ body: Record<string, unknown>; status: number }>
     creates: MockSessionRequest<SlackbotV2CreateSessionRequest>[]
     events: MockSessionEvent[]
     eventRequests: MockSessionEventRequest[]
@@ -4846,16 +6564,23 @@ async function handleMockCodexRequest(
     failNextExecuteAfterAccept: boolean
     failNextEvents: boolean
     failNextExecute: boolean
-      idempotentExecutions: Map<string, string>
+    idempotentExecutions: Map<string, string>
     nextEventId(): number
     port: number
     setFailNextEvents(value: boolean): void
     setFailNextExecute(value: boolean): void
     setFailNextExecuteAfterAccept(value: boolean): void
     streams: Set<ServerResponse>
+    workflowEvents: MockWorkflowEventRequest[]
   }
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${input.port}`)
+  if (url.pathname === '/api/workflows/events') {
+    const request = await nodeRequestToWebRequest(req, url)
+    input.workflowEvents.push((await request.json()) as MockWorkflowEventRequest)
+    await sendWebResponse(res, Response.json({ ok: true }))
+    return
+  }
   const match = /^\/api\/session\/([^/]+)(?:\/(messages|execute|events))?$/.exec(url.pathname)
   if (!match?.[1]) {
     await sendWebResponse(res, new Response('not found', { status: 404 }))
@@ -4868,6 +6593,11 @@ async function handleMockCodexRequest(
     const request = await nodeRequestToWebRequest(req, url)
     const body = (await request.json()) as SlackbotV2CreateSessionRequest
     input.creates.push({ threadKey, body })
+    const queued = input.createResponses.shift()
+    if (queued) {
+      await sendWebResponse(res, Response.json(queued.body, { status: queued.status }))
+      return
+    }
     await sendWebResponse(
       res,
       Response.json({
@@ -4875,6 +6605,8 @@ async function handleMockCodexRequest(
         sandbox_id: null,
         harness_type: body.harness_type,
         harness_thread_id: null,
+        harness_switched: false,
+        persona_id: body.persona_id ?? null,
         status: 'active'
       })
     )
@@ -5009,9 +6741,12 @@ type PatchedSlackApi = {
   failRepliesWithThreadNotFound(channel: string, ts: string): void
   failStreamAppendsAfter(count: number, error: string): void
   failStreamStopsLongerThan(maxChars: number): void
+  failNextStreamStop(): void
   fileInfoRequestCount(fileId: string): number
   holdAssistantStatus(): () => void
   reset(): void
+  respondToNextConversationsJoin(status: number, body: Record<string, unknown>): void
+  respondToNextReaction(status: number, body: Record<string, unknown>): void
   setFileInfo(fileId: string, file: Record<string, unknown>): void
   setUserProfile(userId: string, profile: Record<string, unknown>): void
   userProfileMethodRequestCount(userId: string, method: string): number
@@ -5022,11 +6757,18 @@ type PatchedSlackApi = {
 type StreamCall = {
   body: Record<string, unknown>
   method:
+    | 'agents.sessions.setStatus'
+    | 'agents.sessions.rename'
     | 'assistant.threads.setStatus'
     | 'assistant.threads.setTitle'
+    | 'chat.postMessage'
+    | 'chat.update'
     | 'chat.startStream'
     | 'chat.appendStream'
     | 'chat.stopStream'
+    | 'conversations.join'
+    | 'reactions.add'
+    | 'reactions.remove'
   streamTs?: string
 }
 
@@ -5035,6 +6777,11 @@ type StreamRecord = {
   payloadChars: number
   text: string
   ts: string
+}
+
+type QueuedSlackApiResponse = {
+  body: Record<string, unknown>
+  status: number
 }
 
 type SlackStreamTranscript = {
@@ -5051,6 +6798,8 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
   const calls: StreamCall[] = []
   const fileInfo = new Map<string, Record<string, unknown>>()
   const fileInfoRequests = new Map<string, number>()
+  const conversationsJoinResponses: QueuedSlackApiResponse[] = []
+  const reactionResponses: QueuedSlackApiResponse[] = []
   const threadMessageFiles = new Map<string, Record<string, unknown>[]>()
   const userProfiles = new Map<string, Record<string, unknown>>()
   const userProfileRequests = new Map<string, number>()
@@ -5058,6 +6807,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
   let assistantStatusGate: Promise<void> | null = null
   let releaseAssistantStatusGate: (() => void) | null = null
   let maxStreamStopChars: number | null = null
+  const stopFailure = { remaining: 0 }
   const appendFailure: { error: string; remaining: number } = { error: '', remaining: -1 }
   const streams = new Map<string, StreamRecord>()
   const releaseCurrentAssistantStatusGate = () => {
@@ -5070,12 +6820,20 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
   const server = createServer((req, res) => {
     void handlePatchedSlackRequest(req, res, {
       appendFailure,
-      assistantStatusGate: () => assistantStatusGate,
+      assistantStatusGate: status => {
+        if (!status) return null
+        const gate = assistantStatusGate
+        assistantStatusGate = null
+        return gate
+      },
       calls,
+      conversationsJoinResponses,
       fileInfo,
       fileInfoRequests,
       maxStreamStopChars,
+      stopFailure,
       port,
+      reactionResponses,
       streams,
       threadNotFoundReplies,
       threadMessageFiles,
@@ -5102,6 +6860,9 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       appendFailure.remaining = count
       appendFailure.error = error
     },
+    failNextStreamStop() {
+      stopFailure.remaining = 1
+    },
     failStreamStopsLongerThan(maxChars: number) {
       maxStreamStopChars = maxChars
     },
@@ -5109,7 +6870,7 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       return fileInfoRequests.get(fileId) ?? 0
     },
     holdAssistantStatus() {
-      if (assistantStatusGate) throw new Error('assistant status is already held')
+      if (releaseAssistantStatusGate) throw new Error('assistant status is already held')
       assistantStatusGate = new Promise(resolve => {
         releaseAssistantStatusGate = resolve
       })
@@ -5119,8 +6880,11 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       releaseCurrentAssistantStatusGate()
       calls.length = 0
       maxStreamStopChars = null
+      stopFailure.remaining = 0
       appendFailure.remaining = -1
       appendFailure.error = ''
+      conversationsJoinResponses.length = 0
+      reactionResponses.length = 0
       threadNotFoundReplies.clear()
       threadMessageFiles.clear()
       fileInfo.clear()
@@ -5128,6 +6892,12 @@ async function startPatchedSlackApi(emulatorUrl: string): Promise<PatchedSlackAp
       streams.clear()
       userProfiles.clear()
       userProfileRequests.clear()
+    },
+    respondToNextConversationsJoin(status: number, body: Record<string, unknown>) {
+      conversationsJoinResponses.push({ body, status })
+    },
+    respondToNextReaction(status: number, body: Record<string, unknown>) {
+      reactionResponses.push({ body, status })
     },
     setFileInfo(fileId: string, file: Record<string, unknown>) {
       fileInfo.set(fileId, file)
@@ -5150,12 +6920,15 @@ async function handlePatchedSlackRequest(
   res: ServerResponse,
   input: {
     appendFailure: { error: string; remaining: number }
-    assistantStatusGate: () => Promise<void> | null
+    assistantStatusGate: (status: string) => Promise<void> | null
     calls: StreamCall[]
+    conversationsJoinResponses: QueuedSlackApiResponse[]
     fileInfo: Map<string, Record<string, unknown>>
     fileInfoRequests: Map<string, number>
     maxStreamStopChars: number | null
+    stopFailure: { remaining: number }
     port: number
+    reactionResponses: QueuedSlackApiResponse[]
     streams: Map<string, StreamRecord>
     threadNotFoundReplies: Set<string>
     threadMessageFiles: Map<string, Record<string, unknown>[]>
@@ -5191,10 +6964,16 @@ async function handlePatchedSlackRequest(
   }
 
   const path = normalizeApiPath(url.pathname)
+  if (path === '/api/agents.sessions.setStatus' || path === '/api/agents.sessions.rename') {
+    const body = await requestBody(request)
+    input.calls.push({ method: path.slice('/api/'.length) as StreamCall['method'], body })
+    await sendWebResponse(res, Response.json({ ok: true }))
+    return
+  }
   if (path === '/api/assistant.threads.setStatus') {
     const body = await requestBody(request)
     input.calls.push({ method: 'assistant.threads.setStatus', body })
-    const gate = input.assistantStatusGate()
+    const gate = input.assistantStatusGate(stringField(body.status))
     if (gate) await gate
     await sendWebResponse(res, Response.json({ ok: true }))
     return
@@ -5210,11 +6989,13 @@ async function handlePatchedSlackRequest(
     input.userProfileRequests.set(userId, (input.userProfileRequests.get(userId) ?? 0) + 1)
     input.userProfileRequests.set(path, (input.userProfileRequests.get(path) ?? 0) + 1)
     input.userProfileRequests.set(`${path}:${userId}`, (input.userProfileRequests.get(`${path}:${userId}`) ?? 0) + 1)
-    const profile = input.userProfiles.get(userId) ?? {
+    const profile = input.userProfiles.get(userId) ?? (userId === BOT_USER_ID ? {
+      name: 'centaur', real_name: 'centaur', fields: {}
+    } : {
       name: 'tester',
       real_name: 'Test User',
       fields: {}
-    }
+    })
     if (path === '/api/users.info') {
       await sendWebResponse(
         res,
@@ -5246,6 +7027,68 @@ async function handlePatchedSlackRequest(
     )
     return
   }
+  if (path === '/api/conversations.join') {
+    const body = await requestBody(request)
+    input.calls.push({ method: 'conversations.join', body })
+    const configuredResponse = input.conversationsJoinResponses.shift()
+    if (configuredResponse) {
+      await sendWebResponse(
+        res,
+        Response.json(configuredResponse.body, { status: configuredResponse.status })
+      )
+      return
+    }
+    await sendWebResponse(
+      res,
+      Response.json({
+        ok: true,
+        channel: {
+          id: stringField(body.channel),
+          is_channel: true
+        }
+      })
+    )
+    return
+  }
+  if (path === '/api/reactions.add' || path === '/api/reactions.remove') {
+    const body = await requestBody(request)
+    input.calls.push({
+      method: path === '/api/reactions.add' ? 'reactions.add' : 'reactions.remove',
+      body
+    })
+    const configuredResponse = input.reactionResponses.shift()
+    await sendWebResponse(
+      res,
+      configuredResponse
+        ? Response.json(configuredResponse.body, { status: configuredResponse.status })
+        : Response.json({ ok: true })
+    )
+    return
+  }
+  if (path === '/api/chat.postMessage' || path === '/api/chat.update') {
+    const body = await requestBody(request.clone())
+    if (typeof body.markdown_text === 'string') {
+      input.calls.push({
+        method: path === '/api/chat.postMessage' ? 'chat.postMessage' : 'chat.update',
+        body
+      })
+      if (body.markdown_text.length > SLACK_MARKDOWN_TEXT_MAX_CHARS) {
+        await sendWebResponse(res, Response.json({ ok: false, error: 'msg_too_long' }))
+        return
+      }
+      const { markdown_text: markdownText, ...legacyBody } = body
+      await sendWebResponse(
+        res,
+        Response.json(
+          await postSlack(input.upstreamUrl, request, path, {
+            ...legacyBody,
+            text: markdownText
+          })
+        )
+      )
+      return
+    }
+  }
   if (path === '/api/chat.startStream') {
     await sendWebResponse(
       res,
@@ -5268,7 +7111,8 @@ async function handlePatchedSlackRequest(
         request,
         input.streams,
         input.calls,
-        input.maxStreamStopChars
+        input.maxStreamStopChars,
+        input.stopFailure
       )
     )
     return
@@ -5350,6 +7194,8 @@ async function sendWebResponse(res: ServerResponse, response: Response): Promise
   res.statusCode = response.status
   res.statusMessage = response.statusText
   response.headers.forEach((value, key) => {
+    // The proxy buffers the body, so let Node choose framing for the buffered response.
+    if (key === 'transfer-encoding') return
     res.setHeader(key, value)
   })
   if (response.body === null || response.status === 204) {
@@ -5440,12 +7286,17 @@ async function stopStream(
   request: Request,
   streams: Map<string, StreamRecord>,
   calls: StreamCall[],
-  maxStreamStopChars: number | null
+  maxStreamStopChars: number | null,
+  stopFailure: { remaining: number }
 ): Promise<Response> {
   const body = await requestBody(request)
   const channel = stringField(body.channel)
   const ts = stringField(body.ts)
   calls.push({ method: 'chat.stopStream', body, streamTs: ts })
+  if (stopFailure.remaining > 0) {
+    stopFailure.remaining -= 1
+    return Response.json({ ok: false, error: 'internal_error' })
+  }
   const key = streamKey(channel, ts)
   const record = streams.get(key) ?? { channel, payloadChars: 0, ts, text: '' }
   const text = [record.text, streamBodyText(body)].filter(part => part.trim()).join('\n')
@@ -5701,6 +7552,18 @@ function blocksText(value: unknown): string {
     })
     .filter(Boolean)
     .join('\n')
+}
+
+function stopStreamBlocksText(calls: StreamCall[]): string {
+  const blocks = calls
+    .filter(call => call.method === 'chat.stopStream')
+    .flatMap(call => (Array.isArray(call.body.blocks) ? call.body.blocks : []))
+  const elements = blocks.flatMap(block => {
+    if (!block || typeof block !== 'object' || Array.isArray(block)) return []
+    const value = (block as Record<string, unknown>).elements
+    return Array.isArray(value) ? value : []
+  })
+  return blocksText([...blocks, ...elements])
 }
 
 function normalizeApiPath(path: string): string {

@@ -516,10 +516,21 @@ payload = json.loads(sys.argv[4])
 module_path = project_dir / client_module
 package_name = project_dir.name.replace("-", "_")
 if (project_dir / "__init__.py").is_file() and package_name.isidentifier() and module_path.suffix == ".py":
-    parent = str(project_dir.parent)
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
-    module = importlib.import_module(f"{{package_name}}.{{module_path.stem}}")
+    package_path = project_dir / "__init__.py"
+    package_spec = importlib.util.spec_from_file_location(
+        package_name,
+        package_path,
+        submodule_search_locations=[str(project_dir)],
+    )
+    if package_spec is None or package_spec.loader is None:
+        raise RuntimeError(f"cannot load tool package from {{package_path}}")
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[package_name] = package
+    package_spec.loader.exec_module(package)
+
+    relative_module = module_path.relative_to(project_dir).with_suffix("")
+    module_name = ".".join((package_name, *relative_module.parts))
+    module = importlib.import_module(module_name)
 else:
     spec = importlib.util.spec_from_file_location("_centaur_tool_client", module_path)
     if spec is None or spec.loader is None:
@@ -653,6 +664,32 @@ def emit_tool_call_event(event, tool, method, tool_args=None, started_at=None, r
         pass
 
 
+def list_tools(tools):
+    catalog = {{"name": "centaur-tools"}}
+    started_at = time.monotonic()
+    emit_tool_call_event("tool_call_started", catalog, "list")
+    try:
+        for tool in tools:
+            print(f'{{tool["name"]}}\t{{tool["project_dir"]}}')
+    except Exception:
+        emit_tool_call_event(
+            "tool_call_completed",
+            catalog,
+            "list",
+            started_at=started_at,
+            returncode=1,
+        )
+        raise
+    emit_tool_call_event(
+        "tool_call_completed",
+        catalog,
+        "list",
+        started_at=started_at,
+        returncode=0,
+    )
+    return 0
+
+
 def run_tool(tool, args):
     project_dir = Path(tool["project_dir"])
     started_at = time.monotonic()
@@ -734,9 +771,7 @@ def main(argv):
         tools = load()
         by_name = {{tool["name"]: tool for tool in tools}}
         if command == "list":
-            for tool in tools:
-                print(f'{{tool["name"]}}\\t{{tool["project_dir"]}}')
-            return 0
+            return list_tools(tools)
         if command == "json":
             print(json.dumps(tools, indent=2, sort_keys=True))
             return 0

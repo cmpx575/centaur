@@ -178,9 +178,26 @@ namespace as this release, so a short DNS name is enough.
 {{- end -}}
 
 {{- /*
+Render the standard Kubernetes PodSpec scheduling fields supported by
+chart-managed workloads.
+*/ -}}
+{{- define "centaur.podScheduling" -}}
+{{- $values := .values -}}
+{{- $indent := .indent -}}
+{{- with $values.nodeSelector -}}
+{{- printf "nodeSelector:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- with $values.affinity -}}
+{{- printf "affinity:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- with $values.tolerations -}}
+{{- printf "tolerations:\n%s" (toYaml . | indent 2) | nindent $indent }}
+{{- end -}}
+{{- end -}}
+
+{{- /*
 console — Rails control plane (formerly "iron-control") for authenticated API
-access and encrypted secret storage. Flag-gated (console.enabled), in-cluster
-ClusterIP Service.
+access and encrypted secret storage. Required in-cluster ClusterIP Service.
 
 Backwards compatibility: the canonical values key is `console`; `ironControl` is
 a deprecated alias that is still honored. `centaur.consoleValues` returns the

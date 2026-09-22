@@ -1,4 +1,6 @@
 class User < ApplicationRecord
+  class SsoEmailDomainNotAllowed < StandardError; end
+
   oid_prefix "usr"
 
   # validations: false because SSO-only users have no password. The password
@@ -9,6 +11,10 @@ class User < ApplicationRecord
   has_many :api_keys, dependent: :destroy
   has_many :mcp_oauth_refresh_tokens, dependent: :destroy
   has_many :user_identities, dependent: :destroy
+  has_many :skills, dependent: :destroy
+  has_many :scheduled_tasks, foreign_key: :author_id, dependent: :restrict_with_error
+  has_many :skill_editor_assignments, class_name: "SkillEditor", dependent: :destroy
+  has_many :edited_skills, through: :skill_editor_assignments, source: :skill
   belongs_to :approved_by, class_name: "User", optional: true
 
   after_update :revoke_mcp_oauth_refresh_tokens_when_disabled,
@@ -46,6 +52,8 @@ class User < ApplicationRecord
   # verified email is on the bootstrap allowlist). +identity+ is the provider
   # strategy's { subject:, email:, email_verified:, name: } hash.
   def self.link_or_provision(provider:, identity:)
+    raise SsoEmailDomainNotAllowed unless ConsoleAuth.sso_email_allowed?(identity[:email])
+
     transaction do
       user =
         if (existing = UserIdentity.find_by(provider: provider, subject: identity[:subject]))
@@ -82,10 +90,9 @@ class User < ApplicationRecord
   end
   private_class_method :identity_attributes
 
-  # Attributes for a brand-new SSO user: everyone is provisioned active -- the
-  # console is only reachable on the internal network, so a completed SSO login
-  # is sufficient and there is no admin-approval queue. Admin additionally
-  # requires a bootstrap-allowlisted, IdP-verified email.
+  # Attributes for a brand-new SSO user: everyone is provisioned active once the
+  # IdP identity has passed the configured SSO admission policy. Admin
+  # additionally requires a bootstrap-allowlisted, IdP-verified email.
   def self.provisioned_attributes(identity)
     admin = identity[:email_verified] == true && ConsoleAuth.bootstrap_admin?(identity[:email])
     { email: identity[:email], name: identity[:name], status: :active, admin: admin }

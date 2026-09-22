@@ -1,7 +1,9 @@
 mod activity_summary;
 mod args;
 
-use centaur_api_server::{AppState, build_router_with_app_state};
+use centaur_api_server::{
+    ApiAuthConfig, AppState, build_router_with_app_state, warm_slack_public_channel_cache,
+};
 use centaur_session_runtime::SessionRuntime;
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{TelemetryConfig, init_telemetry};
@@ -19,14 +21,16 @@ async fn main() -> Result<(), ServerError> {
     let telemetry = init_telemetry(TelemetryConfig::from_env())?;
 
     let args = Args::parse();
+    let api_auth = ApiAuthConfig::from_env()?;
     let listener = TcpListener::bind(args.server.bind_addr).await?;
     info!(
         bind_addr = %args.server.bind_addr,
         "starting centaur api-rs server"
     );
 
-    let app_state = AppState::unready();
+    let app_state = AppState::unready(api_auth);
     let app = build_router_with_app_state(app_state.clone());
+    warm_slack_public_channel_cache();
     let shutdown_state = app_state.clone();
     let drain_timeout = args.shutdown_execution_drain_timeout();
     let mut server = tokio::spawn(async move {
@@ -75,35 +79,32 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     }
     let pool = store.pool().clone();
     let sandbox_runtime = args.sandbox_runtime().await?;
-    let mut runtime = SessionRuntime::new(store.clone(), sandbox_runtime)
+    let iron_control = args.iron_control_runtime().await?;
+    let mut runtime = SessionRuntime::new(store.clone(), sandbox_runtime, iron_control.registrar)
+        .with_session_principal_admission(args.session_principal_admission())
         .with_openai_session_title_generator_from_env();
-    let mut warm_pool_bootstrap_principal = None;
-    let mut workflow_host_principal = None;
-    if let Some(iron_control) = args.iron_control_runtime().await? {
-        info!("iron-control session registration enabled");
-        warm_pool_bootstrap_principal = Some(iron_control.warm_pool_bootstrap_principal);
-        workflow_host_principal = Some(iron_control.workflow_host_principal);
-        runtime = runtime.with_iron_control(iron_control.registrar);
-    }
     runtime = runtime.with_personas(args.persona_registry()?);
     let sandbox_capacity_config = args.sandbox_capacity_config();
     if let Some(config) = sandbox_capacity_config {
         runtime = runtime.with_sandbox_capacity(config);
     }
-    if let Some(mut config) = args.warm_pool_config() {
-        config.bootstrap_iron_control_principal = warm_pool_bootstrap_principal.clone();
+    if let Some(config) = args.warm_pool_config(&iron_control.warm_pool_bootstrap_principal) {
         runtime = runtime.with_warm_pool(config);
     }
     runtime = runtime.with_sandbox_reaper(args.sandbox_reaper_config());
     runtime = runtime.with_sandbox_cleanup(args.sandbox_cleanup_config());
+    if let Some(config) = args.session_event_retention_config() {
+        runtime = runtime.with_session_event_retention(config);
+    }
     let workflow_host_sandbox = args
-        .workflow_host_sandbox_runtime(workflow_host_principal.as_deref())
+        .workflow_host_sandbox_runtime(&iron_control.workflow_host_principal)
         .await?;
     let workflows = Some(
-        WorkflowRuntime::new_with_workflow_host_sandbox(
+        WorkflowRuntime::new(
             store,
             runtime.clone(),
             workflow_host_sandbox,
+            iron_control.workflow_principal_registrar,
         )
         .await?,
     );
@@ -124,7 +125,12 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         }
     }
 
-    app_state.mark_ready(runtime, workflows, Some(pool));
+    app_state.mark_ready_with_workflow_host(
+        runtime,
+        workflows,
+        Some(pool),
+        iron_control.workflow_host_principal,
+    );
     info!("centaur api-rs runtime initialized");
     Ok(())
 }
@@ -178,6 +184,8 @@ pub(crate) enum ServerError {
     #[error(transparent)]
     Kube(#[from] kube::Error),
     #[error(transparent)]
+    Sandbox(#[from] centaur_sandbox_core::SandboxError),
+    #[error(transparent)]
     IronProxy(#[from] centaur_iron_proxy::IronProxyConfigError),
     #[error(transparent)]
     IronControl(#[from] centaur_iron_control::IronControlError),
@@ -189,6 +197,8 @@ pub(crate) enum ServerError {
     ToolDiscovery(#[from] centaur_api_server::ToolDiscoveryError),
     #[error(transparent)]
     ActivitySummary(#[from] activity_summary::ActivitySummaryError),
+    #[error(transparent)]
+    ApiAuth(#[from] centaur_api_server::ApiAuthConfigError),
     #[error("tool source error: {0}")]
     ToolSource(String),
     #[error("iron-proxy requires both firewall CA cert and key Secret names")]

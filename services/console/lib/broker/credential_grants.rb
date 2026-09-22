@@ -1,3 +1,6 @@
+require "base64"
+require "uri"
+
 module Broker
   # Registry for broker credential token-exchange strategies. BrokerCredential
   # owns persistence and scheduling; these strategies own provider-specific
@@ -6,8 +9,8 @@ module Broker
     PREQIN_TOKEN_ENDPOINT = "https://api.preqin.com/connect/token".freeze
     PREQIN_REFRESH_TOKEN_ENDPOINT = "https://api.preqin.com/connect/refresh_token".freeze
 
-    GRANTS = %w[refresh_token password preqin].freeze
-    REFRESHABLE_WITHOUT_TOKEN_GRANTS = %w[password preqin].freeze
+    GRANTS = %w[refresh_token client_credentials password preqin].freeze
+    REFRESHABLE_WITHOUT_TOKEN_GRANTS = %w[client_credentials password preqin].freeze
 
     Outcome = Data.define(:result, :clear_refresh_token, :dead_reason)
 
@@ -22,6 +25,8 @@ module Broker
 
       def validate(credential)
         case credential.grant
+        when "client_credentials"
+          validate_client_credentials(credential)
         when "password"
           validate_password(credential)
         when "preqin"
@@ -31,6 +36,8 @@ module Broker
 
       def refresh(credential)
         case credential.grant
+        when "client_credentials"
+          refresh_client_credentials(credential)
         when "password"
           refresh_password(credential)
         when "preqin"
@@ -80,6 +87,15 @@ module Broker
         success(result, clear_refresh_token: clear_stale_refresh_token && result.refresh_token.blank?)
       end
 
+      def refresh_client_credentials(credential)
+        result = post_token_form(
+          credential,
+          url: credential.token_endpoint,
+          form: client_credentials_form(credential)
+        )
+        success(result)
+      end
+
       def refresh_preqin(credential)
         clear_stale_refresh_token = false
 
@@ -125,11 +141,23 @@ module Broker
       end
 
       def post_token_form(credential, url:, form:, form_encoding: :urlencoded, strict_4xx: false)
+        headers = (credential.token_endpoint_headers || {}).dup
+        if credential.oauth_app&.provider_strategy&.respond_to?(:token_endpoint_auth_method) &&
+            credential.oauth_app.provider_strategy.token_endpoint_auth_method.to_sym == :client_secret_basic
+          client_id = credential.effective_client_id
+          client_secret = credential.effective_client_secret
+          require_value!("client_id", client_id)
+          require_value!("client_secret", client_secret)
+          encoded_client_id = URI.encode_www_form_component(client_id)
+          encoded_client_secret = URI.encode_www_form_component(client_secret)
+          headers["Authorization"] = "Basic #{Base64.strict_encode64("#{encoded_client_id}:#{encoded_client_secret}")}"
+          form = form.except("client_id", "client_secret")
+        end
         credential.refresh_client.refresh(
           url: url,
           form: form,
           form_encoding: form_encoding,
-          headers: credential.token_endpoint_headers || {},
+          headers: headers,
           timeout: credential.refresh_timeout_seconds,
           strict_4xx: strict_4xx
         )
@@ -157,6 +185,18 @@ module Broker
           "username" => credential.username,
           "password" => credential.password,
           "client_id" => credential.effective_client_id
+        }
+        add_oauth_optional_fields(form, credential)
+      end
+
+      def client_credentials_form(credential)
+        require_value!("client_id", credential.effective_client_id)
+        require_value!("client_secret", credential.effective_client_secret)
+
+        form = {
+          "grant_type" => "client_credentials",
+          "client_id" => credential.effective_client_id,
+          "client_secret" => credential.effective_client_secret
         }
         add_oauth_optional_fields(form, credential)
       end
@@ -192,6 +232,12 @@ module Broker
       def validate_password(credential)
         credential.errors.add(:username, "can't be blank for the password grant") if credential.username.blank?
         credential.errors.add(:password, "can't be blank for the password grant") if credential.password.blank?
+      end
+
+      def validate_client_credentials(credential)
+        if credential.effective_client_secret.blank?
+          credential.errors.add(:client_secret, "can't be blank for the client_credentials grant")
+        end
       end
 
       def validate_preqin(credential)

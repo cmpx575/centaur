@@ -10,7 +10,18 @@ from rich.table import Table
 
 load_dotenv()
 
-app = typer.Typer(name="slack", help="Slack CLI for AI agents")
+app = typer.Typer(
+    name="slack",
+    help=(
+        "Slack CLI for AI agents with two access paths. Proxied commands omit the "
+        "`-direct` suffix (for example, `thread` and `upload`), route through the Centaur "
+        "API, and are for Slack channel chat surfaces. Direct commands end in `-direct` "
+        "(for example, `thread-direct` and `upload-direct`) and call Slack with an actual user "
+        "token. Use direct commands when a user token is available, including in Slack DM chat "
+        "surfaces and MCP. Choose the command flavor that matches the current surface and "
+        "credential context."
+    ),
+)
 
 
 @app.command("health")
@@ -78,6 +89,29 @@ def send(
 
 
 @app.command()
+def react(
+    channel_id: str = typer.Argument(..., help="Slack conversation ID, e.g. C1234567890"),
+    timestamp: str = typer.Argument(..., help="Timestamp of the message to react to"),
+    emoji: str = typer.Argument(..., help="Emoji name, e.g. pencil2 (surrounding colons optional)"),
+):
+    """Add an emoji reaction to a message using the bot's reactions:write scope.
+
+    Example: slack react C1234567890 1234567890.123456 pencil2
+    """
+    from .client import add_reaction
+
+    try:
+        result = add_reaction(channel_id, timestamp, emoji)
+        if result["added"]:
+            console.print("[green]✓ Reaction added[/]")
+        else:
+            console.print("[green]✓ Reaction already present[/]")
+    except (RuntimeError, ValueError) as e:
+        stderr_console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+
+@app.command()
 def dm(
     user_id: str = typer.Argument(..., help="Slack user ID, e.g. U12345678"),
     message: str = typer.Argument(..., help="Message text to send"),
@@ -103,45 +137,10 @@ def dm(
         raise typer.Exit(1)
 
 
-@app.command()
-def search(
-    query: str = typer.Argument(..., help="Text to search for (supports multiple terms)"),
-    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
-    full: bool = typer.Option(False, "--full", "-f", help="Show full message text"),
-    channels: str = typer.Option(
-        None, "--channels", "-c", help="Comma-separated channel names to search"
-    ),
-    from_user: str = typer.Option(None, "--from", help="Filter by username"),
-    depth: int = typer.Option(200, "--depth", "-d", help="Messages per channel to scan"),
-):
-    """Search messages in bot-accessible channels.
-
-    Searches across Slack native search first, then scans channel history through
-    the Centaur API server proxy. Results are ranked by relevance (exact phrase
-    matches score higher). Use --channels to limit scope.
-
-    Note: Only searches channels where the bot is a member. To search more channels,
-    invite the bot to those channels first.
-
-    Examples:
-        slack search "deploy"
-        slack search "kubernetes error" --channels eng-infra,eng-ai
-        slack search "database migration" --from alice --depth 500
-    """
-    from .client import search_messages
-
-    channel_list = [c.strip() for c in channels.split(",")] if channels else None
-    results = search_messages(
-        query,
-        max_results=limit,
-        channels=channel_list,
-        from_user=from_user,
-        messages_per_channel=depth,
-    )
-
+def _print_message_search_results(query: str, results: list[dict], *, full: bool) -> None:
     if not results:
         console.print("[yellow]No messages found.[/]")
-        raise typer.Exit()
+        return
 
     if full:
         for i, msg in enumerate(results, 1):
@@ -150,19 +149,101 @@ def search(
             console.print(f"[dim]{msg['permalink']}[/]")
             if i < len(results):
                 console.print("---")
-    else:
-        table = Table(title=f"Slack: '{query}' ({len(results)} results)")
-        table.add_column("Channel", style="cyan", max_width=15)
-        table.add_column("User", style="green", max_width=15)
-        table.add_column("Message", style="white", max_width=80)
+        return
 
-        for msg in results:
-            text = msg["text"][:80].replace("\n", " ")
-            if len(msg["text"]) > 80:
-                text += "..."
-            table.add_row(f"#{msg['channel']}", msg["user"], text)
+    table = Table(title=f"Slack: '{query}' ({len(results)} results)")
+    table.add_column("Channel", style="cyan", max_width=15)
+    table.add_column("User", style="green", max_width=15)
+    table.add_column("Message", style="white", max_width=80)
 
-        console.print(table)
+    for msg in results:
+        text = msg["text"][:80].replace("\n", " ")
+        if len(msg["text"]) > 80:
+            text += "..."
+        table.add_row(f"#{msg['channel']}", msg["user"], text)
+
+    console.print(table)
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Text to search for (supports multiple terms)"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
+    full: bool = typer.Option(False, "--full", "-f", help="Output full indexed result metadata"),
+    channels: str = typer.Option(
+        None, "--channels", "-c", help="Comma-separated channel names or IDs to target"
+    ),
+    from_user: str = typer.Option(None, "--from", help="Target messages by this username"),
+):
+    """Search indexed Slack history through company context.
+
+    This command searches normalized, access-scoped Slack rows rather than
+    downloading channel history. Channel and author options are exact filters.
+    Use search-direct for native Slack modifiers when a linked user credential
+    is available.
+
+    Examples:
+        slack search "deploy"
+        slack search "kubernetes error" --channels eng-infra,eng-ai
+        slack search "database migration" --from alice
+    """
+    channel_list = [channel.strip() for channel in channels.split(",")] if channels else None
+
+    from .client import IndexedSlackClient
+
+    result = IndexedSlackClient().search_messages(
+        query=query,
+        limit=limit,
+        channels=channel_list,
+        from_user=from_user,
+    )
+    if result.get("status") == "error":
+        stderr_console.print(f"[red]Error: {result.get('error', 'unknown error')}[/]")
+        raise typer.Exit(1)
+
+    if full:
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return
+
+    _print_message_search_results(query, result.get("results") or [], full=False)
+
+
+@app.command("search-direct")
+def search_direct(
+    query: str = typer.Argument(..., help="Slack search query, including native modifiers"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
+    full: bool = typer.Option(False, "--full", "-f", help="Show full message text"),
+    channels: str = typer.Option(
+        None, "--channels", "-c", help="Comma-separated channel names or IDs to search"
+    ),
+    from_user: str = typer.Option(None, "--from", help="Filter by username"),
+):
+    """Search directly with Slack's native user-token search API.
+
+    Use this command when the current Slack context provides a linked user's
+    credential. Channel filters remain native Slack search modifiers; this
+    command never downloads and scans channel history.
+
+    Examples:
+        slack search-direct "deploy"
+        slack search-direct "kubernetes error" --channels eng-infra,eng-ai
+        slack search-direct "database migration" --from alice
+    """
+    from .client import search_messages_direct
+
+    channel_list = [c.strip() for c in channels.split(",")] if channels else None
+    try:
+        results = search_messages_direct(
+            query,
+            max_results=limit,
+            channels=channel_list,
+            from_user=from_user,
+        )
+    except (RuntimeError, ValueError) as e:
+        stderr_console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from e
+
+    _print_message_search_results(query, results, full=full)
 
 
 @app.command("channel-direct")
@@ -191,7 +272,9 @@ def channel_direct(
         "--allow-name-resolution",
         help="Allow resolving a channel name instead of requiring an explicit Slack channel ID",
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output full page metadata as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Output full page metadata as JSON (default)"
+    ),
 ):
     """Get recent messages from a channel directly with the Slack SDK."""
     import sys
@@ -265,7 +348,9 @@ def channel(
         help="Ask Slack to return all message metadata",
     ),
     full: bool = typer.Option(False, "--full", "-f", help="Show full message text"),
-    json_output: bool = typer.Option(False, "--json", help="Output raw proxy response as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Output raw proxy response as JSON (default)"
+    ),
 ):
     """Get channel history through the Centaur API server proxy."""
     import sys
@@ -351,9 +436,11 @@ def thread(
     inclusive: bool = typer.Option(
         True, "--inclusive/--exclusive", help="Include the boundary timestamps"
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    json_output: bool = typer.Option(True, "--json/--no-json", help="Output as JSON (default)"),
 ):
-    """Get all replies in a thread.
+    """Get all replies through the Centaur API server Slack proxy.
+
+    Use this command for Slack channels. Use thread-direct for Slack DMs.
 
     Examples:
         slack thread "https://slack.com/archives/C01234567/p1234567890123456"
@@ -424,9 +511,11 @@ def thread_direct(
     inclusive: bool = typer.Option(
         True, "--inclusive/--exclusive", help="Include the boundary timestamps"
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+    json_output: bool = typer.Option(True, "--json/--no-json", help="Output as JSON (default)"),
 ):
-    """Get all replies in a thread directly with the Slack SDK.
+    """Get all replies directly with the Slack SDK.
+
+    Use this command for Slack DMs. Use thread for Slack channels.
 
     Examples:
         slack thread-direct "https://slack.com/archives/C01234567/p1234567890123456"
@@ -504,7 +593,9 @@ def sync_history(
         "--latest",
         help="Override the latest boundary: Slack ts, epoch, ISO datetime, or YYYY-MM-DD",
     ),
-    json_output: bool = typer.Option(False, "--json", help="Output the sync payload as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Output the sync payload as JSON (default)"
+    ),
 ):
     """Run an incremental channel-history sync suitable for ETL jobs."""
     from pathlib import Path
@@ -584,19 +675,11 @@ def _render_channels(results: list[dict], title: str, include_access: bool = Fal
 def channels(
     limit: int = typer.Option(100, "--limit", "-n", help="Max channels"),
     query: str = typer.Option(None, "--query", "-q", help="Filter by name"),
-    bot_member_only: bool = typer.Option(
-        False,
-        "--bot-member-only",
-        help="Only list JWT-authorized channels with history access",
-    ),
 ):
-    """List Slack channels authorized by the Centaur API server proxy JWT."""
+    """List bot-readable public and explicitly granted channels from the proxy."""
     from .client import list_channels_proxy
 
-    results = list_channels_proxy(limit=limit, history_only=bot_member_only)
-
-    if query:
-        results = [c for c in results if query.lower() in c["name"].lower()]
+    results = list_channels_proxy(limit=limit, query=query)
 
     _render_channels(results, f"Channels ({len(results)})", include_access=True)
 
@@ -625,18 +708,66 @@ def channels_direct(
     _render_channels(results, f"Channels ({len(results)})")
 
 
+def _render_channel_members(channel: str, members: list[dict], emails_only: bool) -> None:
+    if not members:
+        console.print("[yellow]No members found.[/]")
+        raise typer.Exit()
+
+    if emails_only:
+        for m in members:
+            if m.get("email"):
+                console.print(m["email"])
+        return
+
+    table = Table(title=f"#{channel} Members ({len(members)})")
+    table.add_column("Name", style="cyan", max_width=20)
+    table.add_column("Real Name", style="white", max_width=25)
+    table.add_column("Email", style="green", max_width=35)
+
+    for m in members:
+        table.add_row(f"@{m['name']}", m.get("real_name", ""), m.get("email", ""))
+
+    console.print(table)
+
+
+@app.command("channel-members-proxy")
 @app.command("channel-members")
 def channel_members_cmd(
+    channel_id: str = typer.Argument(..., help="Slack channel ID, e.g. C1234567890"),
+    limit: int = typer.Option(1000, "--limit", "-n", help="Max members"),
+    emails_only: bool = typer.Option(
+        False, "--emails", "-e", help="Output only email addresses (one per line)"
+    ),
+):
+    """List members of a Slack channel through the Centaur API server proxy.
+
+    Examples:
+        slack channel-members C1234567890
+        slack channel-members C1234567890 --emails
+    """
+    from .client import get_channel_members_proxy
+
+    try:
+        members = get_channel_members_proxy(channel_id, limit=limit)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    _render_channel_members(channel_id, members, emails_only)
+
+
+@app.command("channel-members-direct")
+def channel_members_direct_cmd(
     channel: str = typer.Argument(..., help="Channel name (without #) or channel ID"),
     emails_only: bool = typer.Option(
         False, "--emails", "-e", help="Output only email addresses (one per line)"
     ),
 ):
-    """List all members of a Slack channel.
+    """List all members of a Slack channel directly with the Slack SDK.
 
     Examples:
-        slack channel-members eng-ai
-        slack channel-members eng-ai --emails
+        slack channel-members-direct eng-ai
+        slack channel-members-direct eng-ai --emails
     """
     from .client import get_channel_members
 
@@ -646,24 +777,7 @@ def channel_members_cmd(
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
 
-    if not members:
-        console.print("[yellow]No members found.[/]")
-        raise typer.Exit()
-
-    if emails_only:
-        for m in members:
-            if m.get("email"):
-                console.print(m["email"])
-    else:
-        table = Table(title=f"#{channel} Members ({len(members)})")
-        table.add_column("Name", style="cyan", max_width=20)
-        table.add_column("Real Name", style="white", max_width=25)
-        table.add_column("Email", style="green", max_width=35)
-
-        for m in members:
-            table.add_row(f"@{m['name']}", m.get("real_name", ""), m.get("email", ""))
-
-        console.print(table)
+    _render_channel_members(channel, members, emails_only)
 
 
 @app.command()
@@ -946,23 +1060,68 @@ def usergroup_update(
 
 @app.command("search-files")
 def search_files_cmd(
+    channel_id: str = typer.Argument(..., help="Slack channel ID to search"),
     query: str = typer.Argument(..., help="Search query for files"),
     limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
 ):
-    """Search files shared across the workspace.
+    """Search files shared in a Slack channel.
 
     Examples:
-        slack search-files "quarterly report"
-        slack search-files "architecture diagram" -n 10
+        slack search-files C123456789 "quarterly report"
+        slack search-files C123456789 "architecture diagram" -n 10
     """
     from .client import search_files
 
     try:
-        results = search_files(query, max_results=limit)
+        results = search_files(channel_id, query, max_results=limit)
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
 
+    _print_file_search_results(query, results)
+
+
+@app.command("search-files-direct")
+def search_files_direct_cmd(
+    query: str = typer.Argument(..., help="Search query for files"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
+):
+    """Search files by calling Slack files.list directly.
+
+    Examples:
+        slack search-files-direct "quarterly report"
+        slack search-files-direct "architecture diagram" -n 10
+    """
+    from .client import search_files_direct
+
+    try:
+        results = search_files_direct(query, max_results=limit)
+    except RuntimeError as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    _print_file_search_results(query, results)
+
+
+def _format_file_size(size: object) -> str:
+    try:
+        size_bytes = int(size or 0)
+    except (TypeError, ValueError):
+        return str(size)
+    if size_bytes >= 1_000_000:
+        return f"{size_bytes / 1_000_000:.1f}MB"
+    if size_bytes >= 1_000:
+        return f"{size_bytes / 1_000:.0f}KB"
+    return f"{size_bytes}B"
+
+
+def _format_file_info_value(key: str, value: object) -> str:
+    if key == "size":
+        return _format_file_size(value)
+    return str(value)
+
+
+def _print_file_search_results(query: str, results: list[dict]) -> None:
     if not results:
         console.print("[yellow]No files found.[/]")
         raise typer.Exit()
@@ -974,15 +1133,56 @@ def search_files_cmd(
     table.add_column("Size", style="dim", justify="right", max_width=10)
 
     for f in results:
-        size = f["size"]
-        if size > 1_000_000:
-            size_str = f"{size / 1_000_000:.1f}MB"
-        elif size > 1000:
-            size_str = f"{size / 1000:.0f}KB"
-        else:
-            size_str = f"{size}B"
-        table.add_row(f["name"], f["filetype"], f["user"], size_str)
+        table.add_row(f["name"], f["filetype"], f["user"], _format_file_size(f["size"]))
 
+    console.print(table)
+
+
+@app.command("file-info-proxy")
+@app.command("file-info")
+def file_info(
+    file_id: str = typer.Argument(..., help="Slack file ID, e.g. F1234567890"),
+    channel_id: str = typer.Argument(
+        ..., help="Slack channel/conversation ID that the file is shared in"
+    ),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Output raw metadata as JSON (default)"
+    ),
+):
+    """Fetch Slack file metadata through the Centaur API server Slack proxy."""
+    import sys
+
+    from .client import file_info_proxy
+
+    try:
+        result = file_info_proxy(file_id=file_id, channel_id=channel_id)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]Error fetching Slack file info: {e}[/]")
+        raise typer.Exit(1) from e
+
+    if json_output:
+        print(json.dumps(result, indent=2, ensure_ascii=False), file=sys.stdout)
+        raise typer.Exit()
+
+    file = result.get("file", {})
+    table = Table(title=f"Slack File {result.get('file_id') or file_id}")
+    table.add_column("Field", style="cyan", max_width=18)
+    table.add_column("Value", style="white", max_width=90)
+    for key in [
+        "id",
+        "name",
+        "title",
+        "mimetype",
+        "filetype",
+        "size",
+        "user",
+        "created",
+        "permalink",
+        "url_private",
+    ]:
+        value = file.get(key)
+        if value not in (None, "", []):
+            table.add_row(key, _format_file_info_value(key, value))
     console.print(table)
 
 
@@ -1129,8 +1329,9 @@ def files(
     else:
         console.print(f"[bold]Files ({len(files_list)})[/]\n")
         for f in files_list:
-            size_kb = f["size"] / 1024
-            console.print(f"[cyan]{f['name']}[/] ({f['filetype']}, {size_kb:.1f} KB)")
+            console.print(
+                f"[cyan]{f['name']}[/] ({f['filetype']}, {_format_file_size(f['size'])})"
+            )
             console.print(f"  [dim]{f['url_private']}[/]")
 
 
@@ -1208,7 +1409,9 @@ def download(
         ..., help="Slack channel/conversation ID that the file is shared in"
     ),
     output: str = typer.Option(".", "--output", "-o", help="Output directory for downloads"),
-    json_output: bool = typer.Option(False, "--json", help="Print metadata as JSON"),
+    json_output: bool = typer.Option(
+        True, "--json/--no-json", help="Print downloaded file metadata as JSON (default)"
+    ),
 ):
     """Download a Slack file through the Centaur API server Slack proxy."""
     import base64
@@ -1223,278 +1426,19 @@ def download(
         console.print(f"[red]Error downloading Slack file: {e}[/]")
         raise typer.Exit(1) from e
 
-    if json_output:
-        metadata = {key: value for key, value in result.items() if key != "content_base64"}
-        print(json.dumps(metadata, indent=2, ensure_ascii=False), file=sys.stdout)
-        raise typer.Exit()
-
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / result["filename"]
     out_path.write_bytes(base64.b64decode(result["content_base64"]))
+
+    if json_output:
+        metadata = {key: value for key, value in result.items() if key != "content_base64"}
+        metadata["output_path"] = str(out_path.absolute())
+        print(json.dumps(metadata, indent=2, ensure_ascii=False), file=sys.stdout)
+        return
+
     console.print(f"[green]✓ Downloaded {result['filename']}[/] ({result['size_bytes']} bytes)")
     console.print(f"[dim]{out_path.absolute()}[/]")
-
-
-# === Feedback Commands ===
-
-
-@app.command()
-def feedback(
-    action: str = typer.Argument(
-        "collect",
-        help="Action: collect, backfill, digest, show, update-status, improve, loop",
-    ),
-    channels: str = typer.Option(
-        "test-bot",
-        "--channels",
-        "-c",
-        help="Comma-separated channel names to scan",
-    ),
-    since_days: int = typer.Option(
-        None,
-        "--since-days",
-        "-d",
-        help="Override checkpoint, scan last N days",
-    ),
-    limit: int = typer.Option(200, "--limit", "-n", help="Max threads per channel"),
-    status: str = typer.Option(
-        None, "--status", "-s", help="Filter by status (new, triaged, fixed)"
-    ),
-    category: str = typer.Option(None, "--category", help="Filter by category"),
-    severity: str = typer.Option(None, "--severity", help="Min severity (low, medium, high)"),
-    item_id: int = typer.Option(None, "--id", help="Feedback item ID (for show/update-status)"),
-    new_status: str = typer.Option(None, "--new-status", help="New status for update-status"),
-    output: str = typer.Option(None, "--output", "-o", help="Output file path"),
-    max_items: int = typer.Option(
-        8, "--max-items", help="Max actionable feedback items per improvement run"
-    ),
-    persona: str = typer.Option(
-        "eng", "--persona", help="Persona to use for auto-improvement runs"
-    ),
-    harness: str = typer.Option(
-        "amp", "--harness", help="Harness to use for auto-improvement runs"
-    ),
-    interval_sec: int = typer.Option(
-        900, "--interval-sec", help="Sleep interval between loop iterations"
-    ),
-    iterations: int = typer.Option(
-        0, "--iterations", help="Number of loop iterations to run; 0 means forever"
-    ),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Build the improvement prompt without dispatching an agent run"
-    ),
-):
-    """Collect and analyze feedback from bot interactions.
-
-    Actions:
-      collect  - Scan channels for new feedback (incremental)
-      backfill - Scan historical feedback ignoring the usual per-channel cap
-      digest   - Generate markdown digest of feedback
-      show     - Show details of a specific feedback item
-      update-status - Update status of a feedback item
-      improve  - Collect feedback and dispatch a background agent improvement run
-      loop     - Repeatedly run the improvement cycle
-
-    Examples:
-        slack feedback collect -c test-bot
-        slack feedback backfill -c test-bot --since-days 30 --limit 0
-        slack feedback collect -c test-bot,eng-ai --since-days 7
-        slack feedback digest --severity medium
-        slack feedback digest --status new -o /tmp/digest.md
-        slack feedback update-status --id 42 --new-status triaged
-        slack feedback improve --persona eng --harness amp
-        slack feedback loop --iterations 1 --interval-sec 300
-    """
-    import json
-    import time
-
-    from .feedback import (
-        backfill_feedback,
-        collect_feedback,
-        format_digest_markdown,
-        get_feedback_digest,
-        init_db,
-        run_improvement_cycle,
-        update_feedback_status,
-    )
-
-    channel_list = [c.strip() for c in channels.split(",")]
-    limit_per_channel = None if limit <= 0 else limit
-
-    if action == "collect":
-        console.print(f"[bold]Collecting feedback from: {', '.join(channel_list)}[/]")
-        stats = collect_feedback(
-            channels=channel_list,
-            limit_per_channel=limit_per_channel,
-            since_days=since_days,
-        )
-        console.print("\n[green]✓ Collection complete[/]")
-        console.print(f"  Channels scanned: {stats['channels_scanned']}")
-        console.print(f"  Threads analyzed: {stats['threads_analyzed']}")
-        console.print(f"  Feedback items created: {stats['feedback_items_created']}")
-        console.print(f"  Feedback items updated: {stats['feedback_items_updated']}")
-        if stats["by_category"]:
-            console.print(f"  By category: {stats['by_category']}")
-        if stats["by_severity"]:
-            console.print(f"  By severity: {stats['by_severity']}")
-
-    elif action == "backfill":
-        lookback_days = since_days or 30
-        backfill_limit = None if limit == 200 else limit_per_channel
-        console.print(f"[bold]Backfilling feedback from: {', '.join(channel_list)}[/]")
-        stats = backfill_feedback(
-            channels=channel_list,
-            since_days=lookback_days,
-            limit_per_channel=backfill_limit,
-        )
-        console.print("\n[green]✓ Backfill complete[/]")
-        console.print(f"  Lookback days: {lookback_days}")
-        console.print(f"  Channels scanned: {stats['channels_scanned']}")
-        console.print(f"  Threads analyzed: {stats['threads_analyzed']}")
-        console.print(f"  Feedback items created: {stats['feedback_items_created']}")
-        console.print(f"  Feedback items updated: {stats['feedback_items_updated']}")
-        if stats["by_category"]:
-            console.print(f"  By category: {stats['by_category']}")
-        if stats["by_severity"]:
-            console.print(f"  By severity: {stats['by_severity']}")
-
-    elif action == "digest":
-        items = get_feedback_digest(
-            since_days=since_days or 7,
-            status=status,
-            category=category,
-            min_severity=severity,
-        )
-        md = format_digest_markdown(items)
-
-        if output:
-            from pathlib import Path
-
-            Path(output).write_text(md)
-            console.print(f"[green]✓ Digest written to {output}[/]")
-        else:
-            print(md)
-
-    elif action == "show":
-        if not item_id:
-            console.print("[red]Error: --id required for show action[/]")
-            raise typer.Exit(1)
-
-        conn = init_db()
-        row = conn.execute("SELECT * FROM feedback_items WHERE id = ?", (item_id,)).fetchone()
-        conn.close()
-
-        if not row:
-            console.print(f"[red]Error: Feedback item {item_id} not found[/]")
-            raise typer.Exit(1)
-
-        console.print(f"\n[bold]Feedback Item #{row['id']}[/]\n")
-        console.print(f"[cyan]Channel:[/] {row['slack_channel']}")
-        console.print(f"[cyan]Permalink:[/] {row['permalink']}")
-        console.print(f"[cyan]Category:[/] {row['category']}")
-        console.print(f"[cyan]Severity:[/] {row['severity']}")
-        console.print(f"[cyan]Status:[/] {row['status']}")
-        console.print(f"[cyan]Reporter:[/] {row['reporter_user']}")
-        console.print(f"[cyan]CLI:[/] {row['cli_involved'] or 'none'}")
-        if row["amp_thread_id"]:
-            console.print(
-                f"[cyan]Amp Thread:[/] https://ampcode.com/threads/{row['amp_thread_id']}"
-            )
-        console.print(f"\n[cyan]Summary:[/]\n{row['summary']}")
-        console.print(f"\n[cyan]Evidence:[/]\n{json.dumps(json.loads(row['evidence']), indent=2)}")
-
-    elif action == "update-status":
-        if not item_id or not new_status:
-            console.print("[red]Error: --id and --new-status required[/]")
-            raise typer.Exit(1)
-
-        valid_statuses = ["new", "triaged", "in_progress", "fixed", "wontfix"]
-        if new_status not in valid_statuses:
-            console.print(f"[red]Error: Status must be one of: {valid_statuses}[/]")
-            raise typer.Exit(1)
-
-        if update_feedback_status(item_id, new_status):
-            console.print(f"[green]✓ Updated item {item_id} to status: {new_status}[/]")
-        else:
-            console.print(f"[red]Error: Item {item_id} not found[/]")
-            raise typer.Exit(1)
-
-    elif action == "improve":
-        console.print("[bold]Running auto-improvement cycle...[/]\n")
-        result = run_improvement_cycle(
-            channels=channel_list,
-            since_days=since_days or 7,
-            limit_per_channel=limit_per_channel,
-            max_items=max_items,
-            min_severity=severity or "medium",
-            harness=harness,
-            persona_id=persona,
-            dry_run=dry_run,
-        )
-
-        collect_stats = result["collect_stats"]
-        console.print(
-            f"[dim]Collected: +{collect_stats['feedback_items_created']} new, {collect_stats['feedback_items_updated']} updated[/]"
-        )
-
-        if result["actionable_items"] == 0:
-            console.print("\n[green]✓ No actionable feedback found![/]")
-            console.print("[dim]All recent interactions were successful or low severity.[/]")
-            return
-
-        console.print(f"[cyan]Actionable items:[/] {result['actionable_items']}")
-        console.print(f"[cyan]Item IDs:[/] {result['item_ids']}")
-        if dry_run:
-            print(result["prompt"])
-            return
-
-        console.print("\n[green]✓ Improvement agent dispatched[/]")
-        console.print(f"  Thread key: {result['thread_key']}")
-        console.print(f"  Execution id: {result['execution_id']}")
-
-    elif action == "loop":
-        console.print("[bold]Starting auto-improvement loop...[/]")
-        cycle = 0
-        while iterations == 0 or cycle < iterations:
-            cycle += 1
-            console.print(f"\n[bold]Cycle {cycle}[/]")
-            result = run_improvement_cycle(
-                channels=channel_list,
-                since_days=since_days or 7,
-                limit_per_channel=limit_per_channel,
-                max_items=max_items,
-                min_severity=severity or "medium",
-                harness=harness,
-                persona_id=persona,
-                dry_run=dry_run,
-            )
-            collect_stats = result["collect_stats"]
-            console.print(
-                f"  Collected: +{collect_stats['feedback_items_created']} new, {collect_stats['feedback_items_updated']} updated"
-            )
-            console.print(f"  Actionable: {result['actionable_items']}")
-            if result["dispatched"]:
-                console.print(f"  Execution id: {result['execution_id']}")
-                console.print(f"  Thread key: {result['thread_key']}")
-            elif dry_run and result["actionable_items"]:
-                print(result["prompt"])
-
-            if iterations != 0 and cycle >= iterations:
-                break
-            console.print(f"[dim]Sleeping for {interval_sec}s...[/]")
-            try:
-                time.sleep(interval_sec)
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Loop interrupted[/]")
-                break
-
-    else:
-        console.print(f"[red]Unknown action: {action}[/]")
-        console.print(
-            "Valid actions: collect, backfill, digest, show, update-status, improve, loop"
-        )
-        raise typer.Exit(1)
 
 
 @app.command("channel-emails")

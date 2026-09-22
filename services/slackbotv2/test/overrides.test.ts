@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { SlackFormatConverter } from '@chat-adapter/slack'
-import { extractMessageOverrides } from '../src/overrides'
+import {
+  extractMessageOverrides,
+  normalizeHarnessOverrides,
+  validateStrategyOverrides
+} from '../src/overrides'
+import { messageOverridesForText } from '../src/index'
+import { createOpenAiMessageOverridesStrategy } from '../src/message-overrides-strategy'
+import type { SlackbotV2Options, SlackbotV2Trace } from '../src/types'
 
 describe('extractMessageOverrides', () => {
   test('returns text untouched without flags', () => {
@@ -23,6 +30,8 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('--claude-code review this').harnessType).toBe('claudecode')
     expect(extractMessageOverrides('--amp review this').harnessType).toBe('amp')
     expect(extractMessageOverrides('--codex review this').harnessType).toBe('codex')
+    expect(extractMessageOverrides('--nanocodex review this').harnessType).toBe('nanocodex')
+    expect(extractMessageOverrides('--hermes review this').harnessType).toBe('hermes')
   })
 
   test('parses harness flag anywhere in the message', () => {
@@ -57,10 +66,10 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('--opus fix it')).toEqual({
       cleanedText: 'fix it',
       harnessType: 'claudecode',
-      model: 'claude-opus-4-8',
+      model: 'claude-opus-5',
       reasoning: undefined
     })
-    expect(extractMessageOverrides('--sonnet fix it').model).toBe('claude-sonnet-4-6')
+    expect(extractMessageOverrides('--sonnet fix it').model).toBe('claude-sonnet-5')
     expect(extractMessageOverrides('--haiku fix it').model).toBe('claude-haiku-4-5')
     expect(extractMessageOverrides('--fable fix it').model).toBe('claude-fable-5')
   })
@@ -75,13 +84,42 @@ describe('extractMessageOverrides', () => {
     })
   })
 
+  test('--provider selects an arbitrary codex provider', () => {
+    expect(extractMessageOverrides('--provider private_responses --model example-model audit this')).toEqual({
+      cleanedText: 'audit this',
+      harnessType: 'codex',
+      model: 'example-model',
+      provider: 'private_responses',
+      reasoning: undefined
+    })
+  })
+
+  test('--provider uses the configured provider default model', () => {
+    const previous = process.env.CODEX_CUSTOM_PROVIDERS
+    process.env.CODEX_CUSTOM_PROVIDERS = JSON.stringify({
+      private_responses: { defaultModel: 'configured-model' }
+    })
+    try {
+      expect(extractMessageOverrides('--provider=private_responses audit this')).toEqual({
+        cleanedText: 'audit this',
+        harnessType: 'codex',
+        model: 'configured-model',
+        provider: 'private_responses',
+        reasoning: undefined
+      })
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CUSTOM_PROVIDERS
+      else process.env.CODEX_CUSTOM_PROVIDERS = previous
+    }
+  })
+
   test('--model expands claude aliases to full model ids', () => {
     expect(extractMessageOverrides('--claude --model opus go')).toEqual({
       cleanedText: 'go',
       harnessType: 'claudecode',
-      model: 'claude-opus-4-8'
+      model: 'claude-opus-5'
     })
-    expect(extractMessageOverrides('--model Sonnet go').model).toBe('claude-sonnet-4-6')
+    expect(extractMessageOverrides('--model Sonnet go').model).toBe('claude-sonnet-5')
     expect(extractMessageOverrides('--model fable go').model).toBe('claude-fable-5')
   })
 
@@ -120,7 +158,7 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('--codex --opus fix it')).toEqual({
       cleanedText: 'fix it',
       harnessType: 'codex',
-      model: 'claude-opus-4-8',
+      model: 'claude-opus-5',
       reasoning: undefined
     })
     expect(extractMessageOverrides('--sonnet --model claude-opus-4-8 fix it').model).toBe(
@@ -158,6 +196,15 @@ describe('extractMessageOverrides', () => {
     })
   })
 
+  test('does not consume a following flag as a model value', () => {
+    expect(extractMessageOverrides('--model --claude fix this')).toEqual({
+      cleanedText: '--model fix this',
+      harnessType: 'claudecode',
+      model: undefined,
+      reasoning: undefined
+    })
+  })
+
   test('parses -rsn with space or equals', () => {
     expect(extractMessageOverrides('-rsn high fix it')).toEqual({
       cleanedText: 'fix it',
@@ -178,6 +225,14 @@ describe('extractMessageOverrides', () => {
     expect(extractMessageOverrides('-rsn med fix it').reasoning).toBe('medium')
     expect(extractMessageOverrides('-rsn hi fix it').reasoning).toBe('high')
     expect(extractMessageOverrides('-rsn xhi fix it').reasoning).toBe('xhigh')
+  })
+
+  test('-rsn accepts the GPT-5.6 max effort', () => {
+    expect(extractMessageOverrides('-rsn max fix it').reasoning).toBe('max')
+  })
+
+  test('-rsn accepts the GPT-6 Astra ultra effort', () => {
+    expect(extractMessageOverrides('-rsn ultra fix it').reasoning).toBe('ultra')
   })
 
   test('-rsn combines with a harness flag', () => {
@@ -244,6 +299,494 @@ describe('extractMessageOverrides', () => {
     })
   })
 })
+
+// normalizeHarnessOverrides is the object-shaped sibling of
+// extractMessageOverrides: config fields resolve through the SAME vocabulary
+// tables as the inline flags, so a channel default and a Slack flag validate
+// identically.
+describe('normalizeHarnessOverrides', () => {
+  test('resolves harness / model / provider / reasoning through the flag vocabulary', () => {
+    expect(
+      normalizeHarnessOverrides({ harness: 'claude', model: 'opus', reasoning: 'hi' })
+    ).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-opus-5',
+      provider: undefined,
+      reasoning: 'high'
+    })
+  })
+
+  test('a provider shortcut implies its harness, like --bedrock', () => {
+    expect(normalizeHarnessOverrides({ provider: 'bedrock', model: 'gpt-5.2' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-5.2',
+      provider: 'amazon-bedrock',
+      reasoning: undefined
+    })
+  })
+
+  test('a custom provider is accepted by channel defaults', () => {
+    expect(normalizeHarnessOverrides({ provider: 'private_responses', model: 'example-model' })).toEqual({
+      harnessType: 'codex',
+      model: 'example-model',
+      provider: 'private_responses',
+      reasoning: undefined
+    })
+  })
+
+  test('expands a model alias but does not imply a harness (fields are independent)', () => {
+    // Like `--model opus` (not `--opus`): the alias expands, harness is left to
+    // the explicit `harness` field / thread / deployment default.
+    expect(normalizeHarnessOverrides({ model: 'opus' })).toEqual({
+      harnessType: undefined,
+      model: 'claude-opus-5',
+      provider: undefined,
+      reasoning: undefined
+    })
+  })
+
+  test('reports and drops unrecognized enum-like values', () => {
+    const errors: string[] = []
+    const result = normalizeHarnessOverrides(
+      { harness: 'gpt', provider: 'not valid', reasoning: 'turbo' },
+      message => errors.push(message)
+    )
+    expect(result).toEqual({
+      harnessType: undefined,
+      model: undefined,
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(errors.some(e => e.includes('unknown harness'))).toBe(true)
+    expect(errors.some(e => e.includes('invalid provider id'))).toBe(true)
+    expect(errors.some(e => e.includes('unknown reasoning effort'))).toBe(true)
+  })
+})
+
+describe('validateStrategyOverrides', () => {
+  test('accepts canonical strategy model ids', () => {
+    expect(
+      validateStrategyOverrides({
+        model: 'gpt-5.6-sol',
+        reasoning: 'max'
+      })
+    ).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-5.6-sol',
+      provider: undefined,
+      reasoning: 'max'
+    })
+  })
+
+  test('accepts canonical OpenAI model ids from the model catalog', () => {
+    expect(validateStrategyOverrides({ model: 'gpt-6-astra' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-6-astra',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'gpt-5.6-terra' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-5.6-terra',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'gpt-5.6-luna' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-5.6-luna',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'gpt-5.5-pro' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-5.5-pro',
+      provider: undefined,
+      reasoning: undefined
+    })
+  })
+
+  test('canonical strategy model ids imply their compatible harness', () => {
+    expect(validateStrategyOverrides({ model: 'claude-opus-4-7' })).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-opus-4-7',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(
+      validateStrategyOverrides({
+        model: 'claude-opus-4-8'
+      })
+    ).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-opus-4-8',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'claude-opus-5' })).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-opus-5',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'claude-opus-5-fast' })).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-opus-5-fast',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'claude-sonnet-4-6' })).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-sonnet-4-6',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'claude-sonnet-5' })).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-sonnet-5',
+      provider: undefined,
+      reasoning: undefined
+    })
+  })
+
+  test('rejects aliases and arbitrary model ids from the strategy path', () => {
+    expect(validateStrategyOverrides({ model: 'terra' })).toEqual({})
+    expect(validateStrategyOverrides({ model: 'anthropic/claude-fable-5' })).toEqual({})
+    expect(validateStrategyOverrides({ model: 'not real model id' })).toEqual({})
+  })
+
+  test('rejects incompatible canonical strategy fields', () => {
+    expect(validateStrategyOverrides({ harness: 'codex', model: 'claude-opus-4-8' })).toEqual({})
+    expect(validateStrategyOverrides({ harness: 'amp', provider: 'responses' })).toEqual({})
+    expect(validateStrategyOverrides({ reasoning: 'turbo' })).toEqual({})
+  })
+
+  test('drops reasoning when the resolved strategy harness cannot use it', () => {
+    expect(validateStrategyOverrides({ reasoning: 'max' })).toEqual({
+      harnessType: undefined,
+      model: undefined,
+      provider: undefined,
+      reasoning: 'max'
+    })
+    expect(validateStrategyOverrides({ model: 'claude-opus-4-8', reasoning: 'max' })).toEqual({
+      harnessType: 'claudecode',
+      model: 'claude-opus-4-8',
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ harness: 'amp', reasoning: 'max' })).toEqual({
+      harnessType: 'amp',
+      model: undefined,
+      provider: undefined,
+      reasoning: undefined
+    })
+    expect(validateStrategyOverrides({ model: 'gpt-5.6-sol', reasoning: 'max' })).toEqual({
+      harnessType: 'codex',
+      model: 'gpt-5.6-sol',
+      provider: undefined,
+      reasoning: 'max'
+    })
+    expect(validateStrategyOverrides({ harness: 'nanocodex', reasoning: 'high' })).toEqual({
+      harnessType: 'nanocodex',
+      model: undefined,
+      provider: undefined,
+      reasoning: 'high'
+    })
+  })
+})
+
+describe('messageOverridesForText strategy invocation', () => {
+  const trace: SlackbotV2Trace = {
+    includeContext: false,
+    messageId: 'm1',
+    mode: 'execute',
+    openStream: false,
+    startedAtMs: 0,
+    threadId: 'slack:C1:1'
+  }
+
+  test('uses the flags strategy by default', async () => {
+    await expect(
+      messageOverridesForText(slackOptions({}), '--opus fix it', trace)
+    ).resolves.toEqual({
+      cleanedText: 'fix it',
+      overrides: {
+        harnessType: 'claudecode',
+        model: 'claude-opus-5',
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+  })
+
+  test('combines explicit persona and model overrides', async () => {
+    await expect(
+      messageOverridesForText(
+        slackOptions({}),
+        '--persona=invest --claude --model=fable review this',
+        trace
+      )
+    ).resolves.toEqual({
+      cleanedText: 'review this',
+      overrides: {
+        harnessType: 'claudecode',
+        model: 'claude-fable-5',
+        personaId: 'invest',
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+    await expect(
+      messageOverridesForText(slackOptions({}), '--persona eng --codex debug this', trace)
+    ).resolves.toEqual({
+      cleanedText: 'debug this',
+      overrides: {
+        harnessType: 'codex',
+        model: undefined,
+        personaId: 'eng',
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+  })
+
+  test('does not consume a following flag as a persona value', async () => {
+    await expect(
+      messageOverridesForText(slackOptions({}), '--persona --claude fix this', trace)
+    ).resolves.toEqual({
+      cleanedText: '--persona fix this',
+      overrides: {
+        harnessType: 'claudecode',
+        model: undefined,
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+  })
+
+  test('uses the configured strategy instead of the legacy flag parser', async () => {
+    await expect(
+      messageOverridesForText(
+        slackOptions({
+          messageOverridesStrategy: async () => ({ overrides: {} })
+        }),
+        '--opus fix it',
+        trace
+      )
+    ).resolves.toEqual({ overrides: {} })
+  })
+
+  test('does not let a configured strategy select a persona', async () => {
+    await expect(
+      messageOverridesForText(
+        slackOptions({
+          messageOverridesStrategy: async () => ({
+            overrides: { personaId: 'strategy-selected' }
+          })
+        }),
+        'review this',
+        trace
+      )
+    ).resolves.toEqual({ overrides: {} })
+  })
+
+  test('retains a deterministic persona when a configured strategy throws', async () => {
+    await expect(
+      messageOverridesForText(
+        slackOptions({
+          messageOverridesStrategy: async () => {
+            throw new Error('selector failed')
+          }
+        }),
+        '--persona=invest review this',
+        trace
+      )
+    ).resolves.toEqual({
+      cleanedText: 'review this',
+      overrides: expect.objectContaining({ personaId: 'invest' })
+    })
+  })
+
+  test('returns configured strategy overrides without cleaning prompt text', async () => {
+    await expect(
+      messageOverridesForText(
+        slackOptions({
+          messageOverridesStrategy: async () => ({
+            overrides: {
+              harnessType: 'codex',
+              model: 'gpt-5.6-sol',
+              provider: undefined,
+              reasoning: 'max'
+            }
+          })
+        }),
+        'do the work. use max effort and the sol model.',
+        trace
+      )
+    ).resolves.toEqual({
+      overrides: {
+        harnessType: 'codex',
+        model: 'gpt-5.6-sol',
+        provider: undefined,
+        reasoning: 'max'
+      }
+    })
+  })
+
+  test('falls back when the OpenAI strategy request fails', async () => {
+    await expect(
+      messageOverridesForText(
+        slackOptions({
+          messageOverridesStrategy: createOpenAiMessageOverridesStrategy({
+            apiKey: 'test-key',
+            fetch: (async () =>
+              new Response('secret-token=do-not-log', {
+                status: 503,
+                statusText: 'Service Unavailable'
+              })) as unknown as typeof fetch,
+            model: 'gpt-5.4-nano'
+          })
+        }),
+        'use sol',
+        trace
+      )
+    ).resolves.toEqual({ overrides: {} })
+  })
+
+  test('handles --nanocodex deterministically before the OpenAI strategy', async () => {
+    let requestCount = 0
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: (async () => {
+        requestCount += 1
+        throw new Error('the explicit flag must not call the strategy model')
+      }) as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    await expect(strategy({ text: '--nanocodex review this' })).resolves.toEqual({
+      cleanedText: 'review this',
+      overrides: {
+        harnessType: 'nanocodex',
+        model: undefined,
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+    expect(requestCount).toBe(0)
+  })
+
+  test('keeps persona selection deterministic when the OpenAI strategy fails', async () => {
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: (async () => {
+        throw new Error('selector unavailable')
+      }) as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    await expect(
+      messageOverridesForText(
+        slackOptions({ messageOverridesStrategy: strategy }),
+        '--persona=invest investigate this company',
+        trace
+      )
+    ).resolves.toEqual({
+      cleanedText: 'investigate this company',
+      overrides: { personaId: 'invest' }
+    })
+  })
+
+  test('composes a deterministic persona with natural-language model selection', async () => {
+    let requestBody: Record<string, unknown> | undefined
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return Response.json({
+          output: [
+            {
+              content: [
+                {
+                  text: JSON.stringify({
+                    harness: 'codex',
+                    model: 'gpt-5.6-sol',
+                    provider: null,
+                    reasoning: null
+                  })
+                }
+              ]
+            }
+          ]
+        })
+      }) as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    await expect(
+      messageOverridesForText(
+        slackOptions({ messageOverridesStrategy: strategy }),
+        '--persona=invest use sol for this',
+        trace
+      )
+    ).resolves.toEqual({
+      cleanedText: 'use sol for this',
+      overrides: {
+        harnessType: 'codex',
+        model: 'gpt-5.6-sol',
+        personaId: 'invest',
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+    expect(requestBody?.input).toBe('use sol for this')
+  })
+
+  test('allows the OpenAI strategy to select nanocodex from natural language', async () => {
+    let requestBody: Record<string, unknown> | undefined
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return Response.json({
+          output: [
+            {
+              content: [
+                {
+                  text: JSON.stringify({
+                    harness: 'nanocodex',
+                    model: null,
+                    provider: null,
+                    reasoning: null
+                  })
+                }
+              ]
+            }
+          ]
+        })
+      }) as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    await expect(strategy({ text: 'use nanocodex for this' })).resolves.toEqual({
+      overrides: {
+        harnessType: 'nanocodex',
+        model: undefined,
+        provider: undefined,
+        reasoning: undefined
+      }
+    })
+    expect(JSON.stringify(requestBody)).toContain('nanocodex')
+  })
+})
+
+function slackOptions(overrides: Partial<SlackbotV2Options>): SlackbotV2Options {
+  return {
+    apiUrl: 'http://api.example.test',
+    botToken: 'xoxb-test',
+    signingSecret: 'secret',
+    ...overrides
+  }
+}
 
 // The adapter's plain-text extraction feeds extractMessageOverrides. The
 // unpatched @chat-adapter/slack flattened the parsed AST with

@@ -27,6 +27,17 @@ fn harness_auth_fragments_are_baked_in() {
         Some("OPENROUTER_API_KEY")
     );
 
+    let hermes = harness_auth_fragment("hermes", "api_key").unwrap().unwrap();
+    assert_eq!(
+        hermes.transforms[0].config.secrets[0].rules[0]["host"].as_str(),
+        Some("inference-api.nousresearch.com")
+    );
+    let hermes_placeholders = placeholder_env(&[hermes]);
+    assert_eq!(
+        hermes_placeholders.get("NOUS_API_KEY").map(String::as_str),
+        Some("NOUS_API_KEY")
+    );
+
     let meta_ai = harness_auth_fragment("meta-ai", "api_key")
         .unwrap()
         .unwrap();
@@ -59,6 +70,67 @@ fn harness_auth_fragments_are_baked_in() {
     let placeholders = placeholder_env(&[infra]);
     for name in ["GITHUB_TOKEN", "SLACK_BOT_TOKEN"] {
         assert_eq!(placeholders.get(name).map(String::as_str), None);
+    }
+}
+
+#[test]
+fn custom_provider_fragments_are_scoped_and_declare_placeholders() {
+    let fragments = custom_provider_auth_fragments(
+        r#"{
+            "private_responses": {
+                "name": "Private Responses",
+                "baseUrl": "https://inference.example.com/v1",
+                "apiKeyEnv": "PRIVATE_RESPONSES_API_KEY",
+                "defaultModel": "example-model"
+            }
+        }"#,
+    )
+    .unwrap();
+    let placeholders = placeholder_env(&fragments);
+    assert_eq!(
+        placeholders
+            .get("PRIVATE_RESPONSES_API_KEY")
+            .map(String::as_str),
+        Some("PRIVATE_RESPONSES_API_KEY")
+    );
+
+    let yaml = serde_yaml::to_string(&fragments[0]).unwrap();
+    assert!(yaml.contains("host: inference.example.com"));
+    assert!(yaml.contains("proxy_value: PRIVATE_RESPONSES_API_KEY"));
+    assert!(!yaml.contains("https://"));
+}
+
+#[test]
+fn custom_provider_default_model_is_optional() {
+    let fragments = custom_provider_auth_fragments(
+        r#"{
+            "private_responses": {
+                "name": "Private Responses",
+                "baseUrl": "https://inference.example.com/v1",
+                "apiKeyEnv": "PRIVATE_RESPONSES_API_KEY"
+            }
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(fragments.len(), 1);
+}
+
+#[test]
+fn custom_provider_fragments_reject_unsafe_or_malformed_config() {
+    for raw in [
+        r#"{"bad.id":{"name":"Bad","baseUrl":"https://inference.example.com/v1","apiKeyEnv":"BAD_API_KEY","defaultModel":"model"}}"#,
+        r#"{"private":{"name":"Bad","baseUrl":"http://inference.example.com/v1","apiKeyEnv":"BAD_API_KEY","defaultModel":"model"}}"#,
+        r#"{"private":{"name":"Bad","baseUrl":"https://user@inference.example.com/v1","apiKeyEnv":"BAD_API_KEY","defaultModel":"model"}}"#,
+        r#"{"private":{"name":"Bad","baseUrl":"https://inference.example.com:443/v1","apiKeyEnv":"BAD_API_KEY","defaultModel":"model"}}"#,
+        r#"{"private":{"name":"Bad","baseUrl":"https://127.0.0.1/v1","apiKeyEnv":"BAD_API_KEY","defaultModel":"model"}}"#,
+        r#"{"private":{"name":"Bad","baseUrl":"https://inference.example.com/v1","apiKeyEnv":"bad-key","defaultModel":"model"}}"#,
+        r#"{"private":{"name":"Bad","baseUrl":"https://inference.example.com/v1","apiKeyEnv":"BAD_API_KEY","defaultModel":""}}"#,
+        "not-json",
+    ] {
+        assert!(
+            custom_provider_auth_fragments(raw).is_err(),
+            "accepted {raw}"
+        );
     }
 }
 
@@ -105,7 +177,7 @@ fn access_token_fragment_carries_no_broker_credentials_block() {
 }
 
 #[test]
-fn shipped_proxy_allowlist_preserves_railway_project_tokens() {
+fn shipped_proxy_allowlist_preserves_integration_headers() {
     let config: serde_yaml::Value =
         serde_yaml::from_str(include_str!("../../../../iron-proxy/iron-proxy.yaml")).unwrap();
     let transforms = config["transforms"].as_sequence().unwrap();
@@ -119,5 +191,15 @@ fn shipped_proxy_allowlist_preserves_railway_project_tokens() {
         headers
             .iter()
             .any(|header| header.as_str() == Some("project-access-token"))
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|header| header.as_str() == Some("originator"))
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|header| header.as_str() == Some("version"))
     );
 }

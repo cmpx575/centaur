@@ -66,7 +66,22 @@ class McpOauthClient < ApplicationRecord
 
   def self.allowed_redirect_uri?(value)
     uri = URI.parse(value.to_s)
-    uri.scheme == "http" && loopback_host?(uri.host)
+    return false if uri.scheme.blank?
+    return false if uri.fragment.present?
+    return false if value.to_s.include?("*")
+
+    case uri.scheme
+    when "https"
+      uri.host.present?
+    when "http"
+      uri.host.present? && loopback_host?(uri.host)
+    else
+      # RFC 8252 §7.1 private-use URI scheme, how native apps receive the
+      # callback (e.g. Cursor's cursor://anysphere.cursor-mcp/oauth/callback).
+      # Matched by exact string equality only in redirect_uri_allowed?; PKCE
+      # protects the code if another app claims the same scheme.
+      true
+    end
   rescue URI::InvalidURIError
     false
   end

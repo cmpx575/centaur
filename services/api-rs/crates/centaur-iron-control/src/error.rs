@@ -1,8 +1,17 @@
 use thiserror::Error;
 
+use crate::principal::PrincipalDerivationError;
+
 /// Errors returned by the iron-control admin client.
 #[derive(Debug, Error)]
 pub enum IronControlError {
+    /// A session did not carry enough identity metadata to derive its
+    /// canonical principal.
+    #[error(transparent)]
+    PrincipalDerivation(#[from] PrincipalDerivationError),
+    /// Preapproved session admission could not find the required principal.
+    #[error("session principal {foreign_id} is not preapproved")]
+    SessionPrincipalNotPreapproved { foreign_id: String },
     /// The HTTP request could not be sent or the response could not be read.
     #[error("iron-control request to {path} failed: {source}")]
     Transport {

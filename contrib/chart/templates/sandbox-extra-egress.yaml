@@ -1,0 +1,19 @@
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.sandboxExtraEgress.rules }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-sandbox-extra-egress
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/managed-by: api-rs
+      centaur.ai/component: session-sandbox
+{{- with .Values.networkPolicy.sandboxExtraEgress.podSelector }}
+{{ toYaml . | nindent 6 }}
+{{- end }}
+  policyTypes: [Egress]
+  egress:
+{{ toYaml .Values.networkPolicy.sandboxExtraEgress.rules | nindent 4 }}
+{{- end }}
