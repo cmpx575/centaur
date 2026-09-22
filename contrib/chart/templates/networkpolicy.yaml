@@ -395,6 +395,18 @@ spec:
         - protocol: TCP
           port: 5432
 {{- end }}
+{{- if .Values.slackbotv2.fabric.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.slackbotv2.fabric.namespace | quote }}
+          podSelector:
+            matchLabels:
+              app: fabric-intake
+      ports:
+        - protocol: TCP
+          port: {{ .Values.slackbotv2.fabric.port }}
+{{- end }}
     # Slack API egress (direct HTTPS; slackbotv2 does not use the firewall proxy).
     - ports:
         - protocol: TCP

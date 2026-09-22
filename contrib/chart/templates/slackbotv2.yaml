@@ -13,6 +13,14 @@ metadata:
   labels:
 {{ include "centaur.componentLabels" (dict "root" . "component" "slackbotv2") | nindent 4 }}
 spec:
+{{- if .Values.slackbotv2.fabric.enabled }}
+{{- if ne (int .Values.slackbotv2.replicaCount) 1 }}
+{{- fail "fabric outbox currently requires slackbotv2.replicaCount=1" }}
+{{- end }}
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+{{- end }}
   replicas: {{ .Values.slackbotv2.replicaCount }}
   selector:
     matchLabels:
@@ -29,6 +37,17 @@ spec:
         centaur.ai/metrics: slackbotv2
     spec:
       automountServiceAccountToken: false
+{{- if .Values.slackbotv2.fabric.enabled }}
+      serviceAccountName: {{ .Values.slackbotv2.fabric.serviceAccountName }}
+      volumes:
+        - name: fabric-identity
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: fabric-intake
+                  expirationSeconds: 600
+                  path: token
+{{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
@@ -37,7 +56,17 @@ spec:
         - name: slackbotv2
           image: {{ printf "%s:%s" .Values.slackbotv2.image.repository .Values.slackbotv2.image.tag | quote }}
           imagePullPolicy: {{ .Values.slackbotv2.image.pullPolicy }}
+{{- if .Values.slackbotv2.fabric.enabled }}
+          volumeMounts:
+            - name: fabric-identity
+              mountPath: /fabric-identity
+              readOnly: true
+{{- end }}
           env:
+{{- if .Values.slackbotv2.fabric.enabled }}
+            - name: FABRIC_INTAKE_URL
+              value: {{ required "slackbotv2.fabric.intakeUrl is required" .Values.slackbotv2.fabric.intakeUrl | quote }}
+{{- end }}
             - name: PORT
               value: "3001"
             - name: CENTAUR_API_URL
@@ -189,4 +218,13 @@ spec:
     - name: http
       port: 3001
       targetPort: 3001
+{{- end }}
+
+{{- if and .Values.slackbotv2.enabled .Values.slackbotv2.fabric.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.slackbotv2.fabric.serviceAccountName }}
+automountServiceAccountToken: false
 {{- end }}

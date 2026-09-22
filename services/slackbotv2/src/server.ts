@@ -1,3 +1,4 @@
+import { startFabricDelivery } from './fabric'
 import { createSlackbotV2, type SlackbotV2Options } from './index'
 import { parseChannelDefaults } from './channel-defaults'
 import { resolveSlackHomeTeamId } from './session-api'
@@ -112,6 +113,7 @@ const options: SlackbotV2Options = {
 }
 options.slackHomeTeamId = await resolveSlackHomeTeamId(options)
 
+startFabricDelivery(options)
 const { app } = createSlackbotV2(options)
 const server = Bun.serve({
   port,
