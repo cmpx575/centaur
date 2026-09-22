@@ -629,6 +629,14 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   app.post('/api/slack/actions', handleSlackWebhook)
   app.post('/api/slack/options', handleSlackWebhook)
   app.post('/api/slack/commands', handleSlackWebhook)
+  // Existing installations send interactive callbacks here. Let fabric-owned
+  // actions use the same signed handler before falling through to the launcher.
+  app.use('/api/webhooks/slack/actions', async (c, next) => {
+    const rawBody = await c.req.raw.clone().text()
+    const response = await handleFabricWebhook(c.req.raw, rawBody, options, promise => waitUntil(c, promise))
+    if (response) return response
+    await next()
+  })
   registerSlackLauncher(app, {
     workflowSigningSecret: options.launcherWorkflowSigningSecret,
     allowedChannelIds: options.launcherAllowedChannelIds ?? [],
