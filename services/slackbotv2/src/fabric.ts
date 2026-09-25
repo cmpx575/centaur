@@ -8,6 +8,7 @@ import { verifySlackRequest } from './launcher'
 import type { SlackbotV2Options } from './types'
 import { handleRecipeWebhook } from './fabric-recipes'
 import { handleProposalWebhook } from './fabric-proposals'
+import { handleVmWebhook } from './fabric-vms'
 import { parseWorkSetup, setupRuntimeTitle, workSetupBlocks, type WorkSetup } from './fabric-work-setup'
 
 export type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string; planeUrl?: string;
@@ -41,6 +42,8 @@ export function fabricCommand(raw: string): { payload: Record<string, any>; comm
 export async function handleFabricWebhook(request: Request, raw: string, options: SlackbotV2Options,
   waitUntil: (promise: Promise<unknown>) => void): Promise<Response | undefined> {
   if (!options.fabricIntakeUrl) return
+  const vmResponse = await handleVmWebhook(request, raw, options, waitUntil)
+  if (vmResponse) return vmResponse
   const proposalResponse = await handleProposalWebhook(request, raw, options, waitUntil)
   if (proposalResponse) return proposalResponse
   const recipeResponse = await handleRecipeWebhook(request, raw, options, waitUntil)
