@@ -11,6 +11,7 @@ import { isWorkAction, parseWorkCatalog, parseWorkMenu, parseWorkSelection, sele
   workUnavailableView, type WorkSelection } from './fabric-work'
 import { recipeSetups, resolveSetup, setupChoiceFor, setupOptionValue, setupPickerBlock, setupRequestFields,
   workSetupBlocks, type RecipeSetups, type SetupChoice, type WorkSetupRef } from './fabric-work-setup'
+import { launchedView, parseReview, refusedView, reviewButtonMessage, reviewView, type ReviewSummary } from './fabric-launch-review'
 
 export type Recipe = RecipeSetups & { id: string; version: string; digest: string; title: string; description: string;
   aliases: string[]; taskType: string; defaultProfile: string; roles: string[];
@@ -31,7 +32,7 @@ export function recipeMenu(recipes: Recipe[], availability?: Availability) {
       { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'open', text: plain('Choose how to run'), value: r.id }] }]),
     { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'recent', text: plain('Recent work') },
       { type: 'button', action_id: prefix + 'capabilities', text: plain('Capabilities') }] },
-    section('You can also mention `fabric run review focused <Plane-item-link>`, `fabric runs`, or `fabric resume <Plane-item-link>` for a read-only work history.')
+    section('You can also mention `fabric launch review focused <Plane-item-link>` for a private review with a Launch button, `fabric run review focused <Plane-item-link>`, `fabric runs`, or `fabric resume <Plane-item-link>` for a read-only work history.')
   ] }
 }
 
@@ -44,7 +45,7 @@ export function recipeView(recipe: Recipe, metadata: string, work?: WorkMenu, se
   const pasted = values.plane || (!selectedWork ? values.work : '')
   const selectedSetup = resolveSetup(recipe, setup?.selected, setup?.catalogDigest)
   return { type: 'modal', callback_id: prefix + (setup?.editing ? 'setup_submit' : 'submit'), title: plain(setup?.editing ? 'Change setup' : 'Start work'),
-    submit: plain(setup?.editing ? 'Use setup' : 'Start'), close: plain('Back'),
+    submit: plain(setup?.editing ? 'Use setup' : 'Review'), close: plain('Back'),
     private_metadata: metadata, blocks: [section(`*${slackText(recipe.title)}* · ${slackText(recipe.version)}\n${slackText(recipe.description)}\n*Team:* ${recipe.roles.map(slackText).join(' → ')}`),
       ...(groups.length ? [{ type: 'input', block_id: 'work', optional: true, label: plain('Project and work item'),
         hint: plain('Recent items from enabled projects. The latest objective is read when the work starts.'),
@@ -62,7 +63,7 @@ export function recipeView(recipe: Recipe, metadata: string, work?: WorkMenu, se
         ...(setup?.editing ? [setupPickerBlock(recipe, selectedSetup)] : [{ type: 'actions', elements: [
           { type: 'button', action_id: prefix + 'setup_change', text: plain('Change setup'), value: 'change' }] }]),
         { type: 'section', text: plain('A setup describes the method and available tools for this workflow. It does not add capacity or grant new permissions.') }] : []),
-      section('Starting creates one run. Hermes coordinates a separate worker and checker. The outcome returns to this thread and the Plane item; temporary access and resources close afterward.')
+      section('Review shows the model, limits and checks first; nothing starts until you press Launch there. One launch creates one run: Hermes coordinates a separate worker and checker, the outcome returns to this thread and the Plane item, and temporary access and resources close afterward.')
     ] }
 }
 
@@ -99,6 +100,33 @@ export function recipeRequest(recipe: Recipe, profile: string, planeUrl: string,
     ...setupRequestFields(chosen) }
 }
 
+const LAUNCH_FIELDS = ['requestId', 'taskType', 'teamId', 'channelId', 'threadTs', 'userId', 'planeUrl', 'recipeId', 'recipeVersion',
+  'recipeDigest', 'profile', 'workSetupId', 'workSetupVersion', 'workSetupDigest', 'expectedProfileDigest']
+function launchRequest(value: any) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.entries(value).some(([k, v]) => !LAUNCH_FIELDS.includes(k) || typeof v !== 'string')) throw new Error('invalid_launch')
+  return value as Record<string, string>
+}
+function summaryFrom(answer: any, planeUrl: string): ReviewSummary {
+  const recipe = answer?.recipe ?? {}
+  return { recipeTitle: String(recipe.title ?? 'Recipe'), version: String(recipe.version ?? ''), profileTitle: String(recipe.profileTitle ?? ''),
+    ...(recipe.workSetup?.title ? { setupTitle: String(recipe.workSetup.title) } : {}), planeUrl }
+}
+/** One readiness call → a review view whose Launch carries the exact request and the reviewed profile. */
+type Built = { unavailable: true } | { refused: string } | { view: ReturnType<typeof reviewView> }
+async function buildReview(options: SlackbotV2Options, origin: Origin, request: Record<string, string | undefined>, secret: string): Promise<Built> {
+  let answer
+  try { answer = await intake(options, '/v1/launch-readiness', request) } catch { return { unavailable: true } }
+  if (!answer.ok) return answer.status >= 500 ? { unavailable: true } : { refused: String(answer.value.error ?? 'unavailable') }
+  let review
+  try { review = parseReview(answer.value) } catch { return { unavailable: true } }
+  const summary = summaryFrom(answer.value, request.planeUrl ?? '')
+  const launch = { ...request, expectedProfileDigest: review.executionProfile.digest }
+  const metadata = seal({ origin, launch }, secret)
+  if (metadata.length > 3000) return { unavailable: true }
+  return { view: reviewView(review, summary, metadata, prefix + 'launch') }
+}
+
 export async function handleRecipeWebhook(request: Request, raw: string, options: SlackbotV2Options,
   waitUntil: (promise: Promise<unknown>) => void): Promise<Response | undefined> {
   if (!options.fabricIntakeUrl) return
@@ -107,7 +135,7 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const event = payload.event, action = payload.actions?.[0]
   const text = fabricMessageText(event?.text)
   const mention = payload.type === 'event_callback' && event?.type === 'app_mention' && !event.bot_id && !event.subtype
-    && /^fabric\s+(recipes|run|runs|capabilities|resume|work)(?:\s|$)/i.test(text)
+    && /^fabric\s+(recipes|run|runs|capabilities|resume|work|launch)(?:\s|$)/i.test(text)
   const opening = payload.type === 'block_actions' && action?.action_id === prefix + 'open'
   const resumeNavigation = payload.type === 'block_actions' && isResumeAction(action?.action_id)
   const workNavigationAction = payload.type === 'block_actions' && isWorkAction(action?.action_id)
@@ -116,7 +144,10 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const submission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'submit'
   const setupChange = payload.type === 'block_actions' && action?.action_id === prefix + 'setup_change'
   const setupSubmission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'setup_submit'
-  if (!mention && !opening && !submission && !navigation && !resumeNavigation && !workNavigationAction && !workSubmission && !setupChange && !setupSubmission) return
+  const launchSubmission = payload.type === 'view_submission' && payload.view?.callback_id === prefix + 'launch'
+  const reviewOpen = payload.type === 'block_actions' && action?.action_id === prefix + 'review_open'
+  if (!mention && !opening && !submission && !navigation && !resumeNavigation && !workNavigationAction && !workSubmission && !setupChange && !setupSubmission
+    && !launchSubmission && !reviewOpen) return
   const signed = verifySlackRequest({ nowMs: Date.now(), rawBody: raw, signingSecret: options.signingSecret,
     signature: request.headers.get('x-slack-signature') ?? undefined, timestamp: request.headers.get('x-slack-request-timestamp') ?? undefined })
   if (!signed.ok) return new Response('invalid request', { status: 401 })
@@ -126,6 +157,13 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
       saved = unseal(payload.view.private_metadata, options.signingSecret)
       if (!saved.origin || !['teamId', 'channelId', 'userId', 'threadTs'].every(k => typeof saved.origin[k] === 'string' && saved.origin[k])
         || ((setupChange || setupSubmission) && (!saved.setup || (setupSubmission && saved.setup.editing !== true)))) throw new Error('invalid_view')
+    } catch { return new Response('invalid view', { status: 403 }) }
+  }
+  if (launchSubmission || reviewOpen) {
+    try {
+      saved = unseal(launchSubmission ? payload.view.private_metadata : action.value, options.signingSecret)
+      launchRequest(launchSubmission ? saved.launch : saved.request)
+      if (!saved.origin || !['teamId', 'channelId', 'userId', 'threadTs'].every(k => typeof saved.origin[k] === 'string' && saved.origin[k])) throw new Error('invalid_launch_origin')
     } catch { return new Response('invalid view', { status: 403 }) }
   }
   let workSelection: WorkSelection | undefined
@@ -154,7 +192,8 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     threadTs: event?.thread_ts ?? event?.ts ?? payload.message?.thread_ts ?? payload.message?.ts ?? saved?.origin.threadTs }
   if (!options.launcherAllowedTeamIds?.includes(origin.teamId) || !options.launcherAllowedChannelIds?.includes(origin.channelId)
       || !options.launcherAllowedUserIds?.includes(origin.userId) || (saved && (saved.origin.userId !== origin.userId || saved.origin.teamId !== origin.teamId))
-      || ((submission || setupChange || setupSubmission || resumeNavigation || workNavigationAction || workSubmission) && saved.origin.channelId !== origin.channelId)) {
+      || ((submission || setupChange || setupSubmission || resumeNavigation || workNavigationAction || workSubmission || launchSubmission || reviewOpen)
+        && saved.origin.channelId !== origin.channelId)) {
     return new Response('not allowed', { status: 403 })
   }
   const query = new URLSearchParams({ teamId: origin.teamId, channelId: origin.channelId, userId: origin.userId })
@@ -331,18 +370,37 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     const profile = values.profile?.choice?.selected_option?.value ?? ''
     const pasted = (values.plane?.url?.value ?? '').trim()
     const selected = values.work?.item?.selected_option?.value ?? ''
-    if ((!pasted && !selected) || (pasted && selected)) return Response.json({ response_action:'errors', errors:{plane:'Choose one item or paste one link, then start.'} })
+    if ((!pasted && !selected) || (pasted && selected)) return Response.json({ response_action:'errors', errors:{plane:'Choose one item or paste one link, then review.'} })
     const planeUrl = pasted || selected
     if (saved.setup?.editing) return Response.json({ response_action: 'errors', errors: { profile: 'Review the chosen setup before starting.' } })
-    // Send the sealed choice unchanged. The backend resolves an existing request
-    // before checking current definitions, so a lost reply remains replayable.
-    const result = await intake(options, '/v1/runs', recipeRequest(saved.recipe, profile, planeUrl, origin, payload.view.id, saved.setup?.selected))
+    // Review is read-only. The request id binds this form and its exact choice,
+    // so Launch after a lost response replays instead of starting twice.
+    const choice = createHash('sha256').update(JSON.stringify([planeUrl, profile, saved.setup?.selected ?? null])).digest('hex').slice(0, 16)
+    const request = recipeRequest(saved.recipe, profile, planeUrl, origin, payload.view.id + ':' + choice, saved.setup?.selected)
+    const built = await buildReview(options, origin, request, options.signingSecret)
+    if ('unavailable' in built) return Response.json({ response_action: 'errors', errors: { plane: "Couldn't check eligibility: intake didn't answer. Nothing launched. Try again." } })
+    if ('refused' in built) {
+      const key = /PROFILE|RECIPE|WORK_SETUP/.test(built.refused) ? 'profile' : 'plane'
+      return Response.json({ response_action: 'errors', errors: { [key]: refusalText(built.refused) } })
+    }
+    return Response.json({ response_action: 'push', view: built.view })
+  }
+  if (launchSubmission) {
+    let result
+    try { result = await intake(options, '/v1/runs', saved.launch) } catch { return new Response('retry', { status: 503 }) }
     if (!result.ok) {
       if (result.status >= 500) return new Response('retry', { status: 503 })
-      const key = /PROFILE|RECIPE|WORK_SETUP/.test(result.value.error ?? '') ? 'profile' : 'plane'
-      return Response.json({ response_action: 'errors', errors: { [key]: refusalText(result.value.error) } })
+      const code = String(result.value.error ?? 'unavailable')
+      return Response.json({ response_action: 'update', view: refusedView(refusalText(code), code) })
     }
-    return Response.json({ response_action: 'clear' })
+    return Response.json({ response_action: 'update', view: launchedView(result.value, result.value.created === false) })
+  }
+  if (reviewOpen) {
+    const built = await buildReview(options, origin, saved.request, options.signingSecret)
+    const view = 'view' in built ? built.view : 'refused' in built ? refusedView(refusalText(built.refused), built.refused)
+      : refusedView("Couldn't check eligibility: intake didn't answer. Nothing launched. Try again.", 'UNAVAILABLE')
+    await slack(options, 'views.open', { trigger_id: payload.trigger_id, view })
+    return new Response('ok')
   }
   if (opening) {
     // Opening and editing are previews. Consumed capacity must not hide their
@@ -364,6 +422,24 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const recipes = result.value.recipes as Recipe[]
   if (/^fabric\s+recipes\s*$/i.test(text) || (navigation && action.action_id === prefix+'menu')) {
     waitUntil(reply(recipeMenu(recipes, result.value.availability)))
+    return new Response('ok')
+  }
+  const launchMatch = /^fabric\s+launch\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?\s*$/i.exec(text)
+  if (/^fabric\s+launch(?:\s|$)/i.test(text)) {
+    const chosen = launchMatch && recipes.find(r => [r.id, ...r.aliases].includes(launchMatch[1]!.toLowerCase()))
+    const profile = launchMatch?.[2]?.toLowerCase() ?? chosen?.defaultProfile
+    if (!launchMatch || !chosen || !profile || !chosen.profiles[profile]) {
+      waitUntil(reply({ text: 'Use `fabric launch <recipe> [profile] <Plane-item-link>` for a private review with a Launch button. Nothing was started.' }))
+      return new Response('ok')
+    }
+    const request = recipeRequest(chosen, profile, launchMatch[3]!, origin, payload.event_id ?? event.ts)
+    const summary: ReviewSummary = { recipeTitle: chosen.title, version: chosen.version, profileTitle: chosen.profiles[profile]!.title,
+      ...(recipeSetups(chosen) ? { setupTitle: recipeSetups(chosen)!.selected.title } : {}), planeUrl: request.planeUrl! }
+    const value = seal({ origin, request }, options.signingSecret)
+    if (value.length > 2000) { waitUntil(reply({ text: 'This launch is too large to review here. Use `fabric recipes`.' })); return new Response('ok') }
+    // Ephemeral and sealed to the requester: others never see or use this button.
+    waitUntil(slack(options, 'chat.postEphemeral', { channel: origin.channelId, user: origin.userId, thread_ts: origin.threadTs,
+      ...reviewButtonMessage(value, summary) }))
     return new Response('ok')
   }
   const match = /^fabric\s+run\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?\s*$/i.exec(text)
@@ -390,7 +466,12 @@ export function refusalText(error: unknown) {
     PLANE_PROJECT_OUTSIDE_ALLOWLIST:'This project is not enabled. Choose an item from an enabled project.',
     INVALID_PLANE_URL:'Paste a work-item link from the connected Plane workspace.',
     INVALID_PLANE_ITEM_PATH:'Paste a link to a specific Plane work item.',
-    UNSUPPORTED_PROFILE:'Choose one of the recipe modes shown in this form.'
+    UNSUPPORTED_PROFILE:'Choose one of the recipe modes shown in this form.',
+    ITEM_RUN_ACTIVE:'A run for this Plane item is still in progress. Wait for it to finish, then try again.',
+    LINUX_CONCURRENCY_FULL:'The Linux lane is at its active-run limit. Try again when a run finishes.',
+    WAITING_SOFTWARE_CAPACITY:'This item has no one-use repair reservation for you. An operator must add one.',
+    EXECUTION_PROFILE_CHANGED_REFRESH:'The model or limits changed since your review. Review again; nothing was started.',
+    REQUEST_ID_CONFLICT:'A launch from this review already exists with different content. Open the recipe again.'
   }
   return (reasons[code] ?? 'The request could not start. Check the selected work and recipe.') + ` (${code})`
 }

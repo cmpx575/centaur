@@ -6,6 +6,7 @@ import { handleFabricWebhook } from '../src/fabric'
 import { recipeMenu, recipeView, type Recipe } from '../src/fabric-recipes'
 import { createSlackbotV2 } from '../src/index'
 import { createMemoryState } from '@chat-adapter/state-memory'
+import { readiness, launchSubmission, PROFILE } from './launch-review-double'
 
 const recipe: Recipe = { id:'evidence-review',version:'1.0.0',digest:'a'.repeat(64),title:'Review prior work',description:'A checked review',aliases:['review'],taskType:'retained-evidence-review',defaultProfile:'focused',roles:['Coordinator','Worker','Checker'],profiles:{focused:{title:'Focused',description:'Three sources',maxCalls:{coordinator:4,worker:4,checker:6}},full:{title:'Full packet',description:'Seven sources',maxCalls:{coordinator:4,worker:8,checker:6}}} }
 const event = (text: string, id='E1') => ({type:'event_callback',team_id:'T1',event_id:id,event:{type:'app_mention',user:'U1',channel:'C1',ts:'1789846137.000001',text:'<@UBOT> '+text}})
@@ -18,7 +19,8 @@ async function fixture(work: (send: (payload:any, signed?:boolean)=>Promise<Resp
     if(path==='/v1/recipes')return Response.json({recipes:[recipe]})
     if(path==='/v1/recipe-catalog')return Response.json({recipes:[recipe],launchEnabled:false,scope:'Read-only catalog; admission and capacity are not verified.'})
     if(path==='/v1/work-items')return Response.json({projects:[{name:'Research',items:[{name:'Review prior work',identifier:'RES-1',url:'https://plane.example.test/work'}]}],stale:false})
-    if(path==='/v1/runs' && init.method==='POST')return failure?Response.json({error:failure},{status:failure==='TEMPORARY'?503:409}):Response.json({created:true},{status:202})
+    if(path==='/v1/launch-readiness')return failure&&failure!=='LAUNCH_ONLY'?Response.json({error:failure},{status:failure==='TEMPORARY'?503:409}):Response.json(readiness())
+    if(path==='/v1/runs' && init.method==='POST')return failure?Response.json({error:failure==='LAUNCH_ONLY'?'ITEM_RUN_ACTIVE':failure},{status:failure==='TEMPORARY'?503:409}):Response.json({created:true,runId:'lx-0925-01',state:'QUEUED'},{status:202})
     if(path==='/api/chat.postMessage')return Response.json({ok:true,ts:'2'})
     if(path==='/api/views.open')return Response.json({ok:true})
     throw new Error('unexpected '+path)
@@ -42,10 +44,17 @@ test('signed menu and modal preserve origin and pin a compact immutable recipe',
   await send(opening)
   const view=calls.find(c=>c.path.endsWith('views.open')).body.view
   expect(view.private_metadata.length).toBeLessThan(3000)
-  expect((await send(submission(view)))?.status).toBe(200)
+  // Review is read-only; Launch in the pushed review sends the exact request.
+  const pushed=await (await send(submission(view)))!.json()
+  expect(pushed.response_action).toBe('push'); expect(pushed.view.submit.text).toBe('Launch')
+  expect(calls.filter(c=>c.path==='/v1/runs')).toHaveLength(0)
+  const previewed=calls.find(c=>c.path==='/v1/launch-readiness').body
+  expect(previewed).toMatchObject({recipeId:recipe.id,recipeDigest:recipe.digest,profile:'full',channelId:'C1',threadTs:'1789846137.000001',userId:'U1'})
+  const launched=await (await send(launchSubmission(pushed.view)))!.json()
+  expect(launched.response_action).toBe('update'); expect(launched.view.clear_on_close).toBe(true)
   const requests=calls.filter(c=>c.path==='/v1/runs')
-  expect(requests[0].body).toMatchObject({recipeId:recipe.id,recipeDigest:recipe.digest,profile:'full',channelId:'C1',threadTs:'1789846137.000001',userId:'U1'})
-  await send(submission(view))
+  expect(requests[0].body).toEqual({...previewed,expectedProfileDigest:PROFILE})
+  await send(launchSubmission(pushed.view))
   expect(calls.filter(c=>c.path==='/v1/runs')[1].body).toEqual(requests[0].body)
 }))
 test('unsigned, wrong user and tampered modal never submit',async()=>fixture(async(send,calls)=>{
@@ -91,7 +100,8 @@ test('choosing a work item submits the same typed intake and ambiguous input sta
   const selected=submission(view)
   selected.view.state.values.plane.url.value=''
   ;(selected.view.state.values as any).work={item:{selected_option:{value:'https://plane.example.test/work'}}}
-  await send(selected)
+  const pushed=await (await send(selected))!.json()
+  await send(launchSubmission(pushed.view))
   expect(calls.find(c=>c.path==='/v1/runs' && c.body).body.planeUrl).toBe('https://plane.example.test/work')
   selected.view.state.values.plane.url.value='https://plane.example.test/different'
   expect(await (await send(selected))!.json()).toMatchObject({response_action:'errors'})
@@ -110,7 +120,8 @@ test('the configured legacy actions endpoint opens and submits recipes before la
   expect((await send(opening,false))?.status).toBe(401)
   expect((await send(opening))?.status).toBe(200)
   const view=calls.find(c=>c.path.endsWith('views.open')).body.view
-  expect((await send(submission(view)))?.status).toBe(200)
+  const pushed=await (await send(submission(view)))!.json()
+  expect((await send(launchSubmission(pushed.view)))?.status).toBe(200)
   expect(calls.filter(c=>c.path==='/v1/runs' && c.body)).toHaveLength(1)
   expect((await send({...opening,actions:[{action_id:'unsupported_legacy_action',value:'bad'}]}))?.status).toBe(400)
 },undefined,true))

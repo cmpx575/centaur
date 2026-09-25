@@ -8,6 +8,7 @@ import { drainFabricDeliveries, runView, type Run } from '../src/fabric'
 import { recipeView, recipeRequest, type Recipe } from '../src/fabric-recipes'
 import { recipeSetups, resolveSetup, setupChoiceFor, setupOptionValue, setupRef, workSetupBlocks, type WorkSetup } from '../src/fabric-work-setup'
 import { parseWorkCatalog } from '../src/fabric-work'
+import { readiness, launchSubmission, PROFILE } from './launch-review-double'
 
 const human: WorkSetup = { id: 'humanlayer-staged', version: '1.0.0', digest: 'a'.repeat(64), title: 'HumanLayer-inspired staged work',
   description: 'Our adaptation of planning, review and implementation. No HumanLayer product is installed.', status: 'qualified',
@@ -32,6 +33,13 @@ const submission = (view: any, state: any = values()) => ({ type: 'view_submissi
   view: { ...view, id: 'V1', state: { values: state } } })
 const change = (view: any) => ({ ...opening, channel: undefined, view: { ...view, id: 'V1', hash: 'hash', state: { values: values() } },
   actions: [{ action_id: 'fabric_recipe_setup_change', value: 'change' }] })
+/** Review (read-only) then Launch from the pushed review; returns the Launch response. */
+let lastPushed: any
+const reviewAndLaunch = async (send: any, view: any) => {
+  const pushed = await (await send(submission(view))).json()
+  expect(pushed.response_action).toBe('push'); lastPushed = pushed.view
+  return send(launchSubmission(pushed.view))
+}
 const lastView = (calls: any[]) => calls.filter(c => /views\.(open|update)$/.test(c.path)).at(-1)?.body.view
 
 async function fixture(work: (send: (payload: any, signed?: boolean) => Promise<Response>, calls: any[], current: Recipe[], options: any) => Promise<void>) {
@@ -46,7 +54,8 @@ async function fixture(work: (send: (payload: any, signed?: boolean) => Promise<
       if (u.pathname === '/v1/recipes') return Response.json({ recipes: current })
       if (u.pathname === '/v1/recipe-catalog') return Response.json({ recipes: current, launchEnabled: false, scope: 'Read-only catalog; admission and capacity are not verified.' })
       if (u.pathname === '/v1/work-items') return Response.json(menu)
-      if (u.pathname === '/v1/runs' && init.method === 'POST') return Response.json({ created: true }, { status: 202 })
+      if (u.pathname === '/v1/launch-readiness') return Response.json(readiness())
+      if (u.pathname === '/v1/runs' && init.method === 'POST') return Response.json({ created: true, runId: 'r1', state: 'QUEUED' }, { status: 202 })
       if (['/api/chat.postMessage', '/api/views.open', '/api/views.update'].includes(u.pathname)) return Response.json({ ok: true, ts: '2', view: { id: 'V1' } })
       throw new Error('unexpected request ' + u.pathname)
     }) as typeof fetch }
@@ -66,11 +75,14 @@ test('software launch shows the full default and submits its exact tuple', () =>
   for (const word of ['HumanLayer-inspired staged work', 'Method:', 'Stages:', 'Skills:', 'Tools:', 'MCP servers: None declared', 'Runtime:', 'Change setup', 'No HumanLayer product']) expect(text).toContain(word)
   expect(text).not.toContain('workSetupDigest')
   expect(view.private_metadata.length).toBeLessThan(3000)
-  expect((await send(submission(view))).status).toBe(200)
+  const pushed = await (await send(submission(view))).json()
+  expect(calls.find(c => c.path === '/v1/launch-readiness').body).toMatchObject({ workSetupId: human.id, workSetupDigest: human.digest })
+  expect((await send(launchSubmission(pushed.view))).status).toBe(200)
   const request = calls.find(c => c.path === '/v1/runs').body
-  expect(request).toMatchObject({ workSetupId: human.id, workSetupVersion: human.version, workSetupDigest: human.digest, planeUrl: url, profile: 'full' })
+  expect(request).toMatchObject({ workSetupId: human.id, workSetupVersion: human.version, workSetupDigest: human.digest, planeUrl: url, profile: 'full',
+    expectedProfileDigest: PROFILE })
   expect(Object.values(request).every(v => typeof v === 'string')).toBe(true)
-  await send(submission(view)); expect(calls.filter(c => c.path === '/v1/runs')[1].body).toEqual(request)
+  await send(launchSubmission(pushed.view)); expect(calls.filter(c => c.path === '/v1/runs')[1].body).toEqual(request)
 }))
 
 test('searchable Change setup is read-only and preserves item/profile into exact selected preview and Start', () => fixture(async (send, calls) => {
@@ -82,11 +94,11 @@ test('searchable Change setup is read-only and preserves item/profile into exact
   const selected = { ...values(), work_setup: { choice: { selected_option: { value: setupOptionValue(bounded) } } } }
   const response = await send(submission(picker, selected)), result = await response.json()
   expect(result.response_action).toBe('update'); const preview = result.view
-  expect(preview.submit.text).toBe('Start'); expect(JSON.stringify(preview.blocks)).toContain('Work setup: Bounded repair')
+  expect(preview.submit.text).toBe('Review'); expect(JSON.stringify(preview.blocks)).toContain('Work setup: Bounded repair')
   expect(preview.blocks.find((b: any) => b.block_id === 'work').element.initial_option.value).toBe(url)
   expect(preview.blocks.find((b: any) => b.block_id === 'profile').element.initial_option.value).toBe('full')
   expect(calls.filter(c => c.path.startsWith('/v1/')).every(c => c.method === 'GET')).toBe(true)
-  await send(submission(preview))
+  await reviewAndLaunch(send, preview)
   expect(calls.filter(c => c.path === '/v1/runs')).toHaveLength(1)
   expect(calls.find(c => c.path === '/v1/runs').body).toMatchObject({ workSetupId: bounded.id, workSetupVersion: bounded.version, workSetupDigest: bounded.digest, planeUrl: url, profile: 'full' })
 }))
@@ -149,7 +161,7 @@ test('a newly stale signed Start sends its frozen tuple and surfaces backend 409
   let posts = 0
   options.fetch = async (input: any, init: any) => {
     const path = new URL(String(input)).pathname
-    if (path === '/v1/runs' && init.method === 'POST') {
+    if (path === '/v1/launch-readiness') {
       posts++
       expect(JSON.parse(init.body)).toMatchObject({ recipeDigest: 'c'.repeat(64), workSetupId: human.id,
         workSetupVersion: human.version, workSetupDigest: human.digest })
@@ -241,13 +253,16 @@ test('repeated signed Start reaches the immutable run after a lost response, con
     }
     return original(input, init)
   }
-  expect((await send(submission(view))).status).toBe(503)
+  expect((await reviewAndLaunch(send, view)).status).toBe(503)
+  const pushed = lastPushed
   // The menu loses capacity and the catalog changes after the first durable commit.
   current[0]!.digest = 'f'.repeat(64)
   current[0]!.workSetups![0]!.digest = 'e'.repeat(64)
   current[0]!.defaultWorkSetup = setupRef(current[0]!.workSetups![0]!)
   expect(await (await options.fetch('http://intake/v1/recipes', { method: 'GET' })).json()).toEqual({ recipes: [] })
-  expect(await (await send(submission(view))).json()).toEqual({ response_action: 'clear' })
+  // Pressing Launch again replays the sealed request: no re-review, no substitution.
+  const replay = await (await send(launchSubmission(pushed))).json()
+  expect(replay.response_action).toBe('update'); expect(JSON.stringify(replay.view)).toContain('Already launched as run `the-only-run`')
   expect(commits).toBe(1); expect(posts).toBe(2)
   expect(calls.filter(c => c.path === '/v1/recipe-catalog')).toHaveLength(0)
   expect(committed).toMatchObject({ recipeDigest: 'c'.repeat(64), workSetupDigest: human.digest })
