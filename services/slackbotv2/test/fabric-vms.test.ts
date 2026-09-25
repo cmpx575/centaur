@@ -136,3 +136,33 @@ test('card: access lines only while held; save event names the save', () => {
     .toContain('saved as `keep-1`')
   expect(vmCardText(lease())).toContain('`@centaur fabric vm save vl-0925-84770e <name>`')
 })
+
+test('whonix: a bare word is the profile, profile= works, save-close takes a lease', () => {
+  expect(parseVmCommand('<@U> fabric vm whonix')).toEqual({ verb: 'request', os: 'whonix' })
+  expect(parseVmCommand('<@U> fabric vm whonix work 2h')).toEqual({ verb: 'request', os: 'whonix', profile: 'work', hours: '2' })
+  expect(parseVmCommand('<@U> fabric vm whonix profile=default 8h')).toEqual({ verb: 'request', os: 'whonix', profile: 'default', hours: '8' })
+  expect(parseVmCommand('<@U> fabric vm whonix a b')?.verb).toBe('invalid')
+  expect(parseVmCommand('<@U> fabric vm save-close vl-0925-84770e')).toEqual({ verb: 'save-close', lease: 'vl-0925-84770e' })
+  expect(parseVmCommand('<@U> fabric vm save-close nope')?.verb).toBe('invalid')
+  expect(parseVmCommand('<@U> fabric vm ubuntu-desktop small')).toEqual({ verb: 'request', os: 'ubuntu-desktop', size: 'small' })
+})
+
+test('whonix request and save-close reach intake as typed fields', () => fixture(async ({ mention, calls }) => {
+  await mention('fabric vm whonix default 2h')
+  expect(calls.find(c => c.path === '/v1/vms')?.body).toMatchObject({ action: 'request', os: 'whonix', profile: 'default', hours: '2' })
+  await mention('fabric vm save-close vl-0925-84770e', 'U1', 'Ev2')
+  expect(calls.filter(c => c.path === '/v1/vms')[1]?.body).toMatchObject({ action: 'save-close', lease: 'vl-0925-84770e' })
+}))
+
+test('pair card: two VNC lines, stored objects listed, save-close offered', () => {
+  const pair = lease({ os: 'whonix', size: 'pair', profile: 'default', access: { vnc: 'v1', vncGateway: 'v2' },
+    view: { title: 'whonix · profile default · vl-0925-84770e', status: 'Ready', nextAction: 'Open it.', vm: 'ws',
+      expires: '2026-09-25 18:00 UTC', network: 'Tor only', accessLines: ['virtctl vnc ws', 'virtctl vnc gw'], actions: ['save-close'] } })
+  const text = vmCardText(pair)
+  expect(text).toContain('virtctl vnc ws\nvirtctl vnc gw')
+  expect(text).toContain('`@centaur fabric vm save-close vl-0925-84770e`')
+  const closed = vmCardText({ ...pair, state: 'DISCARDED', export: { files: 2, parts: [{ key: 'exports/abc/part-000' }], verified: true },
+    view: { ...pair.view, status: 'Closed', accessLines: [], actions: [] } })
+  expect(closed).toContain('Stored objects: `exports/abc/part-000`')
+  expect(closed).not.toContain('virtctl')
+})
