@@ -9,21 +9,24 @@ import { fabricMessageText, intake, slack, slackText } from './fabric'
 
 export type VmLease = { lease: string; state: string; pending?: string | null; os: string; size: string; hours: number;
   script: string; network: string; vm?: string; from?: string | null; expires?: number | null; error?: string | null;
-  channelId: string; threadTs: string; owner: string; access?: { vnc: string; ssh: string };
+  channelId: string; threadTs: string; owner: string; access?: { vnc: string; ssh?: string; vncGateway?: string };
+  profile?: string; export?: { files?: number; parts?: Array<{ key: string }>; ciphertextSha256?: string; verified?: boolean };
   view: { title: string; status: string; nextAction: string; vm?: string; expires?: string | null; network?: string;
     script?: string; accessLines: string[]; actions: string[] } }
 
 export type VmCommand =
   | { verb: 'help' } | { verb: 'list' }
-  | { verb: 'request'; os: string; size?: string; hours?: string; script?: string; network?: string; from?: string }
+  | { verb: 'request'; os: string; size?: string; hours?: string; script?: string; network?: string; from?: string; profile?: string }
   | { verb: 'from'; save: string; size?: string; hours?: string }
-  | { verb: 'resume' | 'stop' | 'discard'; lease: string; hours?: string }
+  | { verb: 'resume' | 'stop' | 'discard' | 'save-close'; lease: string; hours?: string }
   | { verb: 'save'; lease: string; name: string }
   | { verb: 'invalid'; reason: string }
 
 const WORD = /^[a-z0-9][a-z0-9._-]{0,40}$/
 const LEASE = /^vl-[0-9]{4}-[0-9a-f]{6}$/
 const SIZES = new Set(['small', 'medium', 'large'])
+/** Pair entries (a Gateway + Workstation): a bare word after the OS is the privacy profile, not a size. */
+const PAIRS = new Set(['whonix'])
 
 /** "2h" / "90m" / "0.25h" -> hours as a decimal string; undefined if not a duration. */
 export function duration(word: string): string | undefined {
@@ -41,7 +44,7 @@ export function parseVmCommand(text: string): VmCommand | undefined {
   if (rest.some(w => w.length > 60)) return { verb: 'invalid', reason: 'a word is too long' }
   const [verb, ...args] = rest
   if (verb === 'list') return { verb: 'list' }
-  if (verb === 'resume' || verb === 'stop' || verb === 'discard') {
+  if (verb === 'resume' || verb === 'stop' || verb === 'discard' || verb === 'save-close') {
     if (!args[0] || !LEASE.test(args[0])) return { verb: 'invalid', reason: `\`${verb}\` needs a lease id like \`vl-0925-1a2b3c\`` }
     const hours = verb === 'resume' && args[1] ? duration(args[1]) : undefined
     if (args.length > (verb === 'resume' ? 2 : 1) || (args[1] && !hours)) return { verb: 'invalid', reason: 'unexpected words after the lease id' }
@@ -66,11 +69,12 @@ export function parseVmCommand(text: string): VmCommand | undefined {
   const out: Extract<VmCommand, { verb: 'request' }> = { verb: 'request', os: verb! }
   for (const w of args) {
     const d = duration(w)
-    const kv = /^(script|from)=([a-z0-9][a-z0-9._-]{0,40})$/.exec(w)
+    const kv = /^(script|from|profile)=([a-z0-9][a-z0-9._-]{0,40})$/.exec(w)
     if (d && !out.hours) out.hours = d
-    else if (kv) out[kv[1] as 'script' | 'from'] = kv[2]
+    else if (kv) out[kv[1] as 'script' | 'from' | 'profile'] = kv[2]
+    else if (PAIRS.has(out.os) && WORD.test(w) && !out.profile) out.profile = w   // profile names are checked by fabric intake
     else if (w === 'isolated' || w === 'internet') out.network = w
-    else if (WORD.test(w) && !out.size) out.size = w      // unknown sizes are refused by fabric intake
+    else if (WORD.test(w) && !out.size && !PAIRS.has(out.os)) out.size = w      // unknown sizes are refused by fabric intake
     else return { verb: 'invalid', reason: `did not understand \`${slackText(w)}\`` }
   }
   return out
@@ -81,6 +85,7 @@ const HELP = [
   '`@centaur fabric vm ubuntu-desktop [small|medium|large] [2h|8h|24h] [script=none|dev-tools|browser] [isolated]`',
   '`@centaur fabric vm list` · `… vm stop <lease>` · `… vm resume <lease> [8h]` · `… vm save <lease> <name>` · `… vm from <name> [size]` · `… vm discard <lease>`',
   'Sizes: small 2 vCPU/8 GiB · medium 4/16 (default) · large 8/32. Hold 8 h by default, 24 h max; on expiry the VM shuts down and the disk is kept until you `discard` it.',
+  '*Whonix* (Tor only): `@centaur fabric vm whonix [profile] [2h|8h]` starts a Gateway + a fresh Workstation (profile `default` if omitted; each profile keeps its own Gateway and Tor guards). Keep files in `~/Export`; `… vm save-close <lease>` (or expiry) encrypts them to Noor\'s key, stores them, and closes both VMs.',
 ].join('\n')
 
 export function vmCardText(lease: VmLease, event?: string): string {
@@ -91,6 +96,7 @@ export function vmCardText(lease: VmLease, event?: string): string {
     v.script && v.script !== 'none' ? `script ${v.script}` : '', lease.from ? `from save \`${slackText(lease.from)}\`` : ''].filter(Boolean)
   if (facts.length) lines.push(facts.join(' · '))
   if (v.accessLines.length) lines.push('```' + v.accessLines.join('\n') + '```')
+  if (lease.export?.parts?.length) lines.push('Stored objects: ' + lease.export.parts.map(p => `\`${slackText(p.key)}\``).join(' '))
   if (v.actions.length) lines.push('Next: ' + v.actions.map(a => `\`@centaur fabric vm ${a} ${lease.lease}${a === 'save' ? ' <name>' : ''}\``).join(' · '))
   return lines.join('\n')
 }
@@ -103,6 +109,8 @@ export function vmListText(value: Record<string, any>): string {
   if (!leases.length) lines.push('No VMs.')
   for (const l of leases) lines.push(`• \`${l.lease}\` ${slackText(l.os)} ${l.size} · *${slackText(l.view.status)}*${l.view.expires ? ' · until ' + l.view.expires : ''}`)
   if (saves.length) lines.push('*Saved disks*', ...saves.map(s => `• \`${slackText(s.name)}\` (${slackText(s.os)}, from \`${s.lease}\`) · ${s.state}`))
+  const profiles = (value.profiles ?? []) as Array<{ profile: string; os: string; lease?: string | null; sessions: number }>
+  if (profiles.length) lines.push('*Privacy profiles* (kept Gateway disks)', ...profiles.map(p => `• \`${slackText(p.profile)}\` (${slackText(p.os)}) · ${p.sessions} session(s)${p.lease ? ` · in use by \`${p.lease}\`` : ''}`))
   lines.push(`Ceph block free ≈ ${r.cephBlockMaxAvailGiB ?? '?'} GiB (floor ${r.floorGiB ?? '?'} GiB): ${r.decision ?? 'unknown'}`)
   return lines.join('\n')
 }
@@ -164,7 +172,7 @@ export async function handleVmWebhook(request: Request, raw: string, options: Sl
   const lease = result.value as VmLease & { created?: boolean }
   // New leases and state changes are rendered by the outbox consumer; a replay shows the current card.
   if (!lease.created) waitUntil(reply(vmCardText(lease)))
-  else if (command.verb === 'stop' || command.verb === 'save') waitUntil(reply(vmCardText(lease)))
+  else if (command.verb === 'stop' || command.verb === 'save' || command.verb === 'save-close') waitUntil(reply(vmCardText(lease)))
   return new Response('ok')
 }
 
