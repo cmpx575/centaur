@@ -8,7 +8,7 @@ import type { SlackbotV2Options } from './types'
 import { fabricMessageText, intake, slack, slackText } from './fabric'
 
 export type VmLease = { lease: string; state: string; pending?: string | null; os: string; size: string; hours: number;
-  script: string; network: string; vm?: string; from?: string | null; expires?: number | null; error?: string | null;
+  script: string; network: string; vm?: string; from?: string | null; golden?: string | null; expires?: number | null; error?: string | null;
   channelId: string; threadTs: string; owner: string; access?: { vnc: string; ssh?: string; vncGateway?: string };
   profile?: string; export?: { files?: number; parts?: Array<{ key: string }>; ciphertextSha256?: string; verified?: boolean };
   view: { title: string; status: string; nextAction: string; vm?: string; expires?: string | null; network?: string;
@@ -20,6 +20,7 @@ export type VmCommand =
   | { verb: 'from'; save: string; size?: string; hours?: string }
   | { verb: 'resume' | 'stop' | 'discard' | 'save-close'; lease: string; hours?: string }
   | { verb: 'save'; lease: string; name: string }
+  | { verb: 'promote'; save: string; name: string } | { verb: 'goldens' }
   | { verb: 'invalid'; reason: string }
 
 const WORD = /^[a-z0-9][a-z0-9._-]{0,40}$/
@@ -44,6 +45,12 @@ export function parseVmCommand(text: string): VmCommand | undefined {
   if (rest.some(w => w.length > 60)) return { verb: 'invalid', reason: 'a word is too long' }
   const [verb, ...args] = rest
   if (verb === 'list') return { verb: 'list' }
+  if (verb === 'goldens') return args.length ? { verb: 'invalid', reason: '`goldens` takes no words' } : { verb: 'goldens' }
+  if (verb === 'promote') {
+    // names are checked again by fabric intake (lowercase, reserved words, existing goldens)
+    if (args.length !== 2 || !WORD.test(args[0]!) || !WORD.test(args[1]!)) return { verb: 'invalid', reason: '`promote` needs `<save> <golden-name>`' }
+    return { verb: 'promote', save: args[0]!, name: args[1]! }
+  }
   if (verb === 'resume' || verb === 'stop' || verb === 'discard' || verb === 'save-close') {
     if (!args[0] || !LEASE.test(args[0])) return { verb: 'invalid', reason: `\`${verb}\` needs a lease id like \`vl-0925-1a2b3c\`` }
     const hours = verb === 'resume' && args[1] ? duration(args[1]) : undefined
@@ -84,6 +91,7 @@ const HELP = [
   '*Linux VMs on request* (fabric-vms lane, k3s002/gujranwala, internet-only by default)',
   '`@centaur fabric vm ubuntu-desktop [small|medium|large] [2h|8h|24h] [script=none|dev-tools|browser] [isolated]`',
   '`@centaur fabric vm list` · `… vm stop <lease>` · `… vm resume <lease> [8h]` · `… vm save <lease> <name>` · `… vm from <name> [size]` · `… vm discard <lease>`',
+  '*Goldens*: `… vm promote <save> <golden-name>` turns one of your saves into a golden on the menu (the save is kept); `… vm goldens` lists them; `@centaur fabric vm <golden-name> [size] [2h]` boots a fresh VM from one.',
   'Sizes: small 2 vCPU/8 GiB · medium 4/16 (default) · large 8/32. Hold 8 h by default, 24 h max; on expiry the VM shuts down and the disk is kept until you `discard` it.',
   '*Whonix* (Tor only): `@centaur fabric vm whonix [profile] [2h|8h]` starts a Gateway + a fresh Workstation (profile `default` if omitted; each profile keeps its own Gateway and Tor guards). Keep files in `~/Export`; `… vm save-close <lease>` (or expiry) encrypts them to Noor\'s key, stores them, and closes both VMs.',
 ].join('\n')
@@ -93,7 +101,8 @@ export function vmCardText(lease: VmLease, event?: string): string {
   const lines = [`*${slackText(v.title)}* · *${slackText(v.status)}*${event?.startsWith('saved:') ? ` · saved as \`${slackText(event.slice(6))}\`` : ''}`,
     slackText(v.nextAction)]
   const facts = [v.vm ? `VM \`${v.vm}\`` : '', v.expires ? `until ${v.expires}` : '', v.network ? `network ${v.network}` : '',
-    v.script && v.script !== 'none' ? `script ${v.script}` : '', lease.from ? `from save \`${slackText(lease.from)}\`` : ''].filter(Boolean)
+    v.script && v.script !== 'none' ? `script ${v.script}` : '', lease.from ? `from save \`${slackText(lease.from)}\`` : '',
+    lease.golden ? `from golden \`${slackText(lease.golden)}\`` : ''].filter(Boolean)
   if (facts.length) lines.push(facts.join(' · '))
   if (v.accessLines.length) lines.push('```' + v.accessLines.join('\n') + '```')
   if (lease.export?.parts?.length) lines.push('Stored objects: ' + lease.export.parts.map(p => `\`${slackText(p.key)}\``).join(' '))
@@ -111,7 +120,23 @@ export function vmListText(value: Record<string, any>): string {
   if (saves.length) lines.push('*Saved disks*', ...saves.map(s => `• \`${slackText(s.name)}\` (${slackText(s.os)}, from \`${s.lease}\`) · ${s.state}`))
   const profiles = (value.profiles ?? []) as Array<{ profile: string; os: string; lease?: string | null; sessions: number }>
   if (profiles.length) lines.push('*Privacy profiles* (kept Gateway disks)', ...profiles.map(p => `• \`${slackText(p.profile)}\` (${slackText(p.os)}) · ${p.sessions} session(s)${p.lease ? ` · in use by \`${p.lease}\`` : ''}`))
+  const goldens = (value.goldens ?? []) as Array<{ golden: string; os: string; state: string }>
+  if (goldens.length) lines.push(`*Goldens* (promoted saves): ${goldens.map(g => `\`${slackText(g.golden)}\` ${g.state === 'READY' ? '' : '· ' + g.state}`.trim()).join(' · ')} · \`@centaur fabric vm goldens\``)
   lines.push(`Ceph block free ≈ ${r.cephBlockMaxAvailGiB ?? '?'} GiB (floor ${r.floorGiB ?? '?'} GiB): ${r.decision ?? 'unknown'}`)
+  return lines.join('\n')
+}
+
+/** The VM menu: catalog OS entries plus promoted goldens (shared by every allowlisted user). */
+export function vmGoldensText(value: Record<string, any>): string {
+  const os = (value.catalog?.os ?? {}) as Record<string, string>
+  const goldens = (value.goldens ?? []) as Array<{ golden: string; title: string; state: string; save: string; view?: { status: string } }>
+  const lines = ['*VM menu*', ...Object.entries(os).map(([k, title]) => `• \`${slackText(k)}\` ${slackText(title)} · \`@centaur fabric vm ${slackText(k)}\``)]
+  lines.push('*Goldens from saves*')
+  if (!goldens.length) lines.push('None yet. Turn a save into one: `@centaur fabric vm promote <save> <golden-name>`.')
+  for (const g of goldens) lines.push(`• \`${slackText(g.golden)}\` ${slackText(g.title)} · *${slackText(g.view?.status ?? g.state)}*`
+    + (g.state === 'READY' ? ` · \`@centaur fabric vm ${slackText(g.golden)} [small|medium|large] [2h]\`` : ''))
+  const cap = value.catalog?.maxSavedGoldens
+  if (cap) lines.push(`Up to ${cap} goldens from saves; each is a 32 GiB Ceph disk kept (Retain) until an operator removes it.`)
   return lines.join('\n')
 }
 
@@ -136,13 +161,13 @@ export async function handleVmWebhook(request: Request, raw: string, options: Sl
   if (command.verb === 'help') { waitUntil(reply(HELP)); return new Response('ok') }
   if (command.verb === 'invalid') { waitUntil(reply(`Not a VM command: ${command.reason}.\n${HELP}`)); return new Response('ok') }
   const query = '/v1/vms?' + new URLSearchParams(who)
-  if (command.verb === 'list') {
+  if (command.verb === 'list' || command.verb === 'goldens') {
     const listed = await intake(options, query)
     if (!listed.ok) {
       if (listed.status >= 500) return new Response('retry', { status: 503 })
       waitUntil(reply(`VM list refused: ${String(listed.value.error ?? 'unavailable')}.`)); return new Response('ok')
     }
-    waitUntil(reply(vmListText(listed.value)))
+    waitUntil(reply(command.verb === 'list' ? vmListText(listed.value) : vmGoldensText(listed.value)))
     return new Response('ok')
   }
   const base = { requestId: String(payload.event_id ?? event.ts), threadTs, ...who }
@@ -160,6 +185,8 @@ export async function handleVmWebhook(request: Request, raw: string, options: Sl
       ...(command.size ? { size: command.size } : {}), ...(command.hours ? { hours: command.hours } : {}) }
   } else if (command.verb === 'save') {
     body = { ...base, action: 'save', lease: command.lease, name: command.name }
+  } else if (command.verb === 'promote') {
+    body = { ...base, action: 'promote', save: command.save, name: command.name }
   } else {
     body = { ...base, action: command.verb, lease: command.lease, ...('hours' in command && command.hours ? { hours: command.hours } : {}) }
   }
@@ -172,7 +199,7 @@ export async function handleVmWebhook(request: Request, raw: string, options: Sl
   const lease = result.value as VmLease & { created?: boolean }
   // New leases and state changes are rendered by the outbox consumer; a replay shows the current card.
   if (!lease.created) waitUntil(reply(vmCardText(lease)))
-  else if (command.verb === 'stop' || command.verb === 'save' || command.verb === 'save-close') waitUntil(reply(vmCardText(lease)))
+  else if (command.verb === 'stop' || command.verb === 'save' || command.verb === 'save-close' || command.verb === 'promote') waitUntil(reply(vmCardText(lease)))
   return new Response('ok')
 }
 

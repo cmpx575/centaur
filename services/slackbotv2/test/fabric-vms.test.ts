@@ -3,7 +3,7 @@ import { createHmac } from 'node:crypto'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { handleFabricWebhook } from '../src/fabric'
-import { parseVmCommand, duration, drainVmDeliveries, vmCardText, type VmLease } from '../src/fabric-vms'
+import { parseVmCommand, duration, drainVmDeliveries, vmCardText, vmGoldensText, type VmLease } from '../src/fabric-vms'
 
 const lease = (patch: Partial<VmLease> = {}): VmLease => ({ lease: 'vl-0925-84770e', state: 'HELD', pending: null, os: 'ubuntu-desktop',
   size: 'medium', hours: 8, script: 'none', network: 'internet', vm: 'ubuntu2404-t1-fabric-84770e', from: null, expires: 1790350000,
@@ -165,4 +165,61 @@ test('pair card: two VNC lines, stored objects listed, save-close offered', () =
     view: { ...pair.view, status: 'Closed', accessLines: [], actions: [] } })
   expect(closed).toContain('Stored objects: `exports/abc/part-000`')
   expect(closed).not.toContain('virtctl')
+})
+
+const goldenCard = (state: string, status: string, nextAction: string) => ({ lease: 'golden:my-desk', golden: 'my-desk', kind: 'golden',
+  state, os: 'ubuntu-desktop', title: 'Ubuntu 24.04 XFCE desktop (from save keep-1)', save: 'keep-1', channelId: 'C1', threadTs: '1.0',
+  owner: 'U1', pending: null, from: null, expires: null, error: null,
+  view: { title: 'Golden my-desk · Ubuntu 24.04 XFCE desktop (from save keep-1)', status, nextAction, vm: null, expires: null,
+    network: null, script: null, accessLines: [], actions: [] } })
+
+test('goldens: promote and goldens parse; a golden name boots like an OS', () => {
+  expect(parseVmCommand('<@U> fabric vm promote keep-1 my-desk')).toEqual({ verb: 'promote', save: 'keep-1', name: 'my-desk' })
+  expect(parseVmCommand('<@U> fabric vm promote keep-1')?.verb).toBe('invalid')
+  expect(parseVmCommand('<@U> fabric vm promote keep-1 my-desk extra')?.verb).toBe('invalid')
+  expect(parseVmCommand('<@U> fabric vm goldens')).toEqual({ verb: 'goldens' })
+  expect(parseVmCommand('<@U> fabric vm goldens x')?.verb).toBe('invalid')
+  expect(parseVmCommand('<@U> fabric vm my-desk small 2h')).toEqual({ verb: 'request', os: 'my-desk', size: 'small', hours: '2' })
+})
+
+test('promote reaches intake as typed fields and shows the Promoting card; refusal names its code', () => fixture(async ({ mention, routes, calls, posts }) => {
+  routes['/v1/vms'] = () => Response.json({ ...goldenCard('PENDING', 'Promoting', 'Copying save keep-1 into golden my-desk; the save is kept.'), created: true }, { status: 202 })
+  await mention('fabric vm promote keep-1 my-desk')
+  expect(calls.find(c => c.path === '/v1/vms' && c.method === 'POST')?.body).toEqual({ requestId: 'Ev1', threadTs: '1790309000.000100',
+    teamId: 'T1', channelId: 'C1', userId: 'U1', action: 'promote', save: 'keep-1', name: 'my-desk' })
+  expect(posts()[0]).toContain('*Promoting*')
+  expect(posts()[0]).not.toContain('Next:')
+  routes['/v1/vms'] = () => Response.json({ error: 'VM_SAVE_NOT_FOUND' }, { status: 409 })
+  await mention('fabric vm promote no-such-save my-desk', 'U1', 'Ev2')
+  expect(posts().at(-1)).toContain('`VM_SAVE_NOT_FOUND`')
+  expect(posts().at(-1)).toContain('Nothing was created')
+}))
+
+test('golden-ready card from the outbox names the boot command; list and goldens render the menu', () => fixture(async ({ routes, calls, options, mention, posts }) => {
+  routes['/v1/vms/deliveries'] = () => Response.json({ deliveries: [{ id: 'golden:my-desk:00:golden-ready', event: 'golden-ready',
+    lease: goldenCard('READY', 'Ready', 'On the menu. Boot a fresh VM from it: @centaur fabric vm my-desk [small|medium|large] [2h|8h]') }] })
+  await drainVmDeliveries(options)
+  const post = calls.find(c => c.path === '/api/chat.postMessage')
+  expect(post.body.thread_ts).toBe('1.0')
+  expect(post.body.text).toContain('Golden my-desk')
+  expect(post.body.text).toContain('@centaur fabric vm my-desk')
+  expect(calls.find(c => c.path === '/v1/vms/deliveries/ack').body.id).toBe('golden:my-desk:00:golden-ready')
+  const listing = { leases: [], saves: [], readiness: { decision: 'ADMIT' },
+    goldens: [goldenCard('READY', 'Ready', 'x'), { ...goldenCard('CREATING', 'Promoting', 'y'), golden: 'wip' }],
+    catalog: { os: { 'ubuntu-desktop': 'Ubuntu 24.04 XFCE desktop', 'kali-desktop': 'Kali 2026.2 XFCE desktop' }, maxSavedGoldens: 6 } }
+  const menu = vmGoldensText(listing)
+  expect(menu).toContain('`@centaur fabric vm ubuntu-desktop`')
+  expect(menu).toContain('`@centaur fabric vm my-desk [small|medium|large] [2h]`')
+  expect(menu).toContain('`wip` Ubuntu 24.04 XFCE desktop (from save keep-1) · *Promoting*')
+  expect(menu).not.toContain('fabric vm wip [')
+  expect(vmGoldensText({ catalog: { os: {} } })).toContain('None yet')
+  routes['/v1/vms'] = () => Response.json(listing)
+  await mention('fabric vm goldens', 'U2', 'Ev5')
+  expect(posts().at(-1)).toContain('*VM menu*')
+  await mention('fabric vm list', 'U1', 'Ev6')
+  expect(posts().at(-1)).toContain('*Goldens* (promoted saves): `my-desk` · `wip` · CREATING')
+}))
+
+test('a lease booted from a golden says so on its card', () => {
+  expect(vmCardText(lease({ golden: 'my-desk' }))).toContain('from golden `my-desk`')
 })
