@@ -81,11 +81,11 @@ function recipeMetadata(origin: Origin, recipe: Recipe, secret: string, setup?: 
   return value
 }
 
-function seal(value: unknown, secret: string) {
+export function seal(value: unknown, secret: string) {
   const body = JSON.stringify(value)
   return JSON.stringify({ body, signature: createHmac('sha256', secret).update(body).digest('hex') })
 }
-function unseal(raw: string, secret: string): any {
+export function unseal(raw: string, secret: string): any {
   const { body, signature } = JSON.parse(raw)
   if (typeof body !== 'string' || typeof signature !== 'string' || !/^[a-f0-9]{64}$/.test(signature)) throw new Error('invalid_metadata')
   const expected = createHmac('sha256', secret).update(body).digest()
