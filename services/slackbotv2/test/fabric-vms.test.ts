@@ -203,6 +203,7 @@ test('golden-ready card from the outbox names the boot command; list and goldens
   expect(post.body.thread_ts).toBe('1.0')
   expect(post.body.text).toContain('Golden my-desk')
   expect(post.body.text).toContain('@centaur fabric vm my-desk')
+  expect(post.body.text).not.toContain('from golden')
   expect(calls.find(c => c.path === '/v1/vms/deliveries/ack').body.id).toBe('golden:my-desk:00:golden-ready')
   const listing = { leases: [], saves: [], readiness: { decision: 'ADMIT' },
     goldens: [goldenCard('READY', 'Ready', 'x'), { ...goldenCard('CREATING', 'Promoting', 'y'), golden: 'wip' }],

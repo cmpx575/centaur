@@ -102,7 +102,7 @@ export function vmCardText(lease: VmLease, event?: string): string {
     slackText(v.nextAction)]
   const facts = [v.vm ? `VM \`${v.vm}\`` : '', v.expires ? `until ${v.expires}` : '', v.network ? `network ${v.network}` : '',
     v.script && v.script !== 'none' ? `script ${v.script}` : '', lease.from ? `from save \`${slackText(lease.from)}\`` : '',
-    lease.golden ? `from golden \`${slackText(lease.golden)}\`` : ''].filter(Boolean)
+    lease.golden && !lease.lease.startsWith('golden:') ? `from golden \`${slackText(lease.golden)}\`` : ''].filter(Boolean)
   if (facts.length) lines.push(facts.join(' · '))
   if (v.accessLines.length) lines.push('```' + v.accessLines.join('\n') + '```')
   if (lease.export?.parts?.length) lines.push('Stored objects: ' + lease.export.parts.map(p => `\`${slackText(p.key)}\``).join(' '))
