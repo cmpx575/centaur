@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs'
 import { verifySlackRequest } from './launcher'
 import type { SlackbotV2Options } from './types'
 import { handleRecipeWebhook } from './fabric-recipes'
+import { handleProposalWebhook } from './fabric-proposals'
 import { parseWorkSetup, setupRuntimeTitle, workSetupBlocks, type WorkSetup } from './fabric-work-setup'
 
 export type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string; planeUrl?: string;
@@ -40,6 +41,8 @@ export function fabricCommand(raw: string): { payload: Record<string, any>; comm
 export async function handleFabricWebhook(request: Request, raw: string, options: SlackbotV2Options,
   waitUntil: (promise: Promise<unknown>) => void): Promise<Response | undefined> {
   if (!options.fabricIntakeUrl) return
+  const proposalResponse = await handleProposalWebhook(request, raw, options, waitUntil)
+  if (proposalResponse) return proposalResponse
   const recipeResponse = await handleRecipeWebhook(request, raw, options, waitUntil)
   if (recipeResponse) return recipeResponse
   const parsed = fabricCommand(raw)
@@ -168,10 +171,14 @@ export async function drainFabricDeliveries(options: SlackbotV2Options): Promise
     const run = delivery.run
     if (!options.launcherAllowedChannelIds?.includes(run.channelId)) throw new Error('fabric_delivery_outside_allowlist')
     const report = run.result?.report
-    const text = runSummary(run) + (report ? `\n\n${run.state === 'COMPLETED' ? 'Checked result' : 'Unaccepted worker draft'}:\n${slackText(report.slice(0, 600))}` : '')
+    const error = run.state !== 'COMPLETED' && run.result?.error ? run.result.error : ''
+    const text = runSummary(run) + (error ? `\nObservation: ${slackText(error.slice(0, 600))}` : '')
+      + (report ? `\n\n${run.state === 'COMPLETED' ? 'Checked result' : 'Unaccepted worker draft'}:\n${slackText(report.slice(0, 600))}` : '')
     const blocks = [section(runSummary(run)),
       ...(run.recipe ? [section(`*${slackText(run.recipe.title)}* · ${slackText(run.recipe.profileTitle)}\n${run.recipe.roles.map(slackText).join(' → ')}`)] : []),
       ...(run.recipe?.workSetup ? [{ type: 'section', text: plain(`Method: ${parseWorkSetup(run.recipe.workSetup).method}\nRuntime: ${setupRuntimeTitle(run.recipe.workSetup.runtime)}`) }] : []),
+      // A failed run shows why it stopped, not only "Work stopped".
+      ...(error ? [section('*Observation:* ' + slackText(error).slice(0, 1700))] : []),
       ...(run.result?.checker?.reason ? [section('*Checker:* ' + slackText(run.result.checker.reason).slice(0, 1700))] : []),
       ...(report ? [section(`*${run.state === 'COMPLETED' ? 'Result preview' : 'Unaccepted draft preview'}*\n${slackText(report.slice(0, 600))}`)] : []), runActions(run)]
     const hash = createHash('sha256').update(delivery.id).digest('hex')
