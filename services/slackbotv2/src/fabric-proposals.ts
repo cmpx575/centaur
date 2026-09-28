@@ -205,6 +205,13 @@ const PROPOSAL_REFUSALS: Record<string, string> = {
 export function proposalRefusal(code: string) {
   return PROPOSAL_REFUSALS[code] ? `${PROPOSAL_REFUSALS[code]} (${code})` : refusalText(code)
 }
+/** A refused Launch: one proposal run at a time, so name the run to wait for and say to press again (Noor, 2026-09-28). */
+export function launchRefusal(code: string, blockingRunId?: string) {
+  if (code !== 'PROPOSAL_RUN_OUTSTANDING') return 'Not launched: ' + proposalRefusal(code)
+  const run = blockingRunId ? `run \`${slackText(blockingRunId)}\`` : 'another proposal run'
+  return `Not launched: only one proposal run runs at a time, and ${run} is still running or not yet verified closed. `
+    + `Nothing started. Press Launch again when ${blockingRunId ? `\`${slackText(blockingRunId)}\`` : 'that run'} has finished. (${code})`
+}
 
 /** Buttons, the dismiss modal and `fabric proposals …` mentions. Returns undefined when not ours. */
 export async function handleProposalWebhook(request: Request, raw: string, options: SlackbotV2Options,
@@ -308,8 +315,12 @@ export async function handleProposalWebhook(request: Request, raw: string, optio
         waitUntil(ephemeral('The intake is unavailable. Nothing started; press Launch again in a moment.'))
         return new Response('ok')
       }
+      const code = String(result.value.error ?? 'unavailable')
+      const blockingRunId = typeof result.value.blockingRunId === 'string' ? result.value.blockingRunId : undefined
+      if (!result.ok) options.logger?.warn('fabric_proposal_launch_refused', { code, proposalId: sealed.proposalId,
+        revision: sealed.revision, userId, ...(blockingRunId ? { blockingRunId } : {}) })
       waitUntil(ephemeral(result.ok ? `${result.value.created === false ? 'Already launched' : 'Launched'} as run \`${slackText(String(result.value.runId))}\`. Progress and the checked result follow in this thread and the Plane item.`
-        : 'Not launched: ' + proposalRefusal(String(result.value.error ?? 'unavailable'))))
+        : launchRefusal(code, blockingRunId)))
       return new Response('ok')
     }
     case prefix + 'details': {

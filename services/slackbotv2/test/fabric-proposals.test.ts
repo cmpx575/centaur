@@ -191,6 +191,39 @@ test('a refused launch says why and starts nothing', () => fixture(async ({ send
   expect(calls.find(c => c.path === '/api/chat.postEphemeral').body.text).toContain('dismissed, snoozed, expired or already launched. (PROPOSAL_CLOSED)')
 }))
 
+test('an outstanding-run refusal names the run, says to press Launch again, and logs the refusal', () => fixture(async ({ send, calls, routes, options }) => {
+  const logged: any[] = []
+  options.logger = { warn: (event: string, fields?: any) => logged.push({ event, ...fields }), info: () => {}, error: () => {}, debug: () => {} }
+  routes['/v1/runs'] = () => Response.json({ error: 'PROPOSAL_RUN_OUTSTANDING', blockingRunId: 'lx-0925-08' }, { status: 409 })
+  await send(click('fabric_proposal_launch', valueOf(arm(), 'launch')))
+  const text = calls.find(c => c.path === '/api/chat.postEphemeral').body.text
+  expect(text).toBe('Not launched: only one proposal run runs at a time, and run `lx-0925-08` is still running or not yet verified closed. '
+    + 'Nothing started. Press Launch again when `lx-0925-08` has finished. (PROPOSAL_RUN_OUTSTANDING)')
+  expect(runs(calls)).toHaveLength(1)
+  expect(logged).toEqual([{ event: 'fabric_proposal_launch_refused', code: 'PROPOSAL_RUN_OUTSTANDING', proposalId: PID, revision: 1, userId: 'U2', blockingRunId: 'lx-0925-08' }])
+  // An older intake without blockingRunId still gets the plain instruction; a run id with Slack markup stays literal.
+  calls.length = 0; logged.length = 0
+  routes['/v1/runs'] = () => Response.json({ error: 'PROPOSAL_RUN_OUTSTANDING' }, { status: 409 })
+  await send(click('fabric_proposal_launch', valueOf(arm(), 'launch')))
+  expect(calls.find(c => c.path === '/api/chat.postEphemeral').body.text).toContain('another proposal run is still running or not yet verified closed. Nothing started. Press Launch again when that run has finished.')
+  expect(logged[0]).toEqual({ event: 'fabric_proposal_launch_refused', code: 'PROPOSAL_RUN_OUTSTANDING', proposalId: PID, revision: 1, userId: 'U2' })
+  calls.length = 0
+  routes['/v1/runs'] = () => Response.json({ error: 'PROPOSAL_RUN_OUTSTANDING', blockingRunId: '<!channel>' }, { status: 409 })
+  await send(click('fabric_proposal_launch', valueOf(arm(), 'launch')))
+  expect(calls.find(c => c.path === '/api/chat.postEphemeral').body.text).toContain('run `&lt;!channel&gt;`')
+  // Other refusals keep their exact text, and are logged too.
+  calls.length = 0; logged.length = 0
+  routes['/v1/runs'] = () => Response.json({ error: 'PROPOSAL_CLOSED' }, { status: 409 })
+  await send(click('fabric_proposal_launch', valueOf(arm(), 'launch')))
+  expect(calls.find(c => c.path === '/api/chat.postEphemeral').body.text).toBe('Not launched: This proposal was dismissed, snoozed, expired or already launched. (PROPOSAL_CLOSED)')
+  expect(logged.map(l => l.code)).toEqual(['PROPOSAL_CLOSED'])
+  // A successful launch logs no refusal.
+  calls.length = 0; logged.length = 0
+  routes['/v1/runs'] = () => Response.json({ created: true, runId: 'lx-0925-10', state: 'QUEUED' }, { status: 202 })
+  await send(click('fabric_proposal_launch', valueOf(arm(), 'launch')))
+  expect(logged).toEqual([])
+}))
+
 // ------------------------------------------------------------------ Details, Dismiss, Snooze, Refresh, Resume
 test('Details opens the review read-only (no Launch in the modal) and never posts a run', () => fixture(async ({ send, calls }) => {
   await send(click('fabric_proposal_details', valueOf(arm(), 'details')))
