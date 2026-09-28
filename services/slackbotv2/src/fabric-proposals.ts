@@ -1,4 +1,4 @@
-/** Run-triage proposal cards (fabric docs/proposals.md). The fabric files a
+/** Proposal cards (fabric docs/proposals.md): run triage and research intake. The fabric files a
  * proposal; this file only renders it and relays an allowlisted person's
  * decision. Launch is an ordinary POST /v1/runs with the clicker as userId;
  * the intake re-checks the proposal, the offer and every admission rule and
@@ -10,7 +10,7 @@ import { seal, unseal, refusalText } from './fabric-recipes'
 import { parseReview, reviewBlocks } from './fabric-launch-review'
 import type { SlackbotV2Options } from './types'
 
-export type ProposalCard = { proposalId: string; revision: number; state: string; class: string; title: string; label: string
+export type ProposalCard = { proposalId: string; kind?: string; revision: number; state: string; class: string; title: string; label: string
   facts: string[]; observedAt: number; offer: string[]; planeUrl: string | null; publishedAt: number | null; expiresAt: number | null
   decidedBy: string | null; decisionReason: string | null; runId: string | null; slackTs: string | null
   readiness: { launchable: boolean; firstBlocker: { id: string; code?: string; text: string } | null; observedAt: number } | null }
@@ -55,8 +55,10 @@ function heading(card: ProposalCard) {
 function facts(card: ProposalCard) {
   return section(card.facts.map(f => '• ' + slackText(f)).join('\n') || 'No facts recorded.')
 }
+const RESEARCH = 'research-intake/v1'
 function planeLink(card: ProposalCard) {
-  return card.planeUrl ? [section(`<${card.planeUrl}|Open the proposal in Plane> · all runs and dated facts are listed there`)] : []
+  const what = card.kind === RESEARCH ? 'the frozen abstract and its provenance are there' : 'all runs and dated facts are listed there'
+  return card.planeUrl ? [section(`<${card.planeUrl}|Open the proposal in Plane> · ${what}`)] : []
 }
 
 const OUTCOME: Record<string, (c: ProposalCard) => string> = {
@@ -67,6 +69,14 @@ const OUTCOME: Record<string, (c: ProposalCard) => string> = {
   EXPIRED: c => `*Expired unanswered.* To offer it again: \`@centaur fabric proposals reoffer ${c.proposalId}\``,
   SUPERSEDED: c => `*Superseded* by revision ${c.revision + 1} (new evidence). Use the newer card.`
 }
+/** Research intake ("a paper a day"): the same states, with paper wording; the verdict is a plain reply in this thread. */
+const RESEARCH_OUTCOME: Record<string, (c: ProposalCard) => string> = {
+  SETTLED: c => `*Assessment finished* (run \`${slackText(c.runId ?? '')}\`). Reply in this thread with one of: `
+    + '*Pursue this proof* / *Useful, skip* / *Off-target* / *Can\'t judge*, plus one sentence. The assessment authorizes nothing downstream.',
+  SNOOZED: c => `*Snoozed* by <@${c.decidedBy}>. This paper is not offered again.`,
+  SUPERSEDED: c => `*Superseded* by revision ${c.revision + 1} (the offer changed). Use the newer card.`
+}
+const outcome = (card: ProposalCard) => (card.kind === RESEARCH && RESEARCH_OUTCOME[card.state]) || OUTCOME[card.state]
 
 /** Unarmed (post), armed (arm, with sealed buttons) or closed (update) card blocks. */
 export function proposalMessage(item: ProposalItem, secret?: string) {
@@ -74,7 +84,7 @@ export function proposalMessage(item: ProposalItem, secret?: string) {
   const text = `Proposal · ${card.title}`
   if (item.op === 'post') return { text, blocks: [heading(card), facts(card), context('Preparing — checking readiness before the Launch button appears…')] }
   if (item.op === 'update') return { text: `${text} — ${card.state}`, blocks: [heading(card), facts(card),
-    section((OUTCOME[card.state] ?? (() => `State: ${slackText(card.state)}`))(card)), ...planeLink(card)] }
+    section((outcome(card) ?? (() => `State: ${slackText(card.state)}`))(card)), ...planeLink(card)] }
   const readiness = card.readiness
   const base: Seal = { proposalId: card.proposalId, revision: card.revision, teamId: String(item.request!.teamId), channelId: item.channelId, messageTs: String(card.slackTs) }
   const launchValue = seal({ ...base, request: item.request }, secret!)

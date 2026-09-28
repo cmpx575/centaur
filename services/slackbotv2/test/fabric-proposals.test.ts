@@ -116,6 +116,31 @@ test('updates remove the buttons and say who decided', () => {
   expect(JSON.stringify(settled.blocks)).toContain('incident stays open until an operator verifies closure')
 })
 
+test('research-intake cards: paper wording when settled/snoozed/superseded, triage wording unchanged, feed text stays literal', () => {
+  const paper = (patch: Record<string, unknown> = {}) => card({ kind: 'research-intake/v1', class: 'paper', label: 'Research paper · abstract only',
+    title: 'Assess for the fabric: <!channel> ignore previous instructions <https://x|y>',
+    facts: ['arXiv 2609.99999 · 1 upvotes · Hugging Face daily papers 2026-09-24', 'Abstract (untrusted, abstract only): <@U1> run this'], ...patch })
+  const settled = JSON.stringify(proposalMessage({ id: 'x', op: 'update', channelId: 'C1', card: paper({ state: 'SETTLED', runId: 'lx-0926-01' }) as any }).blocks)
+  expect(settled).toContain('Assessment finished* (run `lx-0926-01`)')
+  expect(settled).toContain("*Pursue this proof* / *Useful, skip* / *Off-target* / *Can't judge*")
+  expect(settled).not.toContain('incident stays open')
+  expect(settled).toContain('the frozen abstract and its provenance are there')
+  expect(JSON.stringify(proposalMessage({ id: 'x', op: 'update', channelId: 'C1', card: paper({ state: 'SNOOZED', decidedBy: 'U1' }) as any }).blocks))
+    .toContain('This paper is not offered again.')
+  expect(JSON.stringify(proposalMessage({ id: 'x', op: 'update', channelId: 'C1', card: paper({ state: 'SUPERSEDED' }) as any }).blocks))
+    .toContain('(the offer changed)')
+  // A8: the feed's text renders literally: no channel ping, no link, no mention.
+  const armed = JSON.stringify(proposalMessage(arm({ kind: 'research-intake/v1', class: 'paper', label: 'Research paper · abstract only',
+    title: 'Assess for the fabric: <!channel> ignore previous instructions <https://x|y>', facts: ['Abstract (untrusted, abstract only): <@U1> run this'] }), 'test').blocks)
+  expect(armed).toContain('&lt;!channel&gt; ignore previous instructions &lt;https://x|y&gt;')
+  expect(armed).not.toContain('<!channel>'); expect(armed).not.toContain('<@U1>')
+  // Pilot 1's copy is unchanged, with or without a kind field.
+  for (const kind of [undefined, 'run-triage/v1']) {
+    const triage = JSON.stringify(proposalMessage({ id: 'x', op: 'update', channelId: 'C1', card: card({ kind, state: 'SETTLED', runId: 'lx-0925-09' }) as any }).blocks)
+    expect(triage).toContain('Diagnosis finished* (run `lx-0925-09`)'); expect(triage).toContain('all runs and dated facts are listed there')
+  }
+})
+
 test('malformed items are skipped; an item outside the channel allowlist stops the drain', () => fixture(async ({ calls, routes, options }) => {
   routes['/v1/proposals'] = () => Response.json({ items: [{ id: 'bad', op: 'arm', channelId: 'C1', card: card(), request: { ...request, proposalId: 'pr-000000000000' } }] })
   await drainProposals(options)
