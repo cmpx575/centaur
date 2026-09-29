@@ -46,7 +46,7 @@ const word = (c: ReviewCheck) => c.status === 'ok' ? 'OK' : c.status === 'n/a' ?
 const time = (epoch: number) => new Date(epoch * 1000).toISOString().slice(11, 19) + ' UTC'
 const date = (epoch: number) => new Date(epoch * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
 
-export type ReviewSummary = { recipeTitle: string; version: string; profileTitle: string; setupTitle?: string; planeUrl: string }
+export type ReviewSummary = { recipeTitle: string; version: string; profileTitle: string; setupTitle?: string; shapeTitle?: string; planeUrl: string }
 
 export function reviewBlocks(review: Review, summary: ReviewSummary) {
   const where = review.placement.coordination
@@ -56,7 +56,8 @@ export function reviewBlocks(review: Review, summary: ReviewSummary) {
   return [
     section(banner),
     section(`*What:* ${slackText(summary.recipeTitle)} ${slackText(summary.version)} · ${slackText(summary.profileTitle)}`
-      + (summary.setupTitle ? ` · ${slackText(summary.setupTitle)}` : '') + `\n*Item:* ${slackText(summary.planeUrl)}`),
+      + (summary.setupTitle ? ` · ${slackText(summary.setupTitle)}` : '')
+      + (summary.shapeTitle ? `\n*How:* ${slackText(summary.shapeTitle)}` : '') + `\n*Item:* ${slackText(summary.planeUrl)}`),
     section(`*Where:* ${where ? `${slackText(where.cluster)} · ${slackText(where.node)} · ${slackText(where.namespace)} · ${slackText(where.runtime)}` : 'no Linux coordination'}`
       + (review.placement.executor ? `\n*Executor:* ${slackText(review.placement.executor.title)}` : '')),
     section(`*Who (requested model ${slackText(review.requestedModel)}):* `
@@ -90,7 +91,8 @@ export function refusedView(text: string, code: string) {
 
 export function reviewButtonMessage(value: string, summary: ReviewSummary) {
   return { text: 'Review this launch before anything starts.', blocks: [
-    section(`*Review launch:* ${slackText(summary.recipeTitle)} · ${slackText(summary.profileTitle)}\n${slackText(summary.planeUrl)}`),
+    section(`*Review launch:* ${slackText(summary.recipeTitle)} · ${slackText(summary.profileTitle)}`
+      + (summary.shapeTitle ? ` · ${slackText(summary.shapeTitle)}` : '') + `\n${slackText(summary.planeUrl)}`),
     { type: 'actions', elements: [{ type: 'button', action_id: 'fabric_recipe_review_open', text: plain('Review launch'), value }] },
     context('Only you can use this button. Reviewing starts nothing; Launch in the review starts one run.')] }
 }

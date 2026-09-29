@@ -13,8 +13,9 @@ import { recipeSetups, resolveSetup, setupChoiceFor, setupOptionValue, setupPick
   workSetupBlocks, type RecipeSetups, type SetupChoice, type WorkSetupRef } from './fabric-work-setup'
 import { launchedView, parseReview, refusedView, reviewButtonMessage, reviewView, type ReviewSummary } from './fabric-launch-review'
 
+export type Shape = { id: string; version: string; digest: string; title: string; limits: { maxAttempts: number } }
 export type Recipe = RecipeSetups & { id: string; version: string; digest: string; title: string; description: string;
-  aliases: string[]; taskType: string; defaultProfile: string; roles: string[];
+  aliases: string[]; taskType: string; defaultProfile: string; roles: string[]; shapes?: Shape[];
   profiles: Record<string, { title: string; description: string; maxCalls: Record<string, number> }> }
 type Origin = { teamId: string; channelId: string; userId: string; threadTs: string }
 const plain = (text: string) => ({ type: 'plain_text', text })
@@ -93,15 +94,18 @@ export function unseal(raw: string, secret: string): any {
   return JSON.parse(body)
 }
 
-export function recipeRequest(recipe: Recipe, profile: string, planeUrl: string, origin: Origin, eventKey: string, setup?: WorkSetupRef) {
+export function recipeRequest(recipe: Recipe, profile: string, planeUrl: string, origin: Origin, eventKey: string, setup?: WorkSetupRef,
+  shape?: Shape) {
   const chosen = setup ?? recipeSetups(recipe)?.selected
   return { ...origin, requestId: 'recipe-' + createHash('sha256').update(origin.teamId + ':' + eventKey).digest('hex').slice(0, 24),
     taskType: recipe.taskType, planeUrl, recipeId: recipe.id, recipeVersion: recipe.version, recipeDigest: recipe.digest, profile,
-    ...setupRequestFields(chosen) }
+    ...setupRequestFields(chosen), ...(shape ? { shapeId: shape.id, shapeVersion: shape.version, shapeDigest: shape.digest } : {}) }
 }
+export const RETRY_SHAPE = 'retry-until-accepted'
 
 const LAUNCH_FIELDS = ['requestId', 'taskType', 'teamId', 'channelId', 'threadTs', 'userId', 'planeUrl', 'recipeId', 'recipeVersion',
-  'recipeDigest', 'profile', 'workSetupId', 'workSetupVersion', 'workSetupDigest', 'expectedProfileDigest']
+  'recipeDigest', 'profile', 'workSetupId', 'workSetupVersion', 'workSetupDigest', 'expectedProfileDigest',
+  'shapeId', 'shapeVersion', 'shapeDigest']
 function launchRequest(value: any) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.entries(value).some(([k, v]) => !LAUNCH_FIELDS.includes(k) || typeof v !== 'string')) throw new Error('invalid_launch')
@@ -110,7 +114,8 @@ function launchRequest(value: any) {
 function summaryFrom(answer: any, planeUrl: string): ReviewSummary {
   const recipe = answer?.recipe ?? {}
   return { recipeTitle: String(recipe.title ?? 'Recipe'), version: String(recipe.version ?? ''), profileTitle: String(recipe.profileTitle ?? ''),
-    ...(recipe.workSetup?.title ? { setupTitle: String(recipe.workSetup.title) } : {}), planeUrl }
+    ...(recipe.workSetup?.title ? { setupTitle: String(recipe.workSetup.title) } : {}),
+    ...(recipe.shape?.title ? { shapeTitle: `${String(recipe.shape.title)} (up to ${Number(recipe.shape.limits?.maxAttempts)} attempts)` } : {}), planeUrl }
 }
 /** One readiness call → a review view whose Launch carries the exact request and the reviewed profile. */
 type Built = { unavailable: true } | { refused: string } | { view: ReturnType<typeof reviewView> }
@@ -424,17 +429,24 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     waitUntil(reply(recipeMenu(recipes, result.value.availability)))
     return new Response('ok')
   }
-  const launchMatch = /^fabric\s+launch\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?\s*$/i.exec(text)
+  const launchMatch = /^fabric\s+launch\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?(?:\s+(retry))?\s*$/i.exec(text)
   if (/^fabric\s+launch(?:\s|$)/i.test(text)) {
     const chosen = launchMatch && recipes.find(r => [r.id, ...r.aliases].includes(launchMatch[1]!.toLowerCase()))
     const profile = launchMatch?.[2]?.toLowerCase() ?? chosen?.defaultProfile
     if (!launchMatch || !chosen || !profile || !chosen.profiles[profile]) {
-      waitUntil(reply({ text: 'Use `fabric launch <recipe> [profile] <Plane-item-link>` for a private review with a Launch button. Nothing was started.' }))
+      waitUntil(reply({ text: 'Use `fabric launch <recipe> [profile] <Plane-item-link> [retry]` for a private review with a Launch button. Nothing was started.' }))
       return new Response('ok')
     }
-    const request = recipeRequest(chosen, profile, launchMatch[3]!, origin, payload.event_id ?? event.ts)
+    // `retry`: the recipe's retry-until-accepted shape (fabric docs/shapes.md), only where the catalog offers it.
+    const shape = launchMatch[4] ? chosen.shapes?.find(s => s.id === RETRY_SHAPE) : undefined
+    if (launchMatch[4] && !shape) {
+      waitUntil(reply({ text: `${chosen.title} does not offer "Retry until accepted". Nothing was started.` }))
+      return new Response('ok')
+    }
+    const request = recipeRequest(chosen, profile, launchMatch[3]!, origin, payload.event_id ?? event.ts, undefined, shape)
     const summary: ReviewSummary = { recipeTitle: chosen.title, version: chosen.version, profileTitle: chosen.profiles[profile]!.title,
-      ...(recipeSetups(chosen) ? { setupTitle: recipeSetups(chosen)!.selected.title } : {}), planeUrl: request.planeUrl! }
+      ...(recipeSetups(chosen) ? { setupTitle: recipeSetups(chosen)!.selected.title } : {}),
+      ...(shape ? { shapeTitle: `${shape.title} (up to ${shape.limits.maxAttempts} attempts)` } : {}), planeUrl: request.planeUrl! }
     const value = seal({ origin, request }, options.signingSecret)
     if (value.length > 2000) { waitUntil(reply({ text: 'This launch is too large to review here. Use `fabric recipes`.' })); return new Response('ok') }
     // Ephemeral and sealed to the requester: others never see or use this button.
@@ -471,7 +483,9 @@ export function refusalText(error: unknown) {
     LINUX_CONCURRENCY_FULL:'The Linux lane is at its active-run limit. Try again when a run finishes.',
     WAITING_SOFTWARE_CAPACITY:'This item has no one-use repair reservation for you. An operator must add one.',
     EXECUTION_PROFILE_CHANGED_REFRESH:'The model or limits changed since your review. Review again; nothing was started.',
-    REQUEST_ID_CONFLICT:'A launch from this review already exists with different content. Open the recipe again.'
+    REQUEST_ID_CONFLICT:'A launch from this review already exists with different content. Open the recipe again.',
+    SHAPE_CHANGED_REFRESH_MENU:'How this recipe retries changed. Start the launch again.',
+    SHAPE_NOT_SUPPORTED:'This recipe does not offer that way of working.'
   }
   return (reasons[code] ?? 'The request could not start. Check the selected work and recipe.') + ` (${code})`
 }
