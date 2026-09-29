@@ -9,12 +9,14 @@ import type { SlackbotV2Options } from './types'
 import { handleRecipeWebhook } from './fabric-recipes'
 import { handleProposalWebhook } from './fabric-proposals'
 import { handleVmWebhook } from './fabric-vms'
+import { handleProgramWebhook, stopButton, type Program } from './fabric-programs'
 import { parseWorkSetup, setupRuntimeTitle, workSetupBlocks, type WorkSetup } from './fabric-work-setup'
 
 export type Run = { requestId: string; runId: string; state: string; channelId: string; threadTs: string; planeUrl?: string;
   view?: { title: string; status: string; nextAction: string; closure: string; checked: boolean; closed: boolean };
   recipe?: { title: string; version: string; profileTitle: string; planDigest: string; roles: string[]; workSetup?: WorkSetup };
   context?: { sources: Array<{name: string}>; packetDigest: string; coverage: string };
+  program?: Program;
   result?: { report?: string; error?: string; checker?: { reason?: string }; terminal?: {
     artifactVerified?: boolean; authorityClosed?: boolean; disposalVerified?: boolean; taskOutcome?: string } } }
 
@@ -44,6 +46,8 @@ export async function handleFabricWebhook(request: Request, raw: string, options
   if (!options.fabricIntakeUrl) return
   const vmResponse = await handleVmWebhook(request, raw, options, waitUntil)
   if (vmResponse) return vmResponse
+  const programResponse = await handleProgramWebhook(request, raw, options, waitUntil)
+  if (programResponse) return programResponse
   const proposalResponse = await handleProposalWebhook(request, raw, options, waitUntil)
   if (proposalResponse) return proposalResponse
   const recipeResponse = await handleRecipeWebhook(request, raw, options, waitUntil)
@@ -132,10 +136,12 @@ export function runSummary(run: Run): string {
   return `*${slackText(run.view.title)}* · *${run.view.status}*\n${run.view.nextAction}\n${run.view.closure}${setup ? '\nWork setup: ' + slackText(setup.title) : ''}`
 }
 
-export function runActions(run: Run) {
+export function runActions(run: Run, secret?: string) {
   return { type: 'actions', elements: [
     { type: 'button', action_id: 'fabric_recipe_details', text: plain('View run'), value: run.requestId },
-    ...(run.planeUrl ? [{ type: 'button', action_id: 'fabric_recipe_plane', text: plain('Open in Plane'), url: run.planeUrl }] : [])
+    ...(run.planeUrl ? [{ type: 'button', action_id: 'fabric_recipe_plane', text: plain('Open in Plane'), url: run.planeUrl }] : []),
+    // Retry until accepted: skip the next attempt (the fabric decides whether one would start).
+    ...(secret && run.program?.stoppable && !run.program.final ? [stopButton(run.program, run.channelId, secret)] : [])
   ] }
 }
 
@@ -183,7 +189,8 @@ export async function drainFabricDeliveries(options: SlackbotV2Options): Promise
       // A failed run shows why it stopped, not only "Work stopped".
       ...(error ? [section('*Observation:* ' + slackText(error).slice(0, 1700))] : []),
       ...(run.result?.checker?.reason ? [section('*Checker:* ' + slackText(run.result.checker.reason).slice(0, 1700))] : []),
-      ...(report ? [section(`*${run.state === 'COMPLETED' ? 'Result preview' : 'Unaccepted draft preview'}*\n${slackText(report.slice(0, 600))}`)] : []), runActions(run)]
+      ...(report ? [section(`*${run.state === 'COMPLETED' ? 'Result preview' : 'Unaccepted draft preview'}*\n${slackText(report.slice(0, 600))}`)] : []),
+      runActions(run, options.signingSecret)]
     const hash = createHash('sha256').update(delivery.id).digest('hex')
     const clientMessageId = `${hash.slice(0,8)}-${hash.slice(8,12)}-4${hash.slice(13,16)}-a${hash.slice(17,20)}-${hash.slice(20,32)}`
     const sent = await slack(options, 'chat.postMessage', { channel: run.channelId, thread_ts: run.threadTs,
