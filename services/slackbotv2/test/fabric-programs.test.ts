@@ -92,6 +92,18 @@ test('Stop refuses an unsigned click, a stranger, another channel and a forged v
   expect(calls.filter(c => c.path === '/v1/programs/stop')).toHaveLength(0)
 }))
 
+test('fabric launch seals source: person by default, lane with a trailing lane (also after retry)', () => fixture(async ({ send, calls }) => {
+  const sealed = () => unseal(calls.filter(c => c.path === '/api/chat.postEphemeral').at(-1).body.blocks
+    .find((b: any) => b.type === 'actions').elements[0].value, 'test').request
+  await send(event('fabric launch research focused <https://plane.example.test/work|work>'))
+  expect(sealed().source).toBe('person')
+  await send(event('fabric launch research focused <https://plane.example.test/work|work> lane'))
+  expect(sealed().source).toBe('lane')
+  await send(event('fabric launch research focused <https://plane.example.test/work|work> retry lane'))
+  expect(sealed()).toMatchObject({ source: 'lane', shapeId: shape.id })
+  expect(calls.filter(c => c.path === '/v1/runs')).toHaveLength(0)
+}))
+
 test('fabric launch … retry reviews the recipe with its retry shape; without it or on another recipe nothing changes', () => fixture(async ({ send, calls }) => {
   await send(event('fabric launch research focused <https://plane.example.test/work|work> retry'))
   const ephemeral = calls.filter(c => c.path === '/api/chat.postEphemeral').at(-1).body
