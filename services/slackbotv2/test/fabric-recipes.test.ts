@@ -71,6 +71,22 @@ test('named alias and profile use same canonical request and stable replay key',
   expect(requests[0].body).toEqual(requests[1].body)
   expect(requests[0].body).toMatchObject({recipeId:'evidence-review',profile:'full',planeUrl:'https://plane.example.test/work'})
 }))
+test('source: a person\'s launch sends person, a trailing lane sends lane (fabric offers diagnoses only for person runs)',async()=>fixture(async(send,calls)=>{
+  await send(event('fabric run review focused <https://plane.example.test/work|work>','E7'))
+  await send(event('fabric run review focused <https://plane.example.test/work|work> lane','E8'))
+  await send(event('fabric run review <https://plane.example.test/work|work> LANE','E9'))
+  const bodies=calls.filter(c=>c.path==='/v1/runs' && c.body).map(c=>c.body)
+  expect(bodies.map(b=>b.source)).toEqual(['person','lane','lane'])
+  expect(bodies[2]).toMatchObject({recipeId:'evidence-review',profile:'focused',planeUrl:'https://plane.example.test/work'})
+  // the menu's modal is a person's launch too
+  await send(opening);const view=calls.find(c=>c.path.endsWith('views.open')).body.view
+  await send(submission(view))
+  expect(calls.filter(c=>c.path==='/v1/launch-readiness').at(-1).body.source).toBe('person')
+  // an unknown trailing word is not a source: nothing starts
+  const before=calls.filter(c=>c.path==='/v1/runs' && c.body).length
+  await send(event('fabric run review focused <https://plane.example.test/work|work> robot','E10'))
+  expect(calls.filter(c=>c.path==='/v1/runs' && c.body)).toHaveLength(before)
+}))
 test('a stale recipe remains a visible modal error and no silent default is used',async()=>fixture(async(send,calls)=>{
   await send(opening);const view=calls.find(c=>c.path.endsWith('views.open')).body.view
   const r=await send(submission(view));expect(await r!.json()).toMatchObject({response_action:'errors',errors:{profile:expect.stringContaining('RECIPE_CHANGED')}})

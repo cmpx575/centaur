@@ -94,18 +94,21 @@ export function unseal(raw: string, secret: string): any {
   return JSON.parse(body)
 }
 
+/** Who started a run (fabric wave 6, topic 5): a person's launch from Slack is `person`; a lane's test run, launched
+ *  with a trailing `lane` word, is `lane`. The fabric offers a diagnosis only for runs a person started. */
+export type RunSource = 'person' | 'lane'
 export function recipeRequest(recipe: Recipe, profile: string, planeUrl: string, origin: Origin, eventKey: string, setup?: WorkSetupRef,
-  shape?: Shape) {
+  shape?: Shape, source: RunSource = 'person') {
   const chosen = setup ?? recipeSetups(recipe)?.selected
   return { ...origin, requestId: 'recipe-' + createHash('sha256').update(origin.teamId + ':' + eventKey).digest('hex').slice(0, 24),
-    taskType: recipe.taskType, planeUrl, recipeId: recipe.id, recipeVersion: recipe.version, recipeDigest: recipe.digest, profile,
+    taskType: recipe.taskType, planeUrl, recipeId: recipe.id, recipeVersion: recipe.version, recipeDigest: recipe.digest, profile, source,
     ...setupRequestFields(chosen), ...(shape ? { shapeId: shape.id, shapeVersion: shape.version, shapeDigest: shape.digest } : {}) }
 }
 export const RETRY_SHAPE = 'retry-until-accepted'
 
 const LAUNCH_FIELDS = ['requestId', 'taskType', 'teamId', 'channelId', 'threadTs', 'userId', 'planeUrl', 'recipeId', 'recipeVersion',
   'recipeDigest', 'profile', 'workSetupId', 'workSetupVersion', 'workSetupDigest', 'expectedProfileDigest',
-  'shapeId', 'shapeVersion', 'shapeDigest']
+  'shapeId', 'shapeVersion', 'shapeDigest', 'source']
 function launchRequest(value: any) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.entries(value).some(([k, v]) => !LAUNCH_FIELDS.includes(k) || typeof v !== 'string')) throw new Error('invalid_launch')
@@ -429,12 +432,12 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     waitUntil(reply(recipeMenu(recipes, result.value.availability)))
     return new Response('ok')
   }
-  const launchMatch = /^fabric\s+launch\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?(?:\s+(retry))?\s*$/i.exec(text)
+  const launchMatch = /^fabric\s+launch\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?(?:\s+(retry))?(?:\s+(lane))?\s*$/i.exec(text)
   if (/^fabric\s+launch(?:\s|$)/i.test(text)) {
     const chosen = launchMatch && recipes.find(r => [r.id, ...r.aliases].includes(launchMatch[1]!.toLowerCase()))
     const profile = launchMatch?.[2]?.toLowerCase() ?? chosen?.defaultProfile
     if (!launchMatch || !chosen || !profile || !chosen.profiles[profile]) {
-      waitUntil(reply({ text: 'Use `fabric launch <recipe> [profile] <Plane-item-link> [retry]` for a private review with a Launch button. Nothing was started.' }))
+      waitUntil(reply({ text: 'Use `fabric launch <recipe> [profile] <Plane-item-link> [retry] [lane]` for a private review with a Launch button. Nothing was started.' }))
       return new Response('ok')
     }
     // `retry`: the recipe's retry-until-accepted shape (fabric docs/shapes.md), only where the catalog offers it.
@@ -443,7 +446,8 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
       waitUntil(reply({ text: `${chosen.title} does not offer "Retry until accepted". Nothing was started.` }))
       return new Response('ok')
     }
-    const request = recipeRequest(chosen, profile, launchMatch[3]!, origin, payload.event_id ?? event.ts, undefined, shape)
+    const request = recipeRequest(chosen, profile, launchMatch[3]!, origin, payload.event_id ?? event.ts, undefined, shape,
+      launchMatch[5] ? 'lane' : 'person')
     const summary: ReviewSummary = { recipeTitle: chosen.title, version: chosen.version, profileTitle: chosen.profiles[profile]!.title,
       ...(recipeSetups(chosen) ? { setupTitle: recipeSetups(chosen)!.selected.title } : {}),
       ...(shape ? { shapeTitle: `${shape.title} (up to ${shape.limits.maxAttempts} attempts)` } : {}), planeUrl: request.planeUrl! }
@@ -454,13 +458,14 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
       ...reviewButtonMessage(value, summary) }))
     return new Response('ok')
   }
-  const match = /^fabric\s+run\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?\s*$/i.exec(text)
+  const match = /^fabric\s+run\s+([a-z0-9-]+)(?:\s+([a-z0-9-]+))?\s+(?:<)?(https:\/\/[^\s<>|]+)(?:\|[^>]+)?(?:>)?(?:\s+(lane))?\s*$/i.exec(text)
   const recipe = match && recipes.find(r => [r.id, ...r.aliases].includes(match[1]!.toLowerCase()))
   if (!match || !recipe) {
-    waitUntil(reply({ text: 'Choose `fabric recipes`, or use `fabric run review focused <Plane-item-link>`.' }))
+    waitUntil(reply({ text: 'Choose `fabric recipes`, or use `fabric run review focused <Plane-item-link>` (add `lane` at the end for a lane\'s test run).' }))
     return new Response('ok')
   }
-  const submitted = await intake(options, '/v1/runs', recipeRequest(recipe, match[2]?.toLowerCase() ?? recipe.defaultProfile, match[3]!, origin, payload.event_id ?? event.ts))
+  const submitted = await intake(options, '/v1/runs', recipeRequest(recipe, match[2]?.toLowerCase() ?? recipe.defaultProfile, match[3]!, origin,
+    payload.event_id ?? event.ts, undefined, undefined, match[4] ? 'lane' : 'person'))
   if (!submitted.ok) {
     if (submitted.status >= 500) return new Response('retry', { status: 503 })
     waitUntil(reply({ text: refusalText(submitted.value.error) }))
