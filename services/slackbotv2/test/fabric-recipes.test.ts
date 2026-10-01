@@ -7,6 +7,7 @@ import { recipeMenu, recipeView, type Recipe } from '../src/fabric-recipes'
 import { createSlackbotV2 } from '../src/index'
 import { createMemoryState } from '@chat-adapter/state-memory'
 import { readiness, launchSubmission, PROFILE } from './launch-review-double'
+import { answer as choicesAnswer } from './choices-double'
 
 const recipe: Recipe = { id:'evidence-review',version:'1.0.0',digest:'a'.repeat(64),title:'Review prior work',description:'A checked review',aliases:['review'],taskType:'retained-evidence-review',defaultProfile:'focused',roles:['Coordinator','Worker','Checker'],profiles:{focused:{title:'Focused',description:'Three sources',maxCalls:{coordinator:4,worker:4,checker:6}},full:{title:'Full packet',description:'Seven sources',maxCalls:{coordinator:4,worker:8,checker:6}}} }
 const event = (text: string, id='E1') => ({type:'event_callback',team_id:'T1',event_id:id,event:{type:'app_mention',user:'U1',channel:'C1',ts:'1789846137.000001',text:'<@UBOT> '+text}})
@@ -19,6 +20,7 @@ async function fixture(work: (send: (payload:any, signed?:boolean)=>Promise<Resp
     if(path==='/v1/recipes')return Response.json({recipes:[recipe]})
     if(path==='/v1/recipe-catalog')return Response.json({recipes:[recipe],launchEnabled:false,scope:'Read-only catalog; admission and capacity are not verified.'})
     if(path==='/v1/work-items')return Response.json({projects:[{name:'Research',items:[{name:'Review prior work',identifier:'RES-1',url:'https://plane.example.test/work'}]}],stale:false})
+    if(path==='/v1/choices')return failure==='CHOICES_DOWN'?Response.json({error:'x'},{status:503}):Response.json(choicesAnswer)
     if(path==='/v1/launch-readiness')return failure&&failure!=='LAUNCH_ONLY'?Response.json({error:failure},{status:failure==='TEMPORARY'?503:409}):Response.json(readiness())
     if(path==='/v1/runs' && init.method==='POST')return failure?Response.json({error:failure==='LAUNCH_ONLY'?'ITEM_RUN_ACTIVE':failure},{status:failure==='TEMPORARY'?503:409}):Response.json({created:true,runId:'lx-0925-01',state:'QUEUED'},{status:202})
     if(path==='/api/chat.postMessage')return Response.json({ok:true,ts:'2'})
@@ -57,6 +59,22 @@ test('signed menu and modal preserve origin and pin a compact immutable recipe',
   await send(launchSubmission(pushed.view))
   expect(calls.filter(c=>c.path==='/v1/runs')[1].body).toEqual(requests[0].body)
 }))
+test('fabric ask posts the choices in the thread; its button opens the usual form; nothing starts',async()=>fixture(async(send,calls)=>{
+  expect((await send(event('fabric ask grok and minimax inside windows')))?.status).toBe(200)
+  expect(calls.find(c=>c.path==='/v1/choices').body).toEqual({teamId:'T1',channelId:'C1',userId:'U1',intention:'grok and minimax inside windows'})
+  const posted=calls.find(c=>c.path.endsWith('chat.postMessage')).body
+  expect(posted).toMatchObject({channel:'C1',thread_ts:'1789846137.000001'})
+  expect(JSON.stringify(posted.blocks)).toContain('fabric_recipe_open')
+  expect(calls.filter(c=>c.path==='/v1/runs'||c.path==='/v1/launch-readiness')).toHaveLength(0)
+  await send(event('fabric ask','E2'))
+  expect(calls.filter(c=>c.path==='/v1/choices')).toHaveLength(1)
+  expect(calls.filter(c=>c.path.endsWith('chat.postMessage')).at(-1).body.text).toContain('Say what you want after `fabric ask`')
+  expect((await send(event('fabric ask grok','E3'),false))?.status).toBe(401)
+}))
+test('fabric ask: intake down asks Slack to retry and posts nothing',async()=>fixture(async(send,calls)=>{
+  expect((await send(event('fabric ask grok')))?.status).toBe(503)
+  expect(calls.filter(c=>c.path.endsWith('chat.postMessage'))).toHaveLength(0)
+},'CHOICES_DOWN'))
 test('unsigned, wrong user and tampered modal never submit',async()=>fixture(async(send,calls)=>{
   expect((await send(opening,false))?.status).toBe(401)
   await send(opening);const view=calls.find(c=>c.path.endsWith('views.open')).body.view
