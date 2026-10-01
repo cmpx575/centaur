@@ -12,6 +12,7 @@ import { isWorkAction, parseWorkCatalog, parseWorkMenu, parseWorkSelection, sele
 import { recipeSetups, resolveSetup, setupChoiceFor, setupOptionValue, setupPickerBlock, setupRequestFields,
   workSetupBlocks, type RecipeSetups, type SetupChoice, type WorkSetupRef } from './fabric-work-setup'
 import { launchedView, parseReview, refusedView, reviewButtonMessage, reviewView, type ReviewSummary } from './fabric-launch-review'
+import { askWords, choicesMessage, parseChoices } from './fabric-choices'
 
 export type Shape = { id: string; version: string; digest: string; title: string; limits: { maxAttempts: number } }
 export type Recipe = RecipeSetups & { id: string; version: string; digest: string; title: string; description: string;
@@ -33,7 +34,7 @@ export function recipeMenu(recipes: Recipe[], availability?: Availability) {
       { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'open', text: plain('Choose how to run'), value: r.id }] }]),
     { type: 'actions', elements: [{ type: 'button', action_id: prefix + 'recent', text: plain('Recent work') },
       { type: 'button', action_id: prefix + 'capabilities', text: plain('Capabilities') }] },
-    section('You can also mention `fabric launch review focused <Plane-item-link>` for a private review with a Launch button, `fabric run review focused <Plane-item-link>`, `fabric runs`, or `fabric resume <Plane-item-link>` for a read-only work history.')
+    section('Say what you want with `fabric ask <your words>` for the choices that fit. You can also mention `fabric launch review focused <Plane-item-link>` for a private review with a Launch button, `fabric run review focused <Plane-item-link>`, `fabric runs`, or `fabric resume <Plane-item-link>` for a read-only work history.')
   ] }
 }
 
@@ -143,7 +144,7 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
   const event = payload.event, action = payload.actions?.[0]
   const text = fabricMessageText(event?.text)
   const mention = payload.type === 'event_callback' && event?.type === 'app_mention' && !event.bot_id && !event.subtype
-    && /^fabric\s+(recipes|run|runs|capabilities|resume|work|launch)(?:\s|$)/i.test(text)
+    && /^fabric\s+(recipes|run|runs|capabilities|resume|work|launch|ask)(?:\s|$)/i.test(text)
   const opening = payload.type === 'block_actions' && action?.action_id === prefix + 'open'
   const resumeNavigation = payload.type === 'block_actions' && isResumeAction(action?.action_id)
   const workNavigationAction = payload.type === 'block_actions' && isWorkAction(action?.action_id)
@@ -354,6 +355,21 @@ export async function handleRecipeWebhook(request: Request, raw: string, options
     } catch { return new Response('retry', { status: 503 }) }
   }
   if (navigation && action.action_id === prefix+'plane') return new Response('ok')
+  const asked = mention ? askWords(text) : undefined
+  if (asked !== undefined) {
+    // An intention in plain words: the fabric answers with choices; each opens the usual form. Nothing starts here.
+    if (!asked) {
+      waitUntil(reply({ text: 'Say what you want after `fabric ask`, for example `fabric ask grok and minimax inside windows`. Nothing was started.' }))
+      return new Response('ok')
+    }
+    const result = await intake(options, '/v1/choices', { teamId: origin.teamId, channelId: origin.channelId, userId: origin.userId,
+      intention: asked })
+    if (!result.ok) return new Response('retry', { status: result.status >= 500 ? 503 : 403 })
+    let answer
+    try { answer = parseChoices(result.value) } catch { return new Response('retry', { status: 503 }) }
+    waitUntil(reply(choicesMessage(answer)))
+    return new Response('ok')
+  }
   if ((mention && /^fabric\s+capabilities\s*$/i.test(text)) || (navigation && action.action_id === prefix+'capabilities')) {
     const result = await intake(options, '/v1/capabilities?' + query)
     if (!result.ok) return new Response('retry', { status: result.status >= 500 ? 503 : 403 })
