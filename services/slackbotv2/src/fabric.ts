@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs'
 import { verifySlackRequest } from './launcher'
 import type { SlackbotV2Options } from './types'
 import { handleRecipeWebhook } from './fabric-recipes'
+import { handleLinksWebhook } from './fabric-links'
 import { handleProposalWebhook } from './fabric-proposals'
 import { handleVmWebhook } from './fabric-vms'
 import { handleProgramWebhook, stopButton, type Program } from './fabric-programs'
@@ -52,6 +53,8 @@ export async function handleFabricWebhook(request: Request, raw: string, options
   if (proposalResponse) return proposalResponse
   const recipeResponse = await handleRecipeWebhook(request, raw, options, waitUntil)
   if (recipeResponse) return recipeResponse
+  const linksResponse = await handleLinksWebhook(request, raw, options, waitUntil)
+  if (linksResponse) return linksResponse
   const parsed = fabricCommand(raw)
   if (!parsed) return
   const signed = verifySlackRequest({ nowMs: Date.now(), rawBody: raw, signingSecret: options.signingSecret,
